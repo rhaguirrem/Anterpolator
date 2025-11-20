@@ -1,0 +1,69 @@
+{
+  "samples_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/Samples_CNN_ABA_BED.csv",
+  "blocks_file": null,
+  "color_file": null,
+  "interpolation_file": "C:\\Projects\\Anterpolator\\Anterpolator3DViewer\\Data\\Samples_CNN_ABA_BED_anterpolation.csv",
+  "block_size": [
+    10,
+    10,
+    10
+  ],
+  "range_size": 0.05,
+  "max_pheromone": 1000,
+  "ants_per_sample": 3,
+  "iterations": 500,
+  "background_value": 0.0,
+  "background_distance": 1000.0,
+  "average_with_blocks": true,
+  "value_filter": 0.0,
+  "verbose": true,
+  "fill_unvisited_domainwise": false,
+  "avoid_visited_threshold_enabled": true,
+  "avoid_visited_threshold": 50,
+  "samples_delimiter": ",",
+  "blocks_delimiter": ",",
+  "samples_header_line": 1,
+  "blocks_header_line": 2,
+  "sample_x_col": "x",
+  "sample_y_col": "y",
+  "sample_z_col": "z",
+  "sample_value_col": "Value",
+  "block_x_col": null,
+  "block_y_col": null,
+  "block_z_col": null,
+  "block_domain_col": null,
+  "process_domains_sequentially": false,
+  "algorithm": "biochemical_clock",
+  "biochemical_clock_params": {
+    "spatial_weight": 2.0,
+    "attr_weight": 20.0,
+    "ancestor_depth_offset": 0.2,
+    "branch_threshold": 10.0,
+    "min_samples_per_event": 3,
+    "max_samples_per_event": 1000,
+    "detect_multiple_events": true,
+    "interpolation_method": "inverse_distance",
+    "fill_background": false,
+    "background_value": 0.0
+  },
+  "domain_algorithm_overrides": {
+    "Hydrothermal": {
+      "algorithm": "biochemical_clock"
+    },
+    "Intrusive": {
+      "algorithm": "biochemical_clock"
+    },
+    "Overburden": {
+      "algorithm": "ant_colony"
+    },
+    "Sedimentary": {
+      "algorithm": "ant_colony"
+    },
+    "Tectonic": {
+      "algorithm": "biochemical_clock"
+    },
+    "Volcanic": {
+      "algorithm": "ant_colony"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+# Large Data Files
+mb_lp_full_Domains.csv
+Anterpolator3DViewer/Data/Leda_5x5x5_DomainedCells.csv
+Anterpolator3DViewer/Output/Samples_CNN_ABA_BED_interpolation.csv
+Caserones Categorizacion.csv
+*.lfc
+*.xlsm
+*.xlsx
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# Temporary
+~$*

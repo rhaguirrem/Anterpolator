@@ -1,0 +1,14 @@
+{
+  "data_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/Leda_assay.csv",
+  "separator": ";",
+  "header_line": 1,
+  "selected_columns": [
+    "HoleID;FROM;TO;Cu(%);Pb(%);Value;Ag(ppm);Au(ppm);SG(Units);Domain;x;y;z"
+  ],
+  "show_plots": true,
+  "show_scree": false,
+  "show_corr_matrix": true,
+  "method": "pca",
+  "pc1": 0,
+  "pc2": 1
+}

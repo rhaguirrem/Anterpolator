@@ -1,0 +1,61 @@
+{
+  "samples_file": "C:/Users/rhagu/OneDrive/Documentos/Trabajo/ENAMI/Modelamiento Cerro Negro/20250902 Modelamiento Cerro Negro/Proceso/Anterpolator/Modelo_2025_Assays_COM1.csv",
+  "blocks_file": "C:/Users/rhagu/OneDrive/Documentos/Trabajo/ENAMI/Modelamiento Cerro Negro/20250902 Modelamiento Cerro Negro/Proceso/Anterpolator/BM Cerro Negro.csv",
+  "color_file": "C:/Users/rhagu/OneDrive/Documentos/Trabajo/ENAMI/Modelamiento Cerro Negro/20250902 Modelamiento Cerro Negro/Proceso/Anterpolator/CuT_pc_Modelo K-Means Aprox.lfc",
+  "interpolation_file": "C:/Users/rhagu/OneDrive/Documentos/Trabajo/ENAMI/Modelamiento Cerro Negro/20250902 Modelamiento Cerro Negro/Proceso/Anterpolator\\Modelo_2025_Assays_COM1_anterpolation.csv",
+  "algorithm": "ant_colony",
+  "block_size": [
+    10,
+    10,
+    10
+  ],
+  "range_size": 0.05,
+  "max_pheromone": 1000,
+  "ants_per_sample": 3,
+  "iterations": 500,
+  "background_value": 0.0,
+  "background_distance": 1000.0,
+  "average_with_blocks": true,
+  "value_filter": 0.0,
+  "verbose": false,
+  "fill_unvisited_domainwise": true,
+  "avoid_visited_threshold_enabled": true,
+  "avoid_visited_threshold": 50,
+  "samples_delimiter": ";",
+  "blocks_delimiter": ",",
+  "samples_header_line": 1,
+  "blocks_header_line": 2,
+  "sample_x_col": "mid_x",
+  "sample_y_col": "mid_y",
+  "sample_z_col": "mid_z",
+  "sample_value_col": "CuT_pc_Modelo",
+  "block_x_col": "X",
+  "block_y_col": "Y",
+  "block_z_col": "Z",
+  "block_domain_col": "GM Lito",
+  "molecular_clock_params": {
+    "spatial_weight": 1.0,
+    "attr_weight": 1.0,
+    "detect_multiple_events": true,
+    "branch_threshold": 2.0,
+    "depth_weight": 1.0,
+    "min_samples_per_event": 3,
+    "interpolation_method": "linear",
+    "fill_background": false,
+    "background_value": 0.0,
+    "ancestor_depth_offset": 1.0
+  },
+  "domain_algorithm_overrides": {
+    "_comment": "Specify algorithm per domain. Example: 'Intrusion': 'molecular_clock', 'Sedimentary': 'ant_colony'",
+    "_example": {
+      "Intrusion": {
+        "algorithm": "molecular_clock",
+        "spatial_weight": 1.0,
+        "attr_weight": 0.5,
+        "detect_multiple_events": true,
+        "branch_threshold": 2.5,
+        "depth_weight": 2.0
+      }
+    }
+  }
+}
