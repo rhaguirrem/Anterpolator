@@ -66,7 +66,7 @@ The application uses `config.json` files to manage parameters for both algorithm
 
 ## Author
 
-**Ramon Aguirre M., PhD**
+**Roberto Aguirre Maturana, Geologist**
 
 ---
 *This project explores the intersection of biology and geostatistics to solve complex geological modeling challenges.*
