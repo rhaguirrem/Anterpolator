@@ -119,8 +119,8 @@ class AntColonyInterpolator(InterpolatorBase):
                 self.domain_heavy_counts[domain] = self.domain_heavy_counts.get(domain, 0) + 1
                 self._maybe_freeze_domain(domain)
             self.next_block_id += 1
-            if self.verbose:
-                print(f"Sample at {pos}: value={value:.2f}, mark_class={mark_class}, domain={domain}")
+            # if self.verbose:
+            #     print(f"Sample at {pos}: value={value:.2f}, mark_class={mark_class}, domain={domain}")
 
     @lru_cache(maxsize=1024)
     def get_neighbors(self, pos: Tuple[int, int, int], dims: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:

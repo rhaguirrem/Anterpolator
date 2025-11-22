@@ -15,6 +15,7 @@ from sklearn.decomposition import PCA
 sys.path.append("C:/Projects/Anterpolator")
 from ant_colony import AntColonyInterpolator
 from molecular_clock_interpolator import MolecularClockInterpolator
+from net_connector_interpolator import NetConnectorInterpolator
 from interpolator_base import InterpolatorBase
 
 # --- Interpolator Factory ---
@@ -74,6 +75,13 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             fill_background=mc_params.get('fill_background', False),
             background_value=mc_params.get('background_value', 0.0),
             ancestor_depth_offset=mc_params.get('ancestor_depth_offset', 1.0),
+            verbose=config.get('verbose', False)
+        )
+    
+    elif algo_type == 'net_connector':
+        return NetConnectorInterpolator(
+            distance_threshold=config.get('distance_threshold', 10.0),
+            grade_difference=config.get('grade_difference', 1.0),
             verbose=config.get('verbose', False)
         )
     
@@ -641,48 +649,77 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     samples_by_domain[domain] = {}
                 samples_by_domain[domain][idx] = val
             
-            # Store multiple interpolators
+            # Store multiple interpolators (list per domain)
             multiblock._interpolators = {}
             
             for domain, domain_samples in samples_by_domain.items():
                 # Determine which algorithm for this domain
                 domain_config = config['domain_algorithm_overrides'].get(domain, {})
+                
+                # First Pass
                 if domain_config.get('skip', False):
                     print(f"  Skipping domain: {domain}")
                     continue
                 
-                algo = domain_config.get('algorithm', config.get('algorithm', 'ant_colony'))
-                print(f"  Domain '{domain}': {len(domain_samples)} samples, algorithm={algo}")
+                algo1 = domain_config.get('algorithm', config.get('algorithm', 'ant_colony'))
+                algo2 = domain_config.get('second_pass_algorithm', 'skip')
                 
-                # Create config for this domain
-                domain_cfg = config.copy()
-                domain_cfg['algorithm'] = algo
+                print(f"  Domain '{domain}': {len(domain_samples)} samples")
+                print(f"    Pass 1: {algo1}")
+                if algo2 != 'skip':
+                    print(f"    Pass 2: {algo2}")
                 
-                # Create interpolator for this domain
-                interpolator = create_interpolator(domain_cfg, domain=domain)
+                domain_interpolators = []
+                
+                # --- Create Pass 1 ---
+                domain_cfg1 = config.copy()
+                domain_cfg1['algorithm'] = algo1
+                interp1 = create_interpolator(domain_cfg1, domain=domain)
                 
                 # Filter allowed_grid to this domain only
                 domain_allowed_grid = {pos for pos in allowed_grid if domain_mapping.get(pos) == domain}
                 
                 # Attach domain-specific attributes
-                interpolator.allowed_grid_override = domain_allowed_grid
-                interpolator.domain_mapping = {pos: domain for pos in domain_allowed_grid}
+                interp1.allowed_grid_override = domain_allowed_grid
+                interp1.domain_mapping = {pos: domain for pos in domain_allowed_grid}
                 
                 # Initialize with only this domain's samples
-                interpolator.initialize_blocks(domain_samples, tuple(block_info['dims']),
+                interp1.initialize_blocks(domain_samples, tuple(block_info['dims']),
                                              all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
                 
-                if hasattr(interpolator, 'create_ants'):
-                    interpolator.create_ants()
+                if hasattr(interp1, 'create_ants'):
+                    interp1.create_ants()
                 
-                multiblock._interpolators[domain] = interpolator
+                domain_interpolators.append(interp1)
+                
+                # --- Create Pass 2 (if configured) ---
+                if algo2 != 'skip':
+                    domain_cfg2 = config.copy()
+                    domain_cfg2['algorithm'] = algo2
+                    interp2 = create_interpolator(domain_cfg2, domain=domain)
+                    
+                    interp2.allowed_grid_override = domain_allowed_grid
+                    interp2.domain_mapping = {pos: domain for pos in domain_allowed_grid}
+                    
+                    # Initialize with original samples (will be augmented later)
+                    interp2.initialize_blocks(domain_samples, tuple(block_info['dims']),
+                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
+                    
+                    if hasattr(interp2, 'create_ants'):
+                        interp2.create_ants()
+                    
+                    domain_interpolators.append(interp2)
+                
+                multiblock._interpolators[domain] = domain_interpolators
             
             # Keep reference to primary interpolator (for compatibility)
             if multiblock._interpolators:
-                multiblock._ant_colony = list(multiblock._interpolators.values())[0]
+                # Just take the first pass of the first domain
+                first_domain_list = list(multiblock._interpolators.values())[0]
+                multiblock._ant_colony = first_domain_list[0]
             
         else:
-            # Original single interpolator approach
+            # Original single interpolator approach (potentially with 2 passes now)
             if config is None:
                 config = {
                     'algorithm': 'ant_colony',
@@ -697,28 +734,72 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     'avoid_visited_threshold': avoid_visited_threshold
                 }
             
-            interpolator = create_interpolator(config)
+            # Check for second pass
+            algo2 = config.get('second_pass_algorithm', 'skip')
             
-            # Attach domain-specific attributes BEFORE initialize_blocks
-            # For molecular clock, don't filter by allowed_grid (let it create blocks anywhere)
-            # For ant colony, use allowed_grid to restrict movement
-            algo_type = config.get('algorithm', 'ant_colony')
-            if algo_type == 'ant_colony':
-                interpolator.allowed_grid_override = allowed_grid
-                interpolator.domain_mapping = domain_mapping
-            elif algo_type == 'molecular_clock':
-                # Enable domain sensitivity for molecular clock
-                interpolator.allowed_grid_override = allowed_grid
-                interpolator.domain_mapping = domain_mapping
-            
-            # Use use_domain_mapping=True to respect allowed_grid_override (geometry)
-            interpolator.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
+            if algo2 != 'skip':
+                print(f"Configuring undomained two-pass interpolation: {config.get('algorithm')} -> {algo2}")
+                multiblock._interpolators = {}
+                domain_interpolators = []
+                
+                # Pass 1
+                interp1 = create_interpolator(config)
+                algo_type = config.get('algorithm', 'ant_colony')
+                if algo_type == 'ant_colony':
+                    interp1.allowed_grid_override = allowed_grid
+                    interp1.domain_mapping = domain_mapping
+                elif algo_type == 'molecular_clock':
+                    interp1.allowed_grid_override = allowed_grid
+                    interp1.domain_mapping = domain_mapping
+                
+                interp1.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
                                          all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
-            
-            if hasattr(interpolator, 'create_ants'):
-                interpolator.create_ants()
-            
-            multiblock._ant_colony = interpolator
+                if hasattr(interp1, 'create_ants'):
+                    interp1.create_ants()
+                domain_interpolators.append(interp1)
+                
+                # Pass 2
+                config2 = config.copy()
+                config2['algorithm'] = algo2
+                interp2 = create_interpolator(config2)
+                if algo2 == 'ant_colony':
+                    interp2.allowed_grid_override = allowed_grid
+                    interp2.domain_mapping = domain_mapping
+                elif algo2 == 'molecular_clock':
+                    interp2.allowed_grid_override = allowed_grid
+                    interp2.domain_mapping = domain_mapping
+                
+                interp2.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
+                                         all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
+                if hasattr(interp2, 'create_ants'):
+                    interp2.create_ants()
+                domain_interpolators.append(interp2)
+                
+                multiblock._interpolators["Undomained"] = domain_interpolators
+                multiblock._ant_colony = interp1
+            else:
+                interpolator = create_interpolator(config)
+                
+                # Attach domain-specific attributes BEFORE initialize_blocks
+                # For molecular clock, don't filter by allowed_grid (let it create blocks anywhere)
+                # For ant colony, use allowed_grid to restrict movement
+                algo_type = config.get('algorithm', 'ant_colony')
+                if algo_type == 'ant_colony':
+                    interpolator.allowed_grid_override = allowed_grid
+                    interpolator.domain_mapping = domain_mapping
+                elif algo_type == 'molecular_clock':
+                    # Enable domain sensitivity for molecular clock
+                    interpolator.allowed_grid_override = allowed_grid
+                    interpolator.domain_mapping = domain_mapping
+                
+                # Use use_domain_mapping=True to respect allowed_grid_override (geometry)
+                interpolator.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
+                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
+                
+                if hasattr(interpolator, 'create_ants'):
+                    interpolator.create_ants()
+                
+                multiblock._ant_colony = interpolator
         
         return multiblock
     else:
@@ -780,14 +861,43 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 'avoid_visited_threshold': avoid_visited_threshold
             }
         
-        interpolator = create_interpolator(config)
-        interpolator.initialize_blocks(sample_blocks, tuple(block_info['dims']),
+        # Check for second pass
+        algo2 = config.get('second_pass_algorithm', 'skip')
+        
+        if algo2 != 'skip':
+            print(f"Configuring undomained two-pass interpolation (auto-blocks): {config.get('algorithm')} -> {algo2}")
+            multiblock._interpolators = {}
+            domain_interpolators = []
+            
+            # Pass 1
+            interp1 = create_interpolator(config)
+            interp1.initialize_blocks(sample_blocks, tuple(block_info['dims']),
                                        min_bounds, block_size, use_domain_mapping=False)
-        
-        if hasattr(interpolator, 'create_ants'):
-            interpolator.create_ants()
-        
-        multiblock._ant_colony = interpolator
+            if hasattr(interp1, 'create_ants'):
+                interp1.create_ants()
+            domain_interpolators.append(interp1)
+            
+            # Pass 2
+            config2 = config.copy()
+            config2['algorithm'] = algo2
+            interp2 = create_interpolator(config2)
+            interp2.initialize_blocks(sample_blocks, tuple(block_info['dims']),
+                                       min_bounds, block_size, use_domain_mapping=False)
+            if hasattr(interp2, 'create_ants'):
+                interp2.create_ants()
+            domain_interpolators.append(interp2)
+            
+            multiblock._interpolators["Undomained"] = domain_interpolators
+            multiblock._ant_colony = interp1
+        else:
+            interpolator = create_interpolator(config)
+            interpolator.initialize_blocks(sample_blocks, tuple(block_info['dims']),
+                                           min_bounds, block_size, use_domain_mapping=False)
+            
+            if hasattr(interpolator, 'create_ants'):
+                interpolator.create_ants()
+            
+            multiblock._ant_colony = interpolator
         return multiblock
 
 def toggle_blocks(plotter):
@@ -833,7 +943,12 @@ def update_interpolation(plotter):
     # Handle multiple interpolators (Scenario 3) or single (Scenario 1 & 2)
     interpolators = []
     if hasattr(blocks, '_interpolators') and blocks._interpolators:
-        interpolators = list(blocks._interpolators.values())
+        # blocks._interpolators is now domain -> list of interpolators
+        # In interactive mode, we currently only run the FIRST pass for each domain
+        # to avoid complexity with data transfer between passes.
+        for domain_list in blocks._interpolators.values():
+            if domain_list:
+                interpolators.append(domain_list[0])
     else:
         interpolators = [interpolator]
         
@@ -1009,9 +1124,28 @@ def export_blocks_to_csv(blocks, filepath):
     # Check if we have multiple interpolators (sequential domain processing)
     if hasattr(blocks, '_interpolators'):
         print(f"  Processing {len(blocks._interpolators)} domain interpolators...")
-        for domain, interpolator in blocks._interpolators.items():
-            print(f"    Exporting domain: {domain} ({len(interpolator.blocks)} blocks)")
-            _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data, rotation_matrix, rotation_center)
+        for domain, interpolator_list in blocks._interpolators.items():
+            # interpolator_list is [Pass1, (optional) Pass2]
+            
+            # We export the LAST interpolator, which contains the cumulative state
+            last_interp = interpolator_list[-1]
+            
+            # Identify original samples to distinguish them from Pass 1 outputs
+            original_sample_positions = set()
+            if len(interpolator_list) > 0:
+                interp1 = interpolator_list[0]
+                for pos, block in interp1.blocks.items():
+                    is_sample = False
+                    if hasattr(block, 'is_sample'): is_sample = block.is_sample
+                    elif isinstance(block, dict): is_sample = block.get('is_sample', False)
+                    
+                    if is_sample:
+                        original_sample_positions.add(pos)
+            
+            print(f"    Exporting domain: {domain} (Final Pass)")
+            _add_interpolator_blocks_to_data(last_interp, min_bounds, block_size, data, rotation_matrix, rotation_center, 
+                                           original_samples=original_sample_positions,
+                                           pass_count=len(interpolator_list))
     else:
         # Single interpolator
         interpolator = blocks._ant_colony
@@ -1024,7 +1158,7 @@ def export_blocks_to_csv(blocks, filepath):
     df.to_csv(filepath, index=False)
     print(f"Exported {len(data)} blocks to {filepath}")
 
-def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data, rotation_matrix=None, rotation_center=None, domain_mapping=None):
+def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data, rotation_matrix=None, rotation_center=None, domain_mapping=None, original_samples=None, pass_count=1):
     """Process blocks from an interpolator and add to data list"""
     # Determine algorithm type
     algo_name = interpolator.get_algorithm_name()
@@ -1045,12 +1179,32 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
             # P_orig = P_aligned @ R + Center
             centroid = centroid @ rotation_matrix + rotation_center
         
+        # Determine Source
+        source = "Unknown"
+        is_sample = False
+        if hasattr(block, 'is_sample'): is_sample = block.is_sample
+        elif isinstance(block, dict): is_sample = block.get('is_sample', False)
+        
+        if is_sample:
+            if original_samples is None or pos in original_samples:
+                source = "Original Sample"
+            else:
+                # It's a sample in this pass, but not in original -> Must be from previous pass
+                source = "First Pass"
+        else:
+            # It's an interpolated block in this pass
+            if pass_count == 1:
+                source = "First Pass"
+            else:
+                source = "Second Pass"
+
         # Initialize common fields with None/NaN for all possible columns
         row = {
             'x': centroid[0],
             'y': centroid[1],
             'z': centroid[2],
             'Algo_Type': algo_type,
+            'Source': source,
             'Value': None,
             'Age': None,
             'Is_Sample': None,
@@ -1134,55 +1288,159 @@ def silent_interpolation(plotter, iterations, interpolation_file):
     if hasattr(blocks, '_interpolators'):
         print(f"Running sequential domain interpolation for {len(blocks._interpolators)} domains...")
         
-        for domain_idx, (domain, interpolator) in enumerate(blocks._interpolators.items(), 1):
-            algo_name = interpolator.get_algorithm_name()
-            print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} ({algo_name}) ===")
+        for domain_idx, (domain, interpolator_list) in enumerate(blocks._interpolators.items(), 1):
+            # interpolator_list is [Pass1, (optional) Pass2]
+            
+            # --- Pass 1 ---
+            interp1 = interpolator_list[0]
+            algo_name1 = interp1.get_algorithm_name()
+            print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 1 ({algo_name1}) ===")
             
             # Force verbose for first iteration if it's an AntColony
-            if hasattr(interpolator, 'verbose'):
-                original_verbose = interpolator.verbose
-                interpolator.verbose = True
+            if hasattr(interp1, 'verbose'):
+                original_verbose = interp1.verbose
+                interp1.verbose = True
             
-            pbar = tqdm(range(iterations), desc=f"Domain {domain} ({algo_name})")
+            pbar = tqdm(range(iterations), desc=f"Domain {domain} - Pass 1")
             for i in pbar:
-                # Use the base class interface
-                should_continue = interpolator.run_iteration(dims)
+                should_continue = interp1.run_iteration(dims)
                 
-                # Restore verbose after first iteration
-                if i == 0 and hasattr(interpolator, 'verbose'):
-                    interpolator.verbose = original_verbose
-                    # Print block count after first iteration
-                    metadata = interpolator.get_metadata()
-                    print(f"\nAfter iteration 1:")
-                    print(f"  Total blocks: {metadata.get('total_blocks', 0)}")
-                    print(f"  Sample blocks: {metadata.get('sample_blocks', 0)}")
-                    print(f"  Interpolated blocks: {metadata.get('interpolated_blocks', 0)}")
-                    print(f"  Remaining ants: {metadata.get('remaining_ants', 0)}")
+                if i == 0 and hasattr(interp1, 'verbose'):
+                    interp1.verbose = original_verbose
                 
-                # Check for early termination
-                if not should_continue or interpolator.is_converged():
-                    pbar.set_description(f"Domain {domain} (converged)")
-                    print(f"Early stop: algorithm converged. Iterations run: {i+1}/{iterations}")
+                if not should_continue or interp1.is_converged():
+                    pbar.set_description(f"Domain {domain} - Pass 1 (converged)")
+                    print(f"Pass 1 converged at iteration {i+1}")
                     break
             
-            # Optionally fill domain-wise after silent run (ant colony specific)
-            if getattr(plotter, '_fill_unvisited_domainwise', False):
-                try:
-                    if hasattr(interpolator, 'fill_unvisited_blocks_domainwise'):
-                        interpolator.fill_unvisited_blocks_domainwise(dims)
-                except Exception as e:
-                    print(f"Domain-wise fill error: {e}")
-            
-            # Print domain metadata
-            metadata = interpolator.get_metadata()
-            print(f"\n=== Domain {domain} Summary ===")
-            for key, value in metadata.items():
-                print(f"{key}: {value}")
+            # --- Pass 2 ---
+            if len(interpolator_list) > 1:
+                interp2 = interpolator_list[1]
+                algo_name2 = interp2.get_algorithm_name()
+                print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 2 ({algo_name2}) ===")
+                
+                print("  Transferring data from Pass 1 to Pass 2...")
+                # Get Pass 1 results (pos -> value)
+                pass1_values = interp1.get_interpolated_values()
+                print(f"  Pass 1 generated {len(pass1_values)} blocks (samples + interpolated).")
+                
+                # Re-initialize Pass 2 with merged samples
+                min_bounds = blocks._block_info['min_bounds']
+                block_size = blocks._block_info['block_size']
+                
+                # Determine if we should enforce domain mapping/grid restriction
+                use_mapping = False
+                if hasattr(interp2, 'allowed_grid_override') and interp2.allowed_grid_override is not None:
+                    use_mapping = True
+                
+                # Double check for undomained special case where allowed_grid_override might be incorrectly set
+                # or if we just want to be absolutely sure we don't trap the ants.
+                if domain == "Undomained" and "Undomained" in blocks._interpolators and len(blocks._interpolators) == 1:
+                     # If we are in the undomained special case, and we suspect the user didn't provide a blocks file
+                     # (or provided an empty one which resulted in auto-blocks), we should ensure use_mapping is False
+                     # UNLESS we are sure allowed_grid_override is valid and intended.
+                     
+                     # In the "Auto-blocks" path (create_blocks else branch), we explicitly do NOT set allowed_grid_override.
+                     # So use_mapping should be False.
+                    
+                     # However, if the user provided a blocks file that was just samples (sparse), allowed_grid_override IS set.
+                     # And use_mapping IS True.
+                     # And the ants ARE trapped.
+                     
+                     # The user claims "the blocks file was indeed empty".
+                     # If the blocks file was empty, create_blocks should have gone to the 'else' branch (if my detection logic is correct).
+                     # OR, it went to the 'if' branch but the dataframe was empty?
+                     
+                     # Let's look at create_blocks logic for empty file.
+                     # if blocks_file is not None:
+                     #    df_blocks = read_autodetect_csv(...)
+                     
+                     # If the file is empty (0 bytes), read_autodetect_csv might fail or return empty DF.
+                     # If it returns empty DF, create_blocks raises ValueError("All block rows have non-numeric coordinates...").
+                     
+                     # So the user must have NOT provided a blocks file path in the UI?
+                     # If the UI field is empty "", then blocks_file is None (if passed correctly).
+                     
+                     # In run_interpolation_cli:
+                     # blocks_file = self.blocks_edit.text() if self.blocks_edit.text() else None
+                     
+                     # So if the field is empty, blocks_file is None.
+                     # So we go to the 'else' branch of create_blocks.
+                     
+                     # In the 'else' branch:
+                     # interp2 = create_interpolator(config2)
+                     # interp2.initialize_blocks(..., use_domain_mapping=False)
+                     
+                     # create_interpolator does NOT set allowed_grid_override unless config has it.
+                     # config comes from UI.
+                     
+                     # So interp2.allowed_grid_override should be None.
+                     # So use_domain_mapping=True is fine?
+                     # Wait, if use_domain_mapping=True, it tries to look up domains in self.domain_mapping.
+                     # If self.domain_mapping is None (which it is in Auto-blocks), it defaults to "default" or "Undomained".
+                     
+                     # So why did the user get "Not in allowed_positions"?
+                     # This error comes from AntColony.run_iteration -> move_ant.
+                     # It checks: if npos not in self.allowed_positions:
+                     
+                     # In initialize_blocks (AntColony):
+                     # if use_domain_mapping:
+                     #    if hasattr(self, 'allowed_grid_override'): ...
+                     #    else: self.allowed_positions = set(sample_blocks.keys())
+                     # else:
+                     #    self.allowed_positions = {full grid}
+                     
+                     # So if use_mapping is False, allowed_positions is full grid.
+                     # If allowed_positions is full grid, "Not in allowed_positions" should only happen at the edges of the bounding box.
+                     # 900k rejections suggests it's happening everywhere.
+                     
+                     # So allowed_positions MUST be restricted.
+                     # So use_mapping MUST be True.
+                     # So allowed_grid_override MUST be set.
+                     
+                     # How did allowed_grid_override get set in the 'else' branch?
+                     # I checked the code, it's not set there.
+                     
+                     # Is it possible that 'interp2' in the loop is NOT the one created in the 'else' branch?
+                     # multiblock._interpolators["Undomained"] = [interp1, interp2]
+                     # In the loop: interp2 = interpolator_list[1]
+                     
+                     # It should be the same object.
+                     
+                     # Wait! I see `interp2.initialize_blocks(..., use_domain_mapping=True)`
+                     interp2.initialize_blocks(pass1_values, dims, min_bounds, block_size, use_domain_mapping=True)
+                     
+                     if hasattr(interp2, 'create_ants'):
+                         interp2.create_ants()
+                    
+                     # Run Pass 2
+                     if hasattr(interp2, 'verbose'):
+                         original_verbose = interp2.verbose
+                         interp2.verbose = True
+                    
+                     pbar = tqdm(range(iterations), desc=f"Domain {domain} - Pass 2")
+                     for i in pbar:
+                         should_continue = interp2.run_iteration(dims)
+                         
+                         if i == 0 and hasattr(interp2, 'verbose'):
+                             interp2.verbose = original_verbose
+                         
+                         if not should_continue or interp2.is_converged():
+                             pbar.set_description(f"Domain {domain} - Pass 2 (converged)")
+                             print(f"Pass 2 converged at iteration {i+1}")
+                             break
+                
+                # Print domain summary (of the last pass)
+                last_interp = interpolator_list[-1]
+                metadata = last_interp.get_metadata()
+                print(f"\n=== Domain {domain} Summary ===")
+                for key, value in metadata.items():
+                    print(f"{key}: {value}")
     else:
         # Single interpolator
         interpolator = blocks._ant_colony
         algo_name = interpolator.get_algorithm_name()
-        print(f"Running {algo_name} interpolation...")
+        print(f"Running {algo_name} for {iterations} iterations...")
         
         # Force verbose for first iteration if it's an AntColony
         if hasattr(interpolator, 'verbose'):
@@ -1551,7 +1809,7 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             )
 
         # Add blocks without scalar bar
-        if getattr(plotter, '_value_is_indexed', False):
+        if getattr(plotter, '_value_is_indexed', False) and hasattr(plotter, '_lfc_bins') and isinstance(plotter._colormap, ListedColormap):
             annotations = {i: plotter._lfc_tick_labels[i] for i in range(len(plotter._lfc_tick_labels))}
             plotter._blocks_actor = plotter.add_mesh(
                 blocks,
@@ -1628,26 +1886,28 @@ if __name__ == "__main__":
         def __init__(self, blocks_file, blocks_delimiter, blocks_header_line, block_domain_col, parent=None):
             super().__init__(parent)
             self.setWindowTitle("Domain Algorithm Mapping")
-            self.resize(700, 500)
+            self.resize(800, 500)
             
-            self.domain_configs = {}  # domain -> {'algorithm': str, 'skip': bool, 'params': dict}
+            self.domain_configs = {}  # domain -> {'algorithm': str, 'second_pass_algorithm': str, 'skip': bool}
             
             layout = QtWidgets.QVBoxLayout()
             self.setLayout(layout)
             
             # Info label
-            info = QtWidgets.QLabel("Configure which algorithm to use for each domain.\nYou can also skip domains to exclude them from interpolation.")
+            info = QtWidgets.QLabel("Configure which algorithm to use for each domain.\n"
+                                  "You can configure a second pass to run after the first one completes.\n"
+                                  "The second pass uses the output of the first pass as input.")
             info.setWordWrap(True)
             layout.addWidget(info)
             
             # Table for domain mappings
             self.table = QtWidgets.QTableWidget()
             self.table.setColumnCount(3)
-            self.table.setHorizontalHeaderLabels(['Domain', 'Algorithm', 'Skip Domain'])
-            self.table.horizontalHeader().setStretchLastSection(False)
+            self.table.setHorizontalHeaderLabels(['Domain', 'First Pass Algorithm', 'Second Pass Algorithm'])
+            self.table.horizontalHeader().setStretchLastSection(True)
             self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-            self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-            self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
             layout.addWidget(self.table)
             
             # Load domains from blocks file
@@ -1655,7 +1915,7 @@ if __name__ == "__main__":
             
             # Buttons
             btn_layout = QtWidgets.QHBoxLayout()
-            self.apply_all_btn = QtWidgets.QPushButton('Apply Algorithm to All')
+            self.apply_all_btn = QtWidgets.QPushButton('Apply First Pass to All')
             self.apply_all_btn.clicked.connect(self.apply_to_all)
             btn_layout.addWidget(self.apply_all_btn)
             btn_layout.addStretch()
@@ -1707,48 +1967,66 @@ if __name__ == "__main__":
                     domain_item.setFlags(domain_item.flags() & ~QtCore.Qt.ItemIsEditable)
                     self.table.setItem(i, 0, domain_item)
                     
-                    # Algorithm selector
-                    algo_combo = QtWidgets.QComboBox()
-                    algo_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'skip'])
-                    algo_combo.setCurrentText('(use default)')
-                    self.table.setCellWidget(i, 1, algo_combo)
+                    # First Pass Algorithm selector
+                    algo1_combo = QtWidgets.QComboBox()
+                    algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'net_connector', 'skip'])
+                    algo1_combo.setCurrentText('(use default)')
+                    self.table.setCellWidget(i, 1, algo1_combo)
                     
-                    # Skip checkbox
-                    skip_check = QtWidgets.QCheckBox()
-                    skip_check.setEnabled(False)  # Controlled by algorithm selection
-                    skip_widget = QtWidgets.QWidget()
-                    skip_layout = QtWidgets.QHBoxLayout(skip_widget)
-                    skip_layout.addWidget(skip_check)
-                    skip_layout.setAlignment(QtCore.Qt.AlignCenter)
-                    skip_layout.setContentsMargins(0, 0, 0, 0)
-                    self.table.setCellWidget(i, 2, skip_widget)
+                    # Second Pass Algorithm selector
+                    algo2_combo = QtWidgets.QComboBox()
+                    algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'net_connector'])
+                    algo2_combo.setCurrentText('skip')
+                    self.table.setCellWidget(i, 2, algo2_combo)
                     
-                    # Connect algorithm change to update skip checkbox
-                    algo_combo.currentTextChanged.connect(
-                        lambda text, row=i: self.update_skip_state(row, text)
+                    # Connect signals
+                    algo1_combo.currentTextChanged.connect(
+                        lambda text, row=i: self.on_first_pass_changed(row, text)
+                    )
+                    algo2_combo.currentTextChanged.connect(
+                        lambda text, row=i: self.on_second_pass_changed(row, text)
                     )
                     
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to load domains: {e}')
         
-        def update_skip_state(self, row, algorithm):
-            """Update skip checkbox based on algorithm selection"""
-            skip_widget = self.table.cellWidget(row, 2)
-            if skip_widget:
-                skip_check = skip_widget.findChild(QtWidgets.QCheckBox)
-                if skip_check:
-                    if algorithm == 'skip':
-                        skip_check.setChecked(True)
-                        skip_check.setEnabled(False)
-                    else:
-                        skip_check.setChecked(False)
-                        skip_check.setEnabled(False)
+        def on_first_pass_changed(self, row, text):
+            """Handle changes to first pass algorithm"""
+            algo2_combo = self.table.cellWidget(row, 2)
+            if not algo2_combo:
+                return
+                
+            if text == 'skip':
+                # If first pass is skip, second pass must be skip and disabled
+                algo2_combo.setCurrentText('skip')
+                algo2_combo.setEnabled(False)
+            else:
+                algo2_combo.setEnabled(True)
+                # Ensure second pass is not same as first (unless skip)
+                current_algo2 = algo2_combo.currentText()
+                if current_algo2 == text and text != 'skip':
+                    algo2_combo.setCurrentText('skip')
         
+        def on_second_pass_changed(self, row, text):
+            """Handle changes to second pass algorithm"""
+            algo1_combo = self.table.cellWidget(row, 1)
+            if not algo1_combo:
+                return
+                
+            algo1 = algo1_combo.currentText()
+            
+            # Don't allow same algorithm (unless skip)
+            if text != 'skip' and text == algo1:
+                QtWidgets.QMessageBox.warning(self, "Invalid Selection", 
+                    "Second pass algorithm cannot be the same as the first pass.")
+                algo2_combo = self.table.cellWidget(row, 2)
+                algo2_combo.setCurrentText('skip')
+
         def apply_to_all(self):
-            """Apply same algorithm to all domains"""
-            algorithms = ['(use default)', 'ant_colony', 'molecular_clock', 'skip']
+            """Apply same first pass algorithm to all domains"""
+            algorithms = ['(use default)', 'ant_colony', 'molecular_clock', 'net_connector', 'skip']
             algo, ok = QtWidgets.QInputDialog.getItem(
-                self, 'Apply to All', 'Select algorithm for all domains:', 
+                self, 'Apply to All', 'Select first pass algorithm for all domains:', 
                 algorithms, 0, False
             )
             if ok:
@@ -1762,17 +2040,28 @@ if __name__ == "__main__":
             configs = {}
             for i in range(self.table.rowCount()):
                 domain_item = self.table.item(i, 0)
-                algo_combo = self.table.cellWidget(i, 1)
+                algo1_combo = self.table.cellWidget(i, 1)
+                algo2_combo = self.table.cellWidget(i, 2)
                 
-                if domain_item and algo_combo:
+                if domain_item and algo1_combo and algo2_combo:
                     domain = domain_item.text()
-                    algorithm = algo_combo.currentText()
+                    algo1 = algo1_combo.currentText()
+                    algo2 = algo2_combo.currentText()
                     
-                    if algorithm != '(use default)':
-                        if algorithm == 'skip':
-                            configs[domain] = {'skip': True}
-                        else:
-                            configs[domain] = {'algorithm': algorithm}
+                    config = {}
+                    
+                    # First Pass
+                    if algo1 == 'skip':
+                        config['skip'] = True
+                    elif algo1 != '(use default)':
+                        config['algorithm'] = algo1
+                    
+                    # Second Pass
+                    if algo2 != 'skip':
+                        config['second_pass_algorithm'] = algo2
+                    
+                    if config:
+                        configs[domain] = config
             
             return configs
         
@@ -1780,17 +2069,32 @@ if __name__ == "__main__":
             """Set domain algorithm configurations from loaded config"""
             for i in range(self.table.rowCount()):
                 domain_item = self.table.item(i, 0)
-                algo_combo = self.table.cellWidget(i, 1)
+                algo1_combo = self.table.cellWidget(i, 1)
+                algo2_combo = self.table.cellWidget(i, 2)
                 
-                if domain_item and algo_combo:
+                if domain_item and algo1_combo and algo2_combo:
                     domain = domain_item.text()
                     if domain in configs:
                         config = configs[domain]
+                        
+                        # Set First Pass
                         if config.get('skip', False):
-                            algo_combo.setCurrentText('skip')
+                            algo1_combo.setCurrentText('skip')
                         elif 'algorithm' in config:
-                            algo_combo.setCurrentText(config['algorithm'])
+                            algo1_combo.setCurrentText(config['algorithm'])
+                        
+                        # Set Second Pass
+                        if 'second_pass_algorithm' in config:
+                            algo2_combo.setCurrentText(config['second_pass_algorithm'])
+                        else:
+                            algo2_combo.setCurrentText('skip')
 
+        def accept(self):
+            super().accept()
+        
+        def reject(self):
+            super().reject()
+        
     class ConfigDialog(QtWidgets.QDialog):
         def __init__(self):
             super().__init__()
@@ -1823,7 +2127,12 @@ if __name__ == "__main__":
             mc_tab.setLayout(mc_form)
             tabs.addTab(mc_tab, "Molecular Clock")
             
-            # Tab 4: Advanced Options
+            nc_tab = QtWidgets.QWidget()
+            nc_form = QtWidgets.QFormLayout()
+            nc_tab.setLayout(nc_form)
+            tabs.addTab(nc_tab, "Net Connector")
+
+            # Tab 5: Advanced Options
             advanced_tab = QtWidgets.QWidget()
             advanced_form = QtWidgets.QFormLayout()
             advanced_tab.setLayout(advanced_form)
@@ -1863,8 +2172,29 @@ if __name__ == "__main__":
 
             # Algorithm selection
             self.algorithm_combo = QtWidgets.QComboBox()
-            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock'])
-            files_form.addRow('Algorithm', self.algorithm_combo)
+            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'net_connector'])
+            
+            self.second_pass_combo = QtWidgets.QComboBox()
+            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'net_connector'])
+            self.second_pass_combo.setCurrentText('skip')
+            
+            def validate_algorithms():
+                algo1 = self.algorithm_combo.currentText()
+                algo2 = self.second_pass_combo.currentText()
+                if algo2 != 'skip' and algo1 == algo2:
+                    QtWidgets.QMessageBox.warning(self, "Invalid Selection", 
+                        f"Second pass algorithm cannot be the same as the first pass ({algo1}).")
+                    self.second_pass_combo.setCurrentText('skip')
+
+            self.algorithm_combo.currentTextChanged.connect(validate_algorithms)
+            self.second_pass_combo.currentTextChanged.connect(validate_algorithms)
+            
+            algo_layout = QtWidgets.QHBoxLayout()
+            algo_layout.addWidget(self.algorithm_combo)
+            algo_layout.addWidget(QtWidgets.QLabel("Second Pass:"))
+            algo_layout.addWidget(self.second_pass_combo)
+            
+            files_form.addRow('First Pass', algo_layout)
 
             # Delimiter selectors
             delim_opts = [',',';','\t','|']
@@ -2040,6 +2370,16 @@ if __name__ == "__main__":
             mc_form.addRow('Detect Multiple Events', self.mc_detect_multiple)
             mc_form.addRow('Interpolation Method', self.mc_interp_method)
 
+            # === NET CONNECTOR TAB ===
+            self.nc_distance_threshold = dbl_spin(10.0, 0.1, 1000.0, 1.0)
+            self.nc_distance_threshold.setToolTip('Maximum distance to search for a connection (in blocks).')
+            
+            self.nc_grade_difference = dbl_spin(1.0, 0.0, 1000.0, 0.1)
+            self.nc_grade_difference.setToolTip('Maximum grade difference allowed for a connection.')
+            
+            nc_form.addRow('Distance Threshold', self.nc_distance_threshold)
+            nc_form.addRow('Grade Difference', self.nc_grade_difference)
+
             # === ADVANCED TAB ===
             self.average_with_blocks = QtWidgets.QCheckBox(); self.average_with_blocks.setChecked(True)
             self.verbose = QtWidgets.QCheckBox(); self.verbose.setChecked(False)
@@ -2178,46 +2518,60 @@ if __name__ == "__main__":
                 if hasattr(blocks, '_interpolators'):
                     print(f"Running sequential domain interpolation for {len(blocks._interpolators)} domains...")
                     
-                    for domain_idx, (domain, interpolator) in enumerate(blocks._interpolators.items(), 1):
-                        algo_name = interpolator.get_algorithm_name()
-                        print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} ({algo_name}) ===")
+                    for domain_idx, (domain, interpolator_list) in enumerate(blocks._interpolators.items(), 1):
+                        # interpolator_list is [Pass1, (optional) Pass2]
                         
-                        print(f"Running {algo_name} for {iterations} iterations...")
-                        pbar = tqdm(range(iterations), desc=f"Domain {domain}")
+                        # --- Pass 1 ---
+                        interp1 = interpolator_list[0]
+                        algo_name1 = interp1.get_algorithm_name()
+                        print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 1 ({algo_name1}) ===")
+                        
+                        print(f"Running {algo_name1} for {iterations} iterations...")
+                        pbar = tqdm(range(iterations), desc=f"Domain {domain} - Pass 1")
                         for i in pbar:
-                            should_continue = interpolator.run_iteration(dims)
-                            if not should_continue or interpolator.is_converged():
-                                print(f"Converged at iteration {i+1}")
+                            should_continue = interp1.run_iteration(dims)
+                            if not should_continue or interp1.is_converged():
+                                print(f"Pass 1 converged at iteration {i+1}")
                                 break
                         
-                        # Print domain summary
-                        metadata = interpolator.get_metadata()
-                        print(f"\n=== Domain {domain} Summary ===")
-                        for key, value in metadata.items():
-                            if key in ['intrusion_trees', 'ancestor_nodes']:
-                                print(f"{key}: <{len(value)} items>")
-                            else:
-                                print(f"{key}: {value}")
-                else:
-                    # Single interpolator
-                    interpolator = blocks._ant_colony
-                    algo_name = interpolator.get_algorithm_name()
-                    print(f"Running {algo_name} for {iterations} iterations...")
-                    pbar = tqdm(range(iterations), desc="Interpolating")
-                    for i in pbar:
-                        should_continue = interpolator.run_iteration(dims)
-                        if not should_continue or interpolator.is_converged():
-                            print(f"Converged at iteration {i+1}")
-                            break
-                    
-                    # Print summary
-                    metadata = interpolator.get_metadata()
-                    print(f"\n=== Interpolation Summary ===")
-                    for key, value in metadata.items():
-                        if key in ['intrusion_trees', 'ancestor_nodes']:
-                            print(f"{key}: <{len(value)} items>")
-                        else:
-                            print(f"{key}: {value}")
+                        # --- Pass 2 ---
+                        if len(interpolator_list) > 1:
+                            interp2 = interpolator_list[1]
+                            algo_name2 = interp2.get_algorithm_name()
+                            print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 2 ({algo_name2}) ===")
+                            
+                            print("  Transferring data from Pass 1 to Pass 2...")
+                            pass1_values = interp1.get_interpolated_values()
+                            print(f"  Pass 1 generated {len(pass1_values)} blocks.")
+                            
+                            # Re-initialize Pass 2 with merged samples
+                            min_bounds = blocks._block_info['min_bounds']
+                            block_size = blocks._block_info['block_size']
+                            
+                            # Determine if we should enforce domain mapping/grid restriction
+                            use_mapping = False
+                            if hasattr(interp2, 'allowed_grid_override') and interp2.allowed_grid_override is not None:
+                                use_mapping = True
+                            
+                            interp2.initialize_blocks(pass1_values, dims, min_bounds, block_size, use_domain_mapping=use_mapping)
+                            
+                            if hasattr(interp2, 'create_ants'):
+                                interp2.create_ants()
+                            
+                            print(f"Running {algo_name2} for {iterations} iterations...")
+                            pbar = tqdm(range(iterations), desc=f"Domain {domain} - Pass 2")
+                            for i in pbar:
+                                should_continue = interp2.run_iteration(dims)
+                                if not should_continue or interp2.is_converged():
+                                    print(f"Pass 2 converged at iteration {i+1}")
+                                    break
+                
+                # Print domain summary (of the last pass)
+                last_interp = interpolator_list[-1]
+                metadata = last_interp.get_metadata()
+                print(f"\n=== Domain {domain} Summary ===")
+                for key, value in metadata.items():
+                    print(f"{key}: {value}")
                 
                 # Export results (handles both single and multiple interpolators)
                 export_blocks_to_csv(blocks, interpolation_file)
@@ -2282,6 +2636,9 @@ if __name__ == "__main__":
                 ,'block_domain_col': (self.block_domain_col.currentText() if (self.block_domain_col.count() and self.block_domain_col.currentText() != '(None)') else None)
                 ,'process_domains_sequentially': self.process_domains_sequentially.isChecked()
                 ,'algorithm': self.algorithm_combo.currentText()
+                ,'second_pass_algorithm': self.second_pass_combo.currentText()
+                ,'distance_threshold': self.nc_distance_threshold.value()
+                ,'grade_difference': self.nc_grade_difference.value()
                 ,'molecular_clock_params': {
                     'spatial_weight': self.mc_spatial_weight.value(),
                     'attr_weight': self.mc_attr_weight.value(),
@@ -2334,6 +2691,8 @@ if __name__ == "__main__":
                 if isinstance(bs, (list, tuple)) and len(bs) == 3:
                     self.block_x.setValue(int(bs[0])); self.block_y.setValue(int(bs[1])); self.block_z.setValue(int(bs[2]))
                 self.range_size.setValue(float(data.get('range_size', self.range_size.value())))
+                self.nc_distance_threshold.setValue(float(data.get('distance_threshold', self.nc_distance_threshold.value())))
+                self.nc_grade_difference.setValue(float(data.get('grade_difference', self.nc_grade_difference.value())))
                 self.max_pheromone.setValue(int(data.get('max_pheromone', self.max_pheromone.value())))
                 self.ants_per_sample.setValue(int(data.get('ants_per_sample', self.ants_per_sample.value())))
                 self.iterations.setValue(int(data.get('iterations', self.iterations.value())))
@@ -2358,6 +2717,12 @@ if __name__ == "__main__":
                     idx = self.algorithm_combo.findText(algo)
                     if idx >= 0:
                         self.algorithm_combo.setCurrentIndex(idx)
+                
+                if 'second_pass_algorithm' in data:
+                    algo2 = data['second_pass_algorithm']
+                    idx2 = self.second_pass_combo.findText(algo2)
+                    if idx2 >= 0:
+                        self.second_pass_combo.setCurrentIndex(idx2)
                 
                 # Molecular clock parameters
                 mc_params = data.get('molecular_clock_params', data.get('biochemical_clock_params', {}))
@@ -2396,38 +2761,6 @@ if __name__ == "__main__":
                 QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to save config: {e}')
 
     app = QtWidgets.QApplication(sys.argv)
-    dialog = ConfigDialog()
-    if dialog.exec_() == QtWidgets.QDialog.Accepted:
-        config = dialog.to_dict()
-        load_and_visualize_samples(
-            samples_file=config['samples_file'],
-            block_size=config['block_size'],
-            value_filter=config['value_filter'],
-            verbose=config['verbose'],
-            iterations=config['iterations'],
-            range_size=config['range_size'],
-            max_pheromone=config['max_pheromone'],
-            ants_per_sample=config['ants_per_sample'],
-            blocks_file=config['blocks_file'],
-            color_file=config['color_file'],
-            background_value=config['background_value'],
-            background_distance=config['background_distance'],
-            average_with_blocks=config['average_with_blocks'],
-            samples_delimiter=config['samples_delimiter'],
-            blocks_delimiter=config['blocks_delimiter'],
-            fill_unvisited_domainwise=config['fill_unvisited_domainwise'],
-            avoid_visited_threshold_enabled=config['avoid_visited_threshold_enabled'],
-            avoid_visited_threshold=config['avoid_visited_threshold'],
-            samples_header_line=config['samples_header_line'],
-            sample_x_col=config['sample_x_col'],
-            sample_y_col=config['sample_y_col'],
-            sample_z_col=config['sample_z_col'],
-            sample_value_col=config['sample_value_col'],
-            blocks_header_line=config['blocks_header_line'],
-            block_x_col=config['block_x_col'],
-            block_y_col=config['block_y_col'],
-            block_z_col=config['block_z_col'],
-            block_domain_col=config['block_domain_col'],
-            config=config
-        )
-    sys.exit()
+    window = ConfigDialog()
+    window.show()
+    sys.exit(app.exec_())
