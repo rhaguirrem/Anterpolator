@@ -15,7 +15,7 @@ from sklearn.decomposition import PCA
 sys.path.append("C:/Projects/Anterpolator")
 from ant_colony import AntColonyInterpolator
 from molecular_clock_interpolator import MolecularClockInterpolator
-from net_connector_interpolator import NetConnectorInterpolator
+from string_theory_interpolator import StringTheoryInterpolator
 from interpolator_base import InterpolatorBase
 
 # --- Interpolator Factory ---
@@ -39,8 +39,8 @@ def create_interpolator(config, domain=None, current_algorithm=None):
     # Determine which algorithm to use
     algo_type = current_algorithm if current_algorithm else config.get('algorithm', 'ant_colony')
     
-    # Check for domain-specific override
-    if domain and 'domain_algorithm_overrides' in config:
+    # Check for domain-specific override (ONLY if not explicitly overridden by current_algorithm)
+    if not current_algorithm and domain and 'domain_algorithm_overrides' in config:
         domain_config = config['domain_algorithm_overrides'].get(domain, {})
         if 'algorithm' in domain_config:
             algo_type = domain_config['algorithm']
@@ -59,7 +59,8 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             background_distance=config.get('background_distance', None),
             average_with_blocks=config.get('average_with_blocks', False),
             avoid_visited_threshold_enabled=config.get('avoid_visited_threshold_enabled', False),
-            avoid_visited_threshold=config.get('avoid_visited_threshold', 100)
+            avoid_visited_threshold=config.get('avoid_visited_threshold', 100),
+            ants_sampling_percentage=config.get('ants_sampling_percentage', 100.0)
         )
     
     elif algo_type == 'molecular_clock':
@@ -78,10 +79,30 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             verbose=config.get('verbose', False)
         )
     
-    elif algo_type == 'net_connector':
-        return NetConnectorInterpolator(
-            distance_threshold=config.get('distance_threshold', 10.0),
-            grade_difference=config.get('grade_difference', 1.0),
+    elif algo_type == 'string_theory' or algo_type == 'net_connector':
+        st_params = config.get('string_theory_params', {})
+        # Fallback to root config if not in sub-dict (for backward compatibility or direct config usage)
+        dist_thresh = st_params.get('distance_threshold', config.get('distance_threshold', 10.0))
+        grade_diff = st_params.get('grade_difference', config.get('grade_difference', 1.0))
+        connect_all = st_params.get('connect_to_all', config.get('connect_to_all', True))
+        max_connections = st_params.get('max_connections', config.get('max_connections', 1))
+        collision_policy = st_params.get('collision_policy', config.get('collision_policy', 'average'))
+        processing_order = st_params.get('processing_order', config.get('processing_order', 'ascending'))
+        
+        filter_by_frequency = st_params.get('filter_by_frequency', config.get('filter_by_frequency', False))
+        min_azimuth_freq = st_params.get('min_azimuth_freq', config.get('min_azimuth_freq', 10.0))
+        min_dip_freq = st_params.get('min_dip_freq', config.get('min_dip_freq', 10.0))
+        
+        return StringTheoryInterpolator(
+            distance_threshold=dist_thresh,
+            grade_difference=grade_diff,
+            connect_to_all=connect_all,
+            max_connections=max_connections,
+            collision_policy=collision_policy,
+            processing_order=processing_order,
+            filter_by_frequency=filter_by_frequency,
+            min_azimuth_freq=min_azimuth_freq,
+            min_dip_freq=min_dip_freq,
             verbose=config.get('verbose', False)
         )
     
@@ -399,8 +420,8 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                   blocks_header_line=1,
                   block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
                   config=None):
-    if blocks_file is not None:
-        print("Loading predefined cells from blocks_file...")
+    if blocks_file and str(blocks_file).strip():
+        print(f"Loading predefined cells from blocks_file: {blocks_file}...")
         if blocks_header_line and blocks_header_line != 1 and blocks_delimiter:
             # Use custom header line parsing
             df_blocks, parsed_cols = read_csv_with_selected_header(blocks_file, blocks_delimiter, blocks_header_line, expected_min_cols=3)
@@ -627,7 +648,8 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'block_size': unified_dims.tolist(),
             'allowed_grid': list(allowed_grid),
             'rotation_matrix': rotation_matrix if is_rotated else None,
-            'rotation_center': rotation_center if is_rotated else None
+            'rotation_center': rotation_center if is_rotated else None,
+            'domain_mapping': domain_mapping
         }
         multiblock = pv.MultiBlock(block_data)
         # Store metadata on multiblock with private-style names to avoid PyVista attribute restrictions
@@ -679,13 +701,24 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 # Filter allowed_grid to this domain only
                 domain_allowed_grid = {pos for pos in allowed_grid if domain_mapping.get(pos) == domain}
                 
+                # Check if we have any non-sample blocks in this domain (sparse vs dense definition)
+                # If the allowed grid is just the samples, we shouldn't enforce it as a constraint.
+                has_extra_blocks = len(domain_allowed_grid) > len(domain_samples) * 1.2
+                print(f"  Domain '{domain}' sparse check: allowed={len(domain_allowed_grid)}, samples={len(domain_samples)}, has_extra={has_extra_blocks}")
+                
                 # Attach domain-specific attributes
-                interp1.allowed_grid_override = domain_allowed_grid
-                interp1.domain_mapping = {pos: domain for pos in domain_allowed_grid}
+                if has_extra_blocks:
+                    interp1.allowed_grid_override = domain_allowed_grid
+                    interp1.domain_mapping = {pos: domain for pos in domain_allowed_grid}
+                    use_mapping = True
+                else:
+                    interp1.allowed_grid_override = None
+                    interp1.domain_mapping = None
+                    use_mapping = False
                 
                 # Initialize with only this domain's samples
                 interp1.initialize_blocks(domain_samples, tuple(block_info['dims']),
-                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
+                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping)
                 
                 if hasattr(interp1, 'create_ants'):
                     interp1.create_ants()
@@ -696,14 +729,20 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 if algo2 != 'skip':
                     domain_cfg2 = config.copy()
                     domain_cfg2['algorithm'] = algo2
-                    interp2 = create_interpolator(domain_cfg2, domain=domain)
+                    interp2 = create_interpolator(domain_cfg2, domain=domain, current_algorithm=algo2)
                     
-                    interp2.allowed_grid_override = domain_allowed_grid
-                    interp2.domain_mapping = {pos: domain for pos in domain_allowed_grid}
+                    if has_extra_blocks:
+                        interp2.allowed_grid_override = domain_allowed_grid
+                        interp2.domain_mapping = {pos: domain for pos in domain_allowed_grid}
+                        use_mapping_2 = True
+                    else:
+                        interp2.allowed_grid_override = None
+                        interp2.domain_mapping = None
+                        use_mapping_2 = False
                     
                     # Initialize with original samples (will be augmented later)
                     interp2.initialize_blocks(domain_samples, tuple(block_info['dims']),
-                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
+                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_2)
                     
                     if hasattr(interp2, 'create_ants'):
                         interp2.create_ants()
@@ -742,18 +781,32 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 multiblock._interpolators = {}
                 domain_interpolators = []
                 
+                # Check if we have any non-sample blocks (sparse vs dense definition)
+                has_extra_blocks = len(allowed_grid) > len(multiblock._sample_blocks) * 1.2
+                print(f"  Undomained (2-pass) sparse check: allowed={len(allowed_grid)}, samples={len(multiblock._sample_blocks)}, has_extra={has_extra_blocks}")
+                
                 # Pass 1
                 interp1 = create_interpolator(config)
                 algo_type = config.get('algorithm', 'ant_colony')
-                if algo_type == 'ant_colony':
-                    interp1.allowed_grid_override = allowed_grid
-                    interp1.domain_mapping = domain_mapping
-                elif algo_type == 'molecular_clock':
-                    interp1.allowed_grid_override = allowed_grid
-                    interp1.domain_mapping = domain_mapping
+                
+                if has_extra_blocks:
+                    if algo_type == 'ant_colony':
+                        interp1.allowed_grid_override = allowed_grid
+                        interp1.domain_mapping = domain_mapping
+                    elif algo_type == 'molecular_clock':
+                        interp1.allowed_grid_override = allowed_grid
+                        interp1.domain_mapping = domain_mapping
+                    elif algo_type == 'string_theory':
+                        interp1.allowed_grid_override = allowed_grid
+                        interp1.domain_mapping = domain_mapping
+                    use_mapping_1 = True
+                else:
+                    interp1.allowed_grid_override = None
+                    interp1.domain_mapping = None
+                    use_mapping_1 = False
                 
                 interp1.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
-                                         all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
+                                         all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_1)
                 if hasattr(interp1, 'create_ants'):
                     interp1.create_ants()
                 domain_interpolators.append(interp1)
@@ -762,15 +815,25 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 config2 = config.copy()
                 config2['algorithm'] = algo2
                 interp2 = create_interpolator(config2)
-                if algo2 == 'ant_colony':
-                    interp2.allowed_grid_override = allowed_grid
-                    interp2.domain_mapping = domain_mapping
-                elif algo2 == 'molecular_clock':
-                    interp2.allowed_grid_override = allowed_grid
-                    interp2.domain_mapping = domain_mapping
+                
+                if has_extra_blocks:
+                    if algo2 == 'ant_colony':
+                        interp2.allowed_grid_override = allowed_grid
+                        interp2.domain_mapping = domain_mapping
+                    elif algo2 == 'molecular_clock':
+                        interp2.allowed_grid_override = allowed_grid
+                        interp2.domain_mapping = domain_mapping
+                    elif algo2 == 'string_theory':
+                        interp2.allowed_grid_override = allowed_grid
+                        interp2.domain_mapping = domain_mapping
+                    use_mapping_2 = True
+                else:
+                    interp2.allowed_grid_override = None
+                    interp2.domain_mapping = None
+                    use_mapping_2 = False
                 
                 interp2.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
-                                         all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
+                                         all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_2)
                 if hasattr(interp2, 'create_ants'):
                     interp2.create_ants()
                 domain_interpolators.append(interp2)
@@ -784,17 +847,35 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 # For molecular clock, don't filter by allowed_grid (let it create blocks anywhere)
                 # For ant colony, use allowed_grid to restrict movement
                 algo_type = config.get('algorithm', 'ant_colony')
-                if algo_type == 'ant_colony':
-                    interpolator.allowed_grid_override = allowed_grid
-                    interpolator.domain_mapping = domain_mapping
-                elif algo_type == 'molecular_clock':
-                    # Enable domain sensitivity for molecular clock
-                    interpolator.allowed_grid_override = allowed_grid
-                    interpolator.domain_mapping = domain_mapping
+                
+                # Check if we have any non-sample blocks in this domain (sparse vs dense definition)
+                # If the allowed grid is just the samples, we shouldn't enforce it as a constraint.
+                # In undomained mode with blocks_file=None, allowed_grid is not defined here, but we are in the blocks_file!=None branch.
+                # allowed_grid comes from domain_mapping.keys()
+                
+                has_extra_blocks = len(allowed_grid) > len(multiblock._sample_blocks) * 1.2
+                print(f"  Undomained (1-pass) sparse check: allowed={len(allowed_grid)}, samples={len(multiblock._sample_blocks)}, has_extra={has_extra_blocks}")
+                
+                if has_extra_blocks:
+                    if algo_type == 'ant_colony':
+                        interpolator.allowed_grid_override = allowed_grid
+                        interpolator.domain_mapping = domain_mapping
+                    elif algo_type == 'molecular_clock':
+                        interpolator.allowed_grid_override = allowed_grid
+                        interpolator.domain_mapping = domain_mapping
+                    elif algo_type == 'string_theory':
+                        interpolator.allowed_grid_override = allowed_grid
+                        interpolator.domain_mapping = domain_mapping
+                    
+                    use_mapping = True
+                else:
+                    interpolator.allowed_grid_override = None
+                    interpolator.domain_mapping = None
+                    use_mapping = False
                 
                 # Use use_domain_mapping=True to respect allowed_grid_override (geometry)
                 interpolator.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
-                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=True)
+                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping)
                 
                 if hasattr(interpolator, 'create_ants'):
                     interpolator.create_ants()
@@ -861,6 +942,28 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 'avoid_visited_threshold': avoid_visited_threshold
             }
         
+        # Generate full grid domain mapping for "Undomained" mode
+        # This ensures that algorithms like String Theory (which rely on domain mapping)
+        # treat the entire bounding box as a valid domain.
+        print("Generating full grid domain mapping for Undomained mode...")
+        full_domain_mapping = {}
+        full_allowed_grid = set()
+        nx, ny, nz = tuple(block_info['dims'])
+        
+        # Optimization: Only generate if grid is not excessively large (e.g. < 10M blocks)
+        # Otherwise, we might run out of memory.
+        if nx * ny * nz < 10_000_000:
+            for i in range(nx):
+                for j in range(ny):
+                    for k in range(nz):
+                        pos = (i, j, k)
+                        full_domain_mapping[pos] = "Default"
+                        full_allowed_grid.add(pos)
+        else:
+            print("Warning: Grid too large for full domain mapping. Falling back to unconstrained mode.")
+            full_domain_mapping = None
+            full_allowed_grid = None
+
         # Check for second pass
         algo2 = config.get('second_pass_algorithm', 'skip')
         
@@ -871,8 +974,15 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             
             # Pass 1
             interp1 = create_interpolator(config)
+            if full_domain_mapping:
+                interp1.allowed_grid_override = full_allowed_grid
+                interp1.domain_mapping = full_domain_mapping
+                use_mapping = True
+            else:
+                use_mapping = False
+                
             interp1.initialize_blocks(sample_blocks, tuple(block_info['dims']),
-                                       min_bounds, block_size, use_domain_mapping=False)
+                                       min_bounds, block_size, use_domain_mapping=use_mapping)
             if hasattr(interp1, 'create_ants'):
                 interp1.create_ants()
             domain_interpolators.append(interp1)
@@ -881,8 +991,15 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             config2 = config.copy()
             config2['algorithm'] = algo2
             interp2 = create_interpolator(config2)
+            if full_domain_mapping:
+                interp2.allowed_grid_override = full_allowed_grid
+                interp2.domain_mapping = full_domain_mapping
+                use_mapping = True
+            else:
+                use_mapping = False
+                
             interp2.initialize_blocks(sample_blocks, tuple(block_info['dims']),
-                                       min_bounds, block_size, use_domain_mapping=False)
+                                       min_bounds, block_size, use_domain_mapping=use_mapping)
             if hasattr(interp2, 'create_ants'):
                 interp2.create_ants()
             domain_interpolators.append(interp2)
@@ -891,8 +1008,15 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             multiblock._ant_colony = interp1
         else:
             interpolator = create_interpolator(config)
+            if full_domain_mapping:
+                interpolator.allowed_grid_override = full_allowed_grid
+                interpolator.domain_mapping = full_domain_mapping
+                use_mapping = True
+            else:
+                use_mapping = False
+                
             interpolator.initialize_blocks(sample_blocks, tuple(block_info['dims']),
-                                           min_bounds, block_size, use_domain_mapping=False)
+                                           min_bounds, block_size, use_domain_mapping=use_mapping)
             
             if hasattr(interpolator, 'create_ants'):
                 interpolator.create_ants()
@@ -1145,7 +1269,8 @@ def export_blocks_to_csv(blocks, filepath):
             print(f"    Exporting domain: {domain} (Final Pass)")
             _add_interpolator_blocks_to_data(last_interp, min_bounds, block_size, data, rotation_matrix, rotation_center, 
                                            original_samples=original_sample_positions,
-                                           pass_count=len(interpolator_list))
+                                           pass_count=len(interpolator_list),
+                                           forced_domain=domain)
     else:
         # Single interpolator
         interpolator = blocks._ant_colony
@@ -1158,7 +1283,7 @@ def export_blocks_to_csv(blocks, filepath):
     df.to_csv(filepath, index=False)
     print(f"Exported {len(data)} blocks to {filepath}")
 
-def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data, rotation_matrix=None, rotation_center=None, domain_mapping=None, original_samples=None, pass_count=1):
+def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data, rotation_matrix=None, rotation_center=None, domain_mapping=None, original_samples=None, pass_count=1, forced_domain=None):
     """Process blocks from an interpolator and add to data list"""
     # Determine algorithm type
     algo_name = interpolator.get_algorithm_name()
@@ -1229,10 +1354,13 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
             # Age: negative distance from sample (0 at sample, more negative further away)
             age = -block.distance_to_sample if not block.is_sample else 0
             
-            # Determine domain: use mapping if provided (for single interpolator mode), else use block's domain
-            domain = block.domain
-            if domain_mapping and pos in domain_mapping:
+            # Determine domain
+            if forced_domain:
+                domain = forced_domain
+            elif domain_mapping and pos in domain_mapping:
                 domain = domain_mapping[pos]
+            else:
+                domain = block.domain
             
             row.update({
                 'Value': block.value,
@@ -1263,9 +1391,12 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
                 age = -dist_to_feeder  # Intermediate blocks get negative ages
             
             # Determine domain
-            domain = block.get('domain', 'Undomained')
-            if domain_mapping and pos in domain_mapping:
+            if forced_domain:
+                domain = forced_domain
+            elif domain_mapping and pos in domain_mapping:
                 domain = domain_mapping[pos]
+            else:
+                domain = block.get('domain', 'Undomained')
             
             row.update({
                 'Value': block.get('value', 0),
@@ -1313,6 +1444,11 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                     print(f"Pass 1 converged at iteration {i+1}")
                     break
             
+            # Generate stats for Pass 1 if String Theory
+            output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
+            if hasattr(interp1, 'generate_statistics'):
+                interp1.generate_statistics(output_dir, domain_name=f"{domain}_Pass1")
+
             # --- Pass 2 ---
             if len(interpolator_list) > 1:
                 interp2 = interpolator_list[1]
@@ -1345,6 +1481,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                     
                      # However, if the user provided a blocks file that was just samples (sparse), allowed_grid_override IS set.
                      # And use_mapping IS True.
+                    
                      # And the ants ARE trapped.
                      
                      # The user claims "the blocks file was indeed empty".
@@ -1407,8 +1544,12 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                      
                      # It should be the same object.
                      
-                     # Wait! I see `interp2.initialize_blocks(..., use_domain_mapping=True)`
-                     interp2.initialize_blocks(pass1_values, dims, min_bounds, block_size, use_domain_mapping=True)
+                     # Determine if we should enforce domain mapping/grid restriction
+                     use_mapping = False
+                     if hasattr(interp2, 'allowed_grid_override') and interp2.allowed_grid_override is not None:
+                         use_mapping = True
+                     
+                     interp2.initialize_blocks(pass1_values, dims, min_bounds, block_size, use_domain_mapping=use_mapping)
                      
                      if hasattr(interp2, 'create_ants'):
                          interp2.create_ants()
@@ -1430,58 +1571,39 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                              print(f"Pass 2 converged at iteration {i+1}")
                              break
                 
-                # Print domain summary (of the last pass)
-                last_interp = interpolator_list[-1]
-                metadata = last_interp.get_metadata()
-                print(f"\n=== Domain {domain} Summary ===")
-                for key, value in metadata.items():
-                    print(f"{key}: {value}")
+                # Generate stats for Pass 2 if String Theory
+                output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
+                if hasattr(interp2, 'generate_statistics'):
+                    interp2.generate_statistics(output_dir, domain_name=f"{domain}_Pass2")
+            
+            # Print domain summary (of the last pass)
+            last_interp = interpolator_list[-1]
+            metadata = last_interp.get_metadata()
+            print(f"\n=== Domain {domain} Summary ===")
+            for key, value in metadata.items():
+                print(f"{key}: {value}")
     else:
         # Single interpolator
         interpolator = blocks._ant_colony
         algo_name = interpolator.get_algorithm_name()
         print(f"Running {algo_name} for {iterations} iterations...")
         
-        # Force verbose for first iteration if it's an AntColony
-        if hasattr(interpolator, 'verbose'):
-            original_verbose = interpolator.verbose
-            interpolator.verbose = True
-        
-        pbar = tqdm(range(iterations), desc=f"Interpolating ({algo_name})")
+        pbar = tqdm(range(iterations), desc=f"Interpolation ({algo_name})")
         for i in pbar:
-            # Use the base class interface
             should_continue = interpolator.run_iteration(dims)
-            
-            # Restore verbose after first iteration
-            if i == 0 and hasattr(interpolator, 'verbose'):
-                interpolator.verbose = original_verbose
-                # Print block count after first iteration
-                metadata = interpolator.get_metadata()
-                print(f"\nAfter iteration 1:")
-                print(f"  Total blocks: {metadata.get('total_blocks', 0)}")
-                print(f"  Sample blocks: {metadata.get('sample_blocks', 0)}")
-                print(f"  Interpolated blocks: {metadata.get('interpolated_blocks', 0)}")
-                print(f"  Remaining ants: {metadata.get('remaining_ants', 0)}")
-            
-            # Check for early termination
             if not should_continue or interpolator.is_converged():
-                pbar.set_description(f"Interpolating (converged)")
-                print(f"Early stop: algorithm converged. Iterations run: {i+1}/{iterations}")
+                print(f"Converged at iteration {i+1}")
                 break
         
-        # Optionally fill domain-wise after silent run (ant colony specific)
-        if getattr(interpolator, '_fill_unvisited_domainwise', False):
-            try:
-                if hasattr(interpolator, 'fill_unvisited_blocks_domainwise'):
-                    interpolator.fill_unvisited_blocks_domainwise(dims)
-            except Exception as e:
-                print(f"Domain-wise fill error: {e}")
-        
-        # Print metadata
         metadata = interpolator.get_metadata()
-        print(f"\n=== Interpolation Summary ===")
+        print(f"\n=== Summary ===")
         for key, value in metadata.items():
             print(f"{key}: {value}")
+            
+        # Generate stats if String Theory
+        output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
+        if hasattr(interpolator, 'generate_statistics'):
+            interpolator.generate_statistics(output_dir, domain_name="Global")
     
     # Export results (handles both single and multiple interpolators)
     export_blocks_to_csv(blocks, interpolation_file)
@@ -1969,13 +2091,13 @@ if __name__ == "__main__":
                     
                     # First Pass Algorithm selector
                     algo1_combo = QtWidgets.QComboBox()
-                    algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'net_connector', 'skip'])
+                    algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'string_theory', 'skip'])
                     algo1_combo.setCurrentText('(use default)')
                     self.table.setCellWidget(i, 1, algo1_combo)
                     
                     # Second Pass Algorithm selector
                     algo2_combo = QtWidgets.QComboBox()
-                    algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'net_connector'])
+                    algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'string_theory'])
                     algo2_combo.setCurrentText('skip')
                     self.table.setCellWidget(i, 2, algo2_combo)
                     
@@ -2024,7 +2146,7 @@ if __name__ == "__main__":
 
         def apply_to_all(self):
             """Apply same first pass algorithm to all domains"""
-            algorithms = ['(use default)', 'ant_colony', 'molecular_clock', 'net_connector', 'skip']
+            algorithms = ['(use default)', 'ant_colony', 'molecular_clock', 'string_theory', 'skip']
             algo, ok = QtWidgets.QInputDialog.getItem(
                 self, 'Apply to All', 'Select first pass algorithm for all domains:', 
                 algorithms, 0, False
@@ -2098,6 +2220,7 @@ if __name__ == "__main__":
     class ConfigDialog(QtWidgets.QDialog):
         def __init__(self):
             super().__init__()
+            self.should_visualize = True
             self.setWindowTitle("Anterpolator 3D Viewer Configuration")
             self.resize(700, 600)
             
@@ -2127,10 +2250,10 @@ if __name__ == "__main__":
             mc_tab.setLayout(mc_form)
             tabs.addTab(mc_tab, "Molecular Clock")
             
-            nc_tab = QtWidgets.QWidget()
-            nc_form = QtWidgets.QFormLayout()
-            nc_tab.setLayout(nc_form)
-            tabs.addTab(nc_tab, "Net Connector")
+            st_tab = QtWidgets.QWidget()
+            st_form = QtWidgets.QFormLayout()
+            st_tab.setLayout(st_form)
+            tabs.addTab(st_tab, "String Theory")
 
             # Tab 5: Advanced Options
             advanced_tab = QtWidgets.QWidget()
@@ -2172,10 +2295,10 @@ if __name__ == "__main__":
 
             # Algorithm selection
             self.algorithm_combo = QtWidgets.QComboBox()
-            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'net_connector'])
+            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'string_theory'])
             
             self.second_pass_combo = QtWidgets.QComboBox()
-            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'net_connector'])
+            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'string_theory'])
             self.second_pass_combo.setCurrentText('skip')
             
             def validate_algorithms():
@@ -2319,6 +2442,9 @@ if __name__ == "__main__":
             self.range_size = dbl_spin(0.2, 0.0001, 1e6, 0.1)
             self.max_pheromone = int_spin(1000, 1, 10_000_000, 10)
             self.ants_per_sample = int_spin(16, 1, 10000, 1)
+            self.ants_sampling_percentage = dbl_spin(100.0, 0.001, 100.0, 1.0)
+            self.ants_sampling_percentage.setToolTip('Percentage of samples that will spawn ants (0-100%).\nUseful for second pass interpolation where input blocks are numerous.')
+            
             self.iterations = int_spin(500, 1, 10_000_000, 50)
             self.background_value = dbl_spin(0.0, -1e9, 1e9, 0.1)
             self.background_distance = dbl_spin(32.0, 0.0, 1e9, 1.0)
@@ -2329,6 +2455,7 @@ if __name__ == "__main__":
             ant_form.addRow('Range Size', self.range_size)
             ant_form.addRow('Max Pheromone', self.max_pheromone)
             ant_form.addRow('Ants per Sample', self.ants_per_sample)
+            ant_form.addRow('Samples with Ants (%)', self.ants_sampling_percentage)
             ant_form.addRow('Iterations (silent)', self.iterations)
             ant_form.addRow('Background Value', self.background_value)
             ant_form.addRow('Background Distance', self.background_distance)
@@ -2370,15 +2497,54 @@ if __name__ == "__main__":
             mc_form.addRow('Detect Multiple Events', self.mc_detect_multiple)
             mc_form.addRow('Interpolation Method', self.mc_interp_method)
 
-            # === NET CONNECTOR TAB ===
-            self.nc_distance_threshold = dbl_spin(10.0, 0.1, 1000.0, 1.0)
-            self.nc_distance_threshold.setToolTip('Maximum distance to search for a connection (in blocks).')
+            # === STRING THEORY TAB ===
+            self.st_distance_threshold = dbl_spin(10.0, 0.1, 1000.0, 1.0)
+            self.st_distance_threshold.setToolTip('Maximum distance to search for a connection (in blocks).')
             
-            self.nc_grade_difference = dbl_spin(1.0, 0.0, 1000.0, 0.1)
-            self.nc_grade_difference.setToolTip('Maximum grade difference allowed for a connection.')
+            self.st_grade_difference = dbl_spin(1.0, 0.0, 1000.0, 0.1)
+            self.st_grade_difference.setToolTip('Maximum grade difference allowed for a connection.')
             
-            nc_form.addRow('Distance Threshold', self.nc_distance_threshold)
-            nc_form.addRow('Grade Difference', self.nc_grade_difference)
+            self.st_connect_to_all = QtWidgets.QCheckBox(); self.st_connect_to_all.setChecked(True)
+            self.st_connect_to_all.setToolTip('If checked, connects to ALL valid samples within threshold.\nIf unchecked, connects only to the single best match (closest grade, then closest distance).')
+
+            self.st_max_connections = int_spin(1, 1, 1000, 1)
+            self.st_max_connections.setToolTip('Number of valid samples to connect to when "Connect to All Valid" is unchecked.\nMinimum: 1.')
+            self.st_max_connections.setEnabled(False)
+            self.st_connect_to_all.toggled.connect(lambda checked: self.st_max_connections.setEnabled(not checked))
+
+            self.st_collision_policy = QtWidgets.QComboBox()
+            self.st_collision_policy.addItems(['overwrite', 'average', 'min', 'max'])
+            self.st_collision_policy.setCurrentText('average')
+            self.st_collision_policy.setToolTip('How to handle blocks where multiple strings overlap:\noverwrite: Use the latest value (order dependent).\naverage: Calculate running average of all strings.\nmin: Keep the minimum value.\nmax: Keep the maximum value.')
+
+            self.st_processing_order = QtWidgets.QComboBox()
+            self.st_processing_order.addItems(['ascending', 'random'])
+            self.st_processing_order.setCurrentText('ascending')
+            self.st_processing_order.setToolTip('Order in which samples are processed:\nascending: Process lowest grade samples first (builds network bottom-up).\nrandom: Process samples in random order.')
+
+            self.st_filter_by_frequency = QtWidgets.QCheckBox(); self.st_filter_by_frequency.setChecked(False)
+            self.st_filter_by_frequency.setToolTip('If checked, filters paths based on Azimuth and Dip frequency.')
+            
+            self.st_min_azimuth_freq = dbl_spin(10.0, 0.0, 100.0, 1.0)
+            self.st_min_azimuth_freq.setToolTip('Minimum frequency (% of max) for Azimuth bin to be kept.')
+            self.st_min_azimuth_freq.setEnabled(False)
+            
+            self.st_min_dip_freq = dbl_spin(10.0, 0.0, 100.0, 1.0)
+            self.st_min_dip_freq.setToolTip('Minimum frequency (% of max) for Dip bin to be kept.')
+            self.st_min_dip_freq.setEnabled(False)
+            
+            self.st_filter_by_frequency.toggled.connect(lambda checked: self.st_min_azimuth_freq.setEnabled(checked))
+            self.st_filter_by_frequency.toggled.connect(lambda checked: self.st_min_dip_freq.setEnabled(checked))
+
+            st_form.addRow('Distance Threshold', self.st_distance_threshold)
+            st_form.addRow('Grade Difference', self.st_grade_difference)
+            st_form.addRow('Connect to All Valid', self.st_connect_to_all)
+            st_form.addRow('Max Connections (if unchecked)', self.st_max_connections)
+            st_form.addRow('Collision Policy', self.st_collision_policy)
+            st_form.addRow('Processing Order', self.st_processing_order)
+            st_form.addRow('Filter by Frequency', self.st_filter_by_frequency)
+            st_form.addRow('Min Azimuth Freq (%)', self.st_min_azimuth_freq)
+            st_form.addRow('Min Dip Freq (%)', self.st_min_dip_freq)
 
             # === ADVANCED TAB ===
             self.average_with_blocks = QtWidgets.QCheckBox(); self.average_with_blocks.setChecked(True)
@@ -2413,6 +2579,168 @@ if __name__ == "__main__":
             self.run_only_btn.clicked.connect(self.run_interpolation_only)
             self.start_btn.clicked.connect(self.accept)
             self.cancel_btn.clicked.connect(self.reject)
+
+        def to_dict(self):
+            return {
+                'samples_file': self.samples_edit.text(),
+                'blocks_file': self.blocks_edit.text(),
+                'color_file': self.color_edit.text(),
+                'interpolation_file': self.interp_edit.text(),
+                'algorithm': self.algorithm_combo.currentText(),
+                'second_pass_algorithm': self.second_pass_combo.currentText(),
+                'samples_delimiter': self.samples_delim.currentText(),
+                'blocks_delimiter': self.blocks_delim.currentText(),
+                'samples_header_line': self.samples_header_line.value(),
+                'blocks_header_line': self.blocks_header_line.value(),
+                'sample_x_col': self.sample_x_col.currentText(),
+                'sample_y_col': self.sample_y_col.currentText(),
+                'sample_z_col': self.sample_z_col.currentText(),
+                'sample_value_col': self.sample_value_col.currentText(),
+                'block_x_col': self.block_x_col.currentText(),
+                'block_y_col': self.block_y_col.currentText(),
+                'block_z_col': self.block_z_col.currentText(),
+                'block_domain_col': self.block_domain_col.currentText(),
+                'block_size': (self.block_x.value(), self.block_y.value(), self.block_z.value()),
+                'range_size': self.range_size.value(),
+                'max_pheromone': self.max_pheromone.value(),
+                'ants_per_sample': self.ants_per_sample.value(),
+                'ants_sampling_percentage': self.ants_sampling_percentage.value(),
+                'iterations': self.iterations.value(),
+                'background_value': self.background_value.value(),
+                'background_distance': self.background_distance.value(),
+                'value_filter': self.value_filter.value(),
+                'avoid_visited_threshold_enabled': self.avoid_visited_enabled.isChecked(),
+                'avoid_visited_threshold': self.avoid_visited_threshold.value(),
+                'molecular_clock_params': {
+                    'spatial_weight': self.mc_spatial_weight.value(),
+                    'attr_weight': self.mc_attr_weight.value(),
+                    'ancestor_depth_offset': self.mc_ancestor_depth_offset.value(),
+                    'branch_threshold': self.mc_branch_threshold.value(),
+                    'min_samples': self.mc_min_samples.value(),
+                    'max_samples': self.mc_max_samples.value(),
+                    'detect_multiple': self.mc_detect_multiple.isChecked(),
+                    'interp_method': self.mc_interp_method.currentText()
+                },
+                'string_theory_params': {
+                    'distance_threshold': self.st_distance_threshold.value(),
+                    'grade_difference': self.st_grade_difference.value(),
+                    'connect_to_all': self.st_connect_to_all.isChecked(),
+                    'max_connections': self.st_max_connections.value(),
+                    'collision_policy': self.st_collision_policy.currentText(),
+                    'processing_order': self.st_processing_order.currentText(),
+                    'filter_by_frequency': self.st_filter_by_frequency.isChecked(),
+                    'min_azimuth_freq': self.st_min_azimuth_freq.value(),
+                    'min_dip_freq': self.st_min_dip_freq.value()
+                },
+                'average_with_blocks': self.average_with_blocks.isChecked(),
+                'fill_unvisited_domainwise': self.fill_unvisited_domainwise.isChecked(),
+                'process_domains_sequentially': self.process_domains_sequentially.isChecked(),
+                'verbose': self.verbose.isChecked(),
+                'domain_algorithm_overrides': self.domain_overrides
+            }
+
+        def from_dict(self, config):
+            if 'samples_file' in config: self.samples_edit.setText(config['samples_file'])
+            if 'blocks_file' in config: self.blocks_edit.setText(config['blocks_file'])
+            if 'color_file' in config: self.color_edit.setText(config['color_file'])
+            if 'interpolation_file' in config: self.interp_edit.setText(config['interpolation_file'])
+            if 'algorithm' in config: self.algorithm_combo.setCurrentText(config['algorithm'])
+            if 'second_pass_algorithm' in config: self.second_pass_combo.setCurrentText(config['second_pass_algorithm'])
+            if 'samples_delimiter' in config: self.samples_delim.setCurrentText(config['samples_delimiter'])
+            if 'blocks_delimiter' in config: self.blocks_delim.setCurrentText(config['blocks_delimiter'])
+            if 'samples_header_line' in config: self.samples_header_line.setValue(config['samples_header_line'])
+            if 'blocks_header_line' in config: self.blocks_header_line.setValue(config['blocks_header_line'])
+            # Columns might need refresh first, but we can try setting text
+            if 'sample_x_col' in config: self.sample_x_col.setCurrentText(config['sample_x_col'])
+            if 'sample_y_col' in config: self.sample_y_col.setCurrentText(config['sample_y_col'])
+            if 'sample_z_col' in config: self.sample_z_col.setCurrentText(config['sample_z_col'])
+            if 'sample_value_col' in config: self.sample_value_col.setCurrentText(config['sample_value_col'])
+            if 'block_x_col' in config: self.block_x_col.setCurrentText(config['block_x_col'])
+            if 'block_y_col' in config: self.block_y_col.setCurrentText(config['block_y_col'])
+            if 'block_z_col' in config: self.block_z_col.setCurrentText(config['block_z_col'])
+            if 'block_domain_col' in config: self.block_domain_col.setCurrentText(config['block_domain_col'])
+            
+            if 'block_size' in config:
+                bs = config['block_size']
+                if isinstance(bs, (list, tuple)) and len(bs) == 3:
+                    self.block_x.setValue(bs[0])
+                    self.block_y.setValue(bs[1])
+                    self.block_z.setValue(bs[2])
+                elif isinstance(bs, (int, float)):
+                    self.block_x.setValue(int(bs))
+                    self.block_y.setValue(int(bs))
+                    self.block_z.setValue(int(bs))
+            
+            if 'range_size' in config: self.range_size.setValue(config['range_size'])
+            if 'max_pheromone' in config: self.max_pheromone.setValue(config['max_pheromone'])
+            if 'ants_per_sample' in config: self.ants_per_sample.setValue(config['ants_per_sample'])
+            if 'ants_sampling_percentage' in config: self.ants_sampling_percentage.setValue(config['ants_sampling_percentage'])
+            if 'iterations' in config: self.iterations.setValue(config['iterations'])
+            if 'background_value' in config: self.background_value.setValue(config['background_value'])
+            if 'background_distance' in config: self.background_distance.setValue(config['background_distance'])
+            if 'value_filter' in config: self.value_filter.setValue(config['value_filter'])
+            if 'avoid_visited_threshold_enabled' in config: self.avoid_visited_enabled.setChecked(config['avoid_visited_threshold_enabled'])
+            if 'avoid_visited_threshold' in config: self.avoid_visited_threshold.setValue(config['avoid_visited_threshold'])
+            
+            if 'molecular_clock_params' in config:
+                mc = config['molecular_clock_params']
+                if 'spatial_weight' in mc: self.mc_spatial_weight.setValue(mc['spatial_weight'])
+                if 'attr_weight' in mc: self.mc_attr_weight.setValue(mc['attr_weight'])
+                if 'ancestor_depth_offset' in mc: self.mc_ancestor_depth_offset.setValue(mc['ancestor_depth_offset'])
+                if 'branch_threshold' in mc: self.mc_branch_threshold.setValue(mc['branch_threshold'])
+                if 'min_samples' in mc: self.mc_min_samples.setValue(mc['min_samples'])
+                if 'max_samples' in mc: self.mc_max_samples.setValue(mc['max_samples'])
+                if 'detect_multiple' in mc: self.mc_detect_multiple.setChecked(mc['detect_multiple'])
+                if 'interp_method' in mc: self.mc_interp_method.setCurrentText(mc['interp_method'])
+
+            if 'string_theory_params' in config:
+                st = config['string_theory_params']
+                if 'distance_threshold' in st: self.st_distance_threshold.setValue(st['distance_threshold'])
+                if 'grade_difference' in st: self.st_grade_difference.setValue(st['grade_difference'])
+                if 'connect_to_all' in st: 
+                    self.st_connect_to_all.setChecked(st['connect_to_all'])
+                    self.st_max_connections.setEnabled(not st['connect_to_all'])
+                if 'max_connections' in st: self.st_max_connections.setValue(st['max_connections'])
+                if 'collision_policy' in st: self.st_collision_policy.setCurrentText(st['collision_policy'])
+                if 'processing_order' in st: self.st_processing_order.setCurrentText(st['processing_order'])
+                if 'filter_by_frequency' in st: 
+                    self.st_filter_by_frequency.setChecked(st['filter_by_frequency'])
+                    self.st_min_azimuth_freq.setEnabled(st['filter_by_frequency'])
+                    self.st_min_dip_freq.setEnabled(st['filter_by_frequency'])
+                if 'min_azimuth_freq' in st: self.st_min_azimuth_freq.setValue(st['min_azimuth_freq'])
+                if 'min_dip_freq' in st: self.st_min_dip_freq.setValue(st['min_dip_freq'])
+                
+                # Backward compatibility for tolerance params (ignore or convert?)
+                # If old params exist but new ones don't, we could try to map them, but they are different concepts.
+                # We'll just ignore them for now.
+
+            if 'average_with_blocks' in config: self.average_with_blocks.setChecked(config['average_with_blocks'])
+            if 'fill_unvisited_domainwise' in config: self.fill_unvisited_domainwise.setChecked(config['fill_unvisited_domainwise'])
+            if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
+            if 'verbose' in config: self.verbose.setChecked(config['verbose'])
+            if 'domain_algorithm_overrides' in config: self.domain_overrides = config['domain_algorithm_overrides']
+
+        def save_config(self):
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Configuration", ".", "JSON Files (*.json)")
+            if path:
+                try:
+                    config = self.to_dict()
+                    with open(path, 'w') as f:
+                        json.dump(config, f, indent=4)
+                    QtWidgets.QMessageBox.information(self, "Success", "Configuration saved successfully.")
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save configuration: {e}")
+
+        def load_config(self):
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Configuration", ".", "JSON Files (*.json)")
+            if path:
+                try:
+                    with open(path, 'r') as f:
+                        config = json.load(f)
+                    self.from_dict(config)
+                    QtWidgets.QMessageBox.information(self, "Success", "Configuration loaded successfully.")
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load configuration: {e}")
 
         def open_domain_mapping(self):
             """Open dialog to configure domain-specific algorithms"""
@@ -2449,7 +2777,7 @@ if __name__ == "__main__":
                     self.domain_mapping_btn.setText('Configure Domain Algorithms...')
         
         def run_interpolation_only(self):
-            """Run interpolation without visualization and close dialog"""
+            """Run interpolation without visualization"""
             try:
                 cfg = self.to_dict()
                 interpolation_file = cfg['interpolation_file']
@@ -2489,7 +2817,8 @@ if __name__ == "__main__":
                 
                 # Create blocks with samples
                 blocks = create_blocks(
-                    points, values,
+                    points,
+                    values,
                     block_size=cfg['block_size'],
                     verbose=cfg['verbose'],
                     range_size=cfg['range_size'],
@@ -2534,6 +2863,11 @@ if __name__ == "__main__":
                                 print(f"Pass 1 converged at iteration {i+1}")
                                 break
                         
+                        # Generate stats for Pass 1 if String Theory
+                        output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
+                        if hasattr(interp1, 'generate_statistics'):
+                            interp1.generate_statistics(output_dir, domain_name=f"{domain}_Pass1")
+
                         # --- Pass 2 ---
                         if len(interpolator_list) > 1:
                             interp2 = interpolator_list[1]
@@ -2565,202 +2899,93 @@ if __name__ == "__main__":
                                 if not should_continue or interp2.is_converged():
                                     print(f"Pass 2 converged at iteration {i+1}")
                                     break
+                            
+                            # Generate stats for Pass 2 if String Theory
+                            output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
+                            if hasattr(interp2, 'generate_statistics'):
+                                interp2.generate_statistics(output_dir, domain_name=f"{domain}_Pass2")
+            
+                        # Print domain summary (of the last pass)
+                        last_interp = interpolator_list[-1]
+                        metadata = last_interp.get_metadata()
+                        print(f"\n=== Domain {domain} Summary ===")
+                        for key, value in metadata.items():
+                            print(f"{key}: {value}")
                 
-                # Print domain summary (of the last pass)
-                last_interp = interpolator_list[-1]
-                metadata = last_interp.get_metadata()
-                print(f"\n=== Domain {domain} Summary ===")
-                for key, value in metadata.items():
-                    print(f"{key}: {value}")
+                else:
+                    # Single interpolator case
+                    interpolator = blocks._ant_colony
+                    algo_name = interpolator.get_algorithm_name()
+                    print(f"Running {algo_name} for {iterations} iterations...")
+                    
+                    pbar = tqdm(range(iterations), desc=f"Interpolation ({algo_name})")
+                    for i in pbar:
+                        should_continue = interpolator.run_iteration(dims)
+                        if not should_continue or interpolator.is_converged():
+                            print(f"Converged at iteration {i+1}")
+                            break
+                    
+                    metadata = interpolator.get_metadata()
+                    print(f"\n=== Summary ===")
+                    for key, value in metadata.items():
+                        print(f"{key}: {value}")
+                        
+                    # Generate stats if String Theory
+                    output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
+                    if hasattr(interpolator, 'generate_statistics'):
+                        interpolator.generate_statistics(output_dir, domain_name="Global")
                 
                 # Export results (handles both single and multiple interpolators)
                 export_blocks_to_csv(blocks, interpolation_file)
-                
-                print("=" * 60)
-                print(f"Interpolation complete! Results saved to:")
-                print(f"  {interpolation_file}")
+                print(f"Interpolation complete! Results saved to:\n  {interpolation_file}")
                 print("=" * 60)
                 
-                QtWidgets.QMessageBox.information(self, 'Complete', 
-                    f'Interpolation complete!\n\nResults saved to:\n{interpolation_file}')
-                
+                QtWidgets.QMessageBox.information(self, "Success", f"Interpolation complete!\nResults saved to:\n{interpolation_file}")
+
             except Exception as e:
-                QtWidgets.QMessageBox.critical(self, 'Error', f'Interpolation failed: {e}')
+                print(f"Error during interpolation: {e}")
                 import traceback
                 traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, "Error", f"An error occurred during interpolation:\n{str(e)}")
 
-        def to_dict(self):
-            samples_file = self.samples_edit.text().strip()
-            if not os.path.isfile(samples_file):
-                raise ValueError('Samples file does not exist.')
-            blocks_file = self.blocks_edit.text().strip() or None
-            if blocks_file and not os.path.isfile(blocks_file):
-                raise ValueError('Blocks file does not exist.')
-            color_file = self.color_edit.text().strip() or None
-            if color_file and not os.path.isfile(color_file):
-                color_file = None
-            interp = self.interp_edit.text().strip()
-            if not interp:
-                base = os.path.splitext(os.path.basename(samples_file))[0]
-                interp = os.path.join(os.path.dirname(samples_file), f"{base}_anterpolation.csv")
-            os.makedirs(os.path.dirname(interp), exist_ok=True)
-            return {
-                'samples_file': samples_file,
-                'blocks_file': blocks_file,
-                'color_file': color_file,
-                'interpolation_file': interp,
-                'block_size': (self.block_x.value(), self.block_y.value(), self.block_z.value()),
-                'range_size': self.range_size.value(),
-                'max_pheromone': self.max_pheromone.value(),
-                'ants_per_sample': self.ants_per_sample.value(),
-                'iterations': self.iterations.value(),
-                'background_value': self.background_value.value(),
-                'background_distance': self.background_distance.value(),
-                'average_with_blocks': self.average_with_blocks.isChecked(),
-                'value_filter': self.value_filter.value(),
-                'verbose': self.verbose.isChecked(),
-                'fill_unvisited_domainwise': self.fill_unvisited_domainwise.isChecked(),
-                'avoid_visited_threshold_enabled': self.avoid_visited_enabled.isChecked(),
-                'avoid_visited_threshold': self.avoid_visited_threshold.value()
-                ,'samples_delimiter': self.samples_delim.currentText()
-                ,'blocks_delimiter': self.blocks_delim.currentText()
-                ,'samples_header_line': self.samples_header_line.value()
-                ,'blocks_header_line': self.blocks_header_line.value()
-                ,'sample_x_col': self.sample_x_col.currentText() if self.sample_x_col.count() else None
-                ,'sample_y_col': self.sample_y_col.currentText() if self.sample_y_col.count() else None
-                ,'sample_z_col': self.sample_z_col.currentText() if self.sample_z_col.count() else None
-                ,'sample_value_col': self.sample_value_col.currentText() if self.sample_value_col.count() else None
-                ,'block_x_col': self.block_x_col.currentText() if self.block_x_col.count() else None
-                ,'block_y_col': self.block_y_col.currentText() if self.block_y_col.count() else None
-                ,'block_z_col': self.block_z_col.currentText() if self.block_z_col.count() else None
-                ,'block_domain_col': (self.block_domain_col.currentText() if (self.block_domain_col.count() and self.block_domain_col.currentText() != '(None)') else None)
-                ,'process_domains_sequentially': self.process_domains_sequentially.isChecked()
-                ,'algorithm': self.algorithm_combo.currentText()
-                ,'second_pass_algorithm': self.second_pass_combo.currentText()
-                ,'distance_threshold': self.nc_distance_threshold.value()
-                ,'grade_difference': self.nc_grade_difference.value()
-                ,'molecular_clock_params': {
-                    'spatial_weight': self.mc_spatial_weight.value(),
-                    'attr_weight': self.mc_attr_weight.value(),
-                    'ancestor_depth_offset': self.mc_ancestor_depth_offset.value(),
-                    'branch_threshold': self.mc_branch_threshold.value(),
-                    'min_samples_per_event': self.mc_min_samples.value(),
-                    'max_samples_per_event': self.mc_max_samples.value(),
-                    'detect_multiple_events': self.mc_detect_multiple.isChecked(),
-                    'interpolation_method': self.mc_interp_method.currentText(),
-                    'fill_background': False,
-                    'background_value': self.background_value.value()
-                }
-                ,'domain_algorithm_overrides': self.domain_overrides
-            }
-
-        def load_config(self):
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Load Config', '.', 'JSON Files (*.json)')
-            if not path:
-                return
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                self.samples_edit.setText(data.get('samples_file', self.samples_edit.text()))
-                self.blocks_edit.setText(data.get('blocks_file', self.blocks_edit.text() or ''))
-                self.color_edit.setText(data.get('color_file', self.color_edit.text() or ''))
-                self.interp_edit.setText(data.get('interpolation_file', self.interp_edit.text() or ''))
-                # Delimiters & header lines
-                if 'samples_delimiter' in data: self.samples_delim.setCurrentText(data['samples_delimiter'])
-                if 'blocks_delimiter' in data: self.blocks_delim.setCurrentText(data['blocks_delimiter'])
-                self.samples_header_line.setValue(int(data.get('samples_header_line', 1)))
-                self.blocks_header_line.setValue(int(data.get('blocks_header_line', 1)))
-                # Refresh column choices after header changes
-                # (Signals will auto refresh; we proceed to set mapping selections)
-                def set_if_exists(cb, value):
-                    if value is None: return
-                    idx = cb.findText(value)
-                    if idx >= 0: cb.setCurrentIndex(idx)
-                set_if_exists(self.sample_x_col, data.get('sample_x_col'))
-                set_if_exists(self.sample_y_col, data.get('sample_y_col'))
-                set_if_exists(self.sample_z_col, data.get('sample_z_col'))
-                set_if_exists(self.sample_value_col, data.get('sample_value_col'))
-                set_if_exists(self.block_x_col, data.get('block_x_col'))
-                set_if_exists(self.block_y_col, data.get('block_y_col'))
-                set_if_exists(self.block_z_col, data.get('block_z_col'))
-                if data.get('block_domain_col'):
-                    set_if_exists(self.block_domain_col, data.get('block_domain_col'))
-                self.block_domain_col.setCurrentText(data.get('block_domain_col') or '(None)')
-                # Numeric sizes
-                bs = data.get('block_size', (10,10,10))
-                if isinstance(bs, (list, tuple)) and len(bs) == 3:
-                    self.block_x.setValue(int(bs[0])); self.block_y.setValue(int(bs[1])); self.block_z.setValue(int(bs[2]))
-                self.range_size.setValue(float(data.get('range_size', self.range_size.value())))
-                self.nc_distance_threshold.setValue(float(data.get('distance_threshold', self.nc_distance_threshold.value())))
-                self.nc_grade_difference.setValue(float(data.get('grade_difference', self.nc_grade_difference.value())))
-                self.max_pheromone.setValue(int(data.get('max_pheromone', self.max_pheromone.value())))
-                self.ants_per_sample.setValue(int(data.get('ants_per_sample', self.ants_per_sample.value())))
-                self.iterations.setValue(int(data.get('iterations', self.iterations.value())))
-                self.background_value.setValue(float(data.get('background_value', self.background_value.value())))
-                self.background_distance.setValue(float(data.get('background_distance', self.background_distance.value())))
-                self.average_with_blocks.setChecked(bool(data.get('average_with_blocks', self.average_with_blocks.isChecked())))
-                self.value_filter.setValue(float(data.get('value_filter', self.value_filter.value())))
-                self.verbose.setChecked(bool(data.get('verbose', self.verbose.isChecked())))
-                self.fill_unvisited_domainwise.setChecked(bool(data.get('fill_unvisited_domainwise', self.fill_unvisited_domainwise.isChecked())))
-                self.process_domains_sequentially.setChecked(bool(data.get('process_domains_sequentially', True)))
-                self.avoid_visited_enabled.setChecked(bool(data.get('avoid_visited_threshold_enabled', False)))
-                try:
-                    self.avoid_visited_threshold.setValue(int(data.get('avoid_visited_threshold', 100)))
-                except Exception:
-                    self.avoid_visited_threshold.setValue(100)
-                
-                # Algorithm selection
-                if 'algorithm' in data:
-                    algo = data['algorithm']
-                    if algo == 'biochemical_clock':
-                        algo = 'molecular_clock'
-                    idx = self.algorithm_combo.findText(algo)
-                    if idx >= 0:
-                        self.algorithm_combo.setCurrentIndex(idx)
-                
-                if 'second_pass_algorithm' in data:
-                    algo2 = data['second_pass_algorithm']
-                    idx2 = self.second_pass_combo.findText(algo2)
-                    if idx2 >= 0:
-                        self.second_pass_combo.setCurrentIndex(idx2)
-                
-                # Molecular clock parameters
-                mc_params = data.get('molecular_clock_params', data.get('biochemical_clock_params', {}))
-                self.mc_spatial_weight.setValue(float(mc_params.get('spatial_weight', 1.0)))
-                self.mc_attr_weight.setValue(float(mc_params.get('attr_weight', 1.0)))
-                self.mc_ancestor_depth_offset.setValue(float(mc_params.get('ancestor_depth_offset', 1.0)))
-                self.mc_branch_threshold.setValue(float(mc_params.get('branch_threshold', 2.0)))
-                self.mc_min_samples.setValue(int(mc_params.get('min_samples_per_event', 3)))
-                self.mc_max_samples.setValue(int(mc_params.get('max_samples_per_event', 1000)))
-                self.mc_detect_multiple.setChecked(bool(mc_params.get('detect_multiple_events', True)))
-                interp_method = mc_params.get('interpolation_method', 'linear')
-                idx = self.mc_interp_method.findText(interp_method)
-                if idx >= 0:
-                    self.mc_interp_method.setCurrentIndex(idx)
-                
-                # Domain algorithm overrides
-                if 'domain_algorithm_overrides' in data:
-                    self.domain_overrides = data['domain_algorithm_overrides']
-                    count = len(self.domain_overrides)
-                    if count > 0:
-                        self.domain_mapping_btn.setText(f'Configure Domain Algorithms... ({count} configured)')
-                
-                QtWidgets.QMessageBox.information(self, 'Config', 'Configuration loaded.')
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to load config: {e}')
-
-        def save_config(self):
-            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save Config', 'config.json', 'JSON Files (*.json)')
-            if not path:
-                return
-            try:
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(self.to_dict(), f, indent=2)
-                QtWidgets.QMessageBox.information(self, 'Config', 'Configuration saved.')
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to save config: {e}')
-
+    # Create and run application
     app = QtWidgets.QApplication(sys.argv)
-    window = ConfigDialog()
-    window.show()
-    sys.exit(app.exec_())
+    dialog = ConfigDialog()
+    if dialog.exec_() == QtWidgets.QDialog.Accepted:
+        if dialog.should_visualize:
+            cfg = dialog.to_dict()
+            
+            # Run visualization with config
+            load_and_visualize_samples(
+                samples_file=cfg['samples_file'],
+                block_size=cfg['block_size'],
+                value_filter=cfg['value_filter'],
+                verbose=cfg['verbose'],
+                iterations=cfg['iterations'],
+                range_size=cfg['range_size'],
+                max_pheromone=cfg['max_pheromone'],
+                ants_per_sample=cfg['ants_per_sample'],
+                blocks_file=cfg['blocks_file'],
+                color_file=cfg['color_file'],
+                background_value=cfg['background_value'],
+                background_distance=cfg['background_distance'],
+                average_with_blocks=cfg['average_with_blocks'],
+                samples_delimiter=cfg.get('samples_delimiter'),
+                blocks_delimiter=cfg.get('blocks_delimiter'),
+                fill_unvisited_domainwise=cfg.get('fill_unvisited_domainwise', False),
+                avoid_visited_threshold_enabled=cfg.get('avoid_visited_threshold_enabled', False),
+                avoid_visited_threshold=cfg.get('avoid_visited_threshold', 100),
+                samples_header_line=cfg.get('samples_header_line', 1),
+                sample_x_col=cfg.get('sample_x_col'),
+                sample_y_col=cfg.get('sample_y_col'),
+                sample_z_col=cfg.get('sample_z_col'),
+                sample_value_col=cfg.get('sample_value_col'),
+                blocks_header_line=cfg.get('blocks_header_line', 1),
+                block_x_col=cfg.get('block_x_col'),
+                block_y_col=cfg.get('block_y_col'),
+                block_z_col=cfg.get('block_z_col'),
+                block_domain_col=cfg.get('block_domain_col'),
+                config=cfg
+            )
+    
+    sys.exit(0)

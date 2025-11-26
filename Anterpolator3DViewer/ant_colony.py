@@ -37,11 +37,13 @@ class Ant:
 class AntColonyInterpolator(InterpolatorBase):
     def __init__(self, range_size=10, max_pheromone=150, ants_per_sample=3, verbose=False, background_value=0.0, background_distance=None, average_with_blocks=False,
                  avoid_visited_threshold_enabled: bool = False,
-                 avoid_visited_threshold: int = 100):
+                 avoid_visited_threshold: int = 100,
+                 ants_sampling_percentage: float = 100.0):
         super().__init__(verbose)
         self.range_size = range_size
         self.max_pheromone = max_pheromone
         self.ants_per_sample = ants_per_sample
+        self.ants_sampling_percentage = ants_sampling_percentage
         # self.blocks inherited from InterpolatorBase
         self.ants: List[Ant] = []
         self.next_block_id = 1
@@ -138,13 +140,27 @@ class AntColonyInterpolator(InterpolatorBase):
 
     def create_ants(self):
         self.ants.clear()
-        for pos, block in self.blocks.items():
-            if block.is_sample:
-                for _ in range(self.ants_per_sample):
-                    ant = Ant(pos, pos, block.mark_class)
-                    ant.origin_sample_id = block.block_id
-                    ant.domain = block.domain
-                    self.ants.append(ant)
+        
+        # Collect all sample positions
+        sample_positions = [pos for pos, block in self.blocks.items() if block.is_sample]
+        
+        # Determine how many samples will spawn ants
+        if self.ants_sampling_percentage < 100.0:
+            num_samples_to_use = int(len(sample_positions) * (self.ants_sampling_percentage / 100.0))
+            num_samples_to_use = max(1, num_samples_to_use) # Ensure at least one sample spawns ants
+            selected_samples = random.sample(sample_positions, num_samples_to_use)
+            if self.verbose:
+                print(f"Ant Colony: Subsampling {self.ants_sampling_percentage}% of samples. Using {num_samples_to_use}/{len(sample_positions)} samples.")
+        else:
+            selected_samples = sample_positions
+
+        for pos in selected_samples:
+            block = self.blocks[pos]
+            for _ in range(self.ants_per_sample):
+                ant = Ant(pos, pos, block.mark_class)
+                ant.origin_sample_id = block.block_id
+                ant.domain = block.domain
+                self.ants.append(ant)
         
         # Debug: count ants per domain
         if self.verbose:

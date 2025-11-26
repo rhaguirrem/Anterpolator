@@ -1,0 +1,80 @@
+{
+    "samples_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/Alati_Leyes.csv",
+    "blocks_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/Alati 20x20x20_Domained.csv",
+    "color_file": "",
+    "interpolation_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/Alati_Leyes_anterpolation.csv",
+    "algorithm": "string_theory",
+    "second_pass_algorithm": "skip",
+    "samples_delimiter": ",",
+    "blocks_delimiter": ",",
+    "samples_header_line": 1,
+    "blocks_header_line": 1,
+    "sample_x_col": "mid_x",
+    "sample_y_col": "mid_y",
+    "sample_z_col": "mid_z",
+    "sample_value_col": "CuCalc",
+    "block_x_col": "x",
+    "block_y_col": "y",
+    "block_z_col": "z",
+    "block_domain_col": "Domain",
+    "block_size": [
+        20,
+        20,
+        20
+    ],
+    "range_size": 0.05,
+    "max_pheromone": 1000,
+    "ants_per_sample": 3,
+    "iterations": 500,
+    "background_value": 0.0,
+    "background_distance": 1000.0,
+    "value_filter": 0.0,
+    "avoid_visited_threshold_enabled": true,
+    "avoid_visited_threshold": 50,
+    "molecular_clock_params": {
+        "spatial_weight": 3.0,
+        "attr_weight": 3.0,
+        "ancestor_depth_offset": 4.0,
+        "branch_threshold": 4.0,
+        "min_samples": 3,
+        "max_samples": 1000,
+        "detect_multiple": true,
+        "interp_method": "linear"
+    },
+    "string_theory_params": {
+        "distance_threshold": 30.0,
+        "grade_difference": 0.02,
+        "connect_to_all": false
+    },
+    "average_with_blocks": true,
+    "fill_unvisited_domainwise": false,
+    "process_domains_sequentially": true,
+    "verbose": false,
+    "domain_algorithm_overrides": {
+        "And": {
+            "skip": true
+        },
+        "Arenisca": {
+            "skip": true
+        },
+        "Caliza Inferior": {
+            "skip": true
+        },
+        "Caliza Superior": {
+            "skip": true
+        },
+        "GnD": {
+            "skip": true
+        },
+        "No consolidado": {
+            "skip": true
+        },
+        "Pluton Granodioritico": {
+            "skip": true
+        },
+        "Veta": {
+            "algorithm": "string_theory",
+            "second_pass_algorithm": "ant_colony"
+        }
+    }
+}

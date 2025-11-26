@@ -1,0 +1,91 @@
+{
+    "samples_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/CNN/CNN_Fe_Assays.csv",
+    "blocks_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/CNN/CNN Lito 10x10x10.csv",
+    "color_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/CNN/Fe Anomalia.lfc",
+    "interpolation_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/CNN/CNN_Fe_Assays_Anterpolation.csv",
+    "algorithm": "string_theory",
+    "second_pass_algorithm": "skip",
+    "samples_delimiter": ",",
+    "blocks_delimiter": ",",
+    "samples_header_line": 1,
+    "blocks_header_line": 2,
+    "sample_x_col": "mid_x",
+    "sample_y_col": "mid_y",
+    "sample_z_col": "mid_z",
+    "sample_value_col": "FE",
+    "block_x_col": "X",
+    "block_y_col": "Y",
+    "block_z_col": "Z",
+    "block_domain_col": "Litologia integrado",
+    "block_size": [
+        10,
+        10,
+        10
+    ],
+    "range_size": 0.2,
+    "max_pheromone": 1000,
+    "ants_per_sample": 16,
+    "ants_sampling_percentage": 100.0,
+    "iterations": 500,
+    "background_value": 0.0,
+    "background_distance": 32.0,
+    "value_filter": 0.0,
+    "avoid_visited_threshold_enabled": false,
+    "avoid_visited_threshold": 100,
+    "molecular_clock_params": {
+        "spatial_weight": 1.0,
+        "attr_weight": 1.0,
+        "ancestor_depth_offset": 1.0,
+        "branch_threshold": 2.0,
+        "min_samples": 3,
+        "max_samples": 1000,
+        "detect_multiple": true,
+        "interp_method": "linear"
+    },
+    "string_theory_params": {
+        "distance_threshold": 15.0,
+        "grade_difference": 5.0,
+        "connect_to_all": false,
+        "max_connections": 8,
+        "collision_policy": "average"
+    },
+    "average_with_blocks": true,
+    "fill_unvisited_domainwise": false,
+    "process_domains_sequentially": true,
+    "verbose": false,
+    "domain_algorithm_overrides": {
+        "APL": {
+            "skip": true
+        },
+        "BTR": {
+            "skip": true
+        },
+        "DCN": {
+            "skip": true
+        },
+        "DDI": {
+            "skip": true
+        },
+        "DES": {
+            "skip": true
+        },
+        "DIO": {
+            "skip": true
+        },
+        "GRO": {
+            "skip": true
+        },
+        "MET": {
+            "algorithm": "string_theory"
+        },
+        "NC": {
+            "skip": true
+        },
+        "SAN": {
+            "skip": true
+        },
+        "SGE": {
+            "skip": true
+        }
+    }
+}

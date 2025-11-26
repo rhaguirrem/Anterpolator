@@ -1,0 +1,75 @@
+{
+  "samples_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/Alati_Leyes.csv",
+  "blocks_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/Alati 20x20x20_Domained.csv",
+  "color_file": null,
+  "interpolation_file": "C:/Projects/Anterpolator/Anterpolator3DViewer/Data/Alati_Leyes_anterpolation.csv",
+  "block_size": [
+    20,
+    20,
+    20
+  ],
+  "range_size": 0.05,
+  "max_pheromone": 1000,
+  "ants_per_sample": 3,
+  "iterations": 500,
+  "background_value": 0.0,
+  "background_distance": 1000.0,
+  "average_with_blocks": true,
+  "value_filter": 0.0,
+  "verbose": false,
+  "fill_unvisited_domainwise": false,
+  "avoid_visited_threshold_enabled": true,
+  "avoid_visited_threshold": 50,
+  "samples_delimiter": ",",
+  "blocks_delimiter": ",",
+  "samples_header_line": 1,
+  "blocks_header_line": 1,
+  "sample_x_col": "x",
+  "sample_y_col": "y",
+  "sample_z_col": "z",
+  "sample_value_col": "Value",
+  "block_x_col": "x",
+  "block_y_col": "y",
+  "block_z_col": "z",
+  "block_domain_col": "Domain",
+  "process_domains_sequentially": true,
+  "algorithm": "molecular_clock",
+  "molecular_clock_params": {
+    "spatial_weight": 3.0,
+    "attr_weight": 3.0,
+    "ancestor_depth_offset": 4.0,
+    "branch_threshold": 4.0,
+    "min_samples_per_event": 3,
+    "max_samples_per_event": 1000,
+    "detect_multiple_events": true,
+    "interpolation_method": "linear",
+    "fill_background": false,
+    "background_value": 0.0
+  },
+  "domain_algorithm_overrides": {
+    "And": {
+      "algorithm": "ant_colony"
+    },
+    "Arenisca": {
+      "algorithm": "ant_colony"
+    },
+    "Caliza Inferior": {
+      "algorithm": "ant_colony"
+    },
+    "Caliza Superior": {
+      "algorithm": "ant_colony"
+    },
+    "GnD": {
+      "algorithm": "molecular_clock"
+    },
+    "No consolidado": {
+      "algorithm": "ant_colony"
+    },
+    "Pluton Granodioritico": {
+      "algorithm": "molecular_clock"
+    },
+    "Veta": {
+      "algorithm": "molecular_clock"
+    }
+  }
+}
