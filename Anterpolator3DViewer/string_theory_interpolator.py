@@ -36,6 +36,7 @@ class StringTheoryInterpolator(InterpolatorBase):
         }
         
         self.paths = [] # List of (p1, p2, path_points)
+        self.kept_paths_indices = None # Set of indices of paths that passed filtering
         
         # Result storage: (x, y, z) -> dict
         # We initialize with sample values.
@@ -321,34 +322,46 @@ class StringTheoryInterpolator(InterpolatorBase):
                 p1_real = np.array(p1) * bs
                 p2_real = np.array(p2) * bs
                 
-                dx = p2_real[0] - p1_real[0]
-                dy = p2_real[1] - p1_real[1]
-                dz = p2_real[2] - p1_real[2]
+                # Ensure p_start has higher Z (or equal)
+                if p1_real[2] < p2_real[2]:
+                    p_start = p2_real
+                    p_end = p1_real
+                else:
+                    p_start = p1_real
+                    p_end = p2_real
+                
+                dx = p_end[0] - p_start[0]
+                dy = p_end[1] - p_start[1]
+                dz = p_end[2] - p_start[2]
             else:
-                dx = p2[0] - p1[0]
-                dy = p2[1] - p1[1]
-                dz = p2[2] - p1[2]
+                # Ensure p_start has higher Z (or equal)
+                if p1[2] < p2[2]:
+                    p_start = p2
+                    p_end = p1
+                else:
+                    p_start = p1
+                    p_end = p2
+
+                dx = p_end[0] - p_start[0]
+                dy = p_end[1] - p_start[1]
+                dz = p_end[2] - p_start[2]
             
             # Azimuth (0-360)
             # arctan2(dx, dy) gives angle from North (Y axis) clockwise if we consider:
             # Y is North, X is East.
-            # arctan2(x, y) -> angle from Y axis.
-            # If x=1, y=0 (East) -> arctan2(1, 0) = pi/2 = 90 deg.
-            # If x=0, y=1 (North) -> arctan2(0, 1) = 0 deg.
-            # If x=-1, y=0 (West) -> arctan2(-1, 0) = -pi/2 = -90 = 270 deg.
-            # If x=0, y=-1 (South) -> arctan2(0, -1) = pi = 180 deg.
-            # This matches Azimuth convention (0=N, 90=E).
             az = np.degrees(np.arctan2(dx, dy))
             if az < 0:
                 az += 360
             azimuths.append(az)
             
-            # Dip (-90 to 90)
+            # Dip (0 to 90) - positive downwards
             h_dist = np.sqrt(dx**2 + dy**2)
             if h_dist == 0:
-                dip = 90 if dz > 0 else -90
+                dip = 90.0 # Vertical
             else:
-                dip = np.degrees(np.arctan(dz / h_dist))
+                # dz is <= 0 because we swapped to make start higher than end.
+                # We want positive dip [0, 90].
+                dip = np.degrees(np.arctan(abs(dz) / h_dist))
             dips.append(dip)
             
         # Create output directory
@@ -390,7 +403,7 @@ class StringTheoryInterpolator(InterpolatorBase):
         
         # 3. Dip Histogram
         plt.figure(figsize=(10, 6))
-        plt.hist(dips, bins=36, range=(-90, 90), color='lightgreen', edgecolor='black')
+        plt.hist(dips, bins=36, range=(0, 90), color='lightgreen', edgecolor='black')
         plt.title(f'Path Dip Distribution - {domain_name}')
         plt.xlabel('Dip (degrees)')
         plt.ylabel('Frequency')
@@ -401,9 +414,30 @@ class StringTheoryInterpolator(InterpolatorBase):
         # Save raw stats to CSV
         with open(os.path.join(stats_dir, f'path_stats_{safe_domain}.csv'), 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Length', 'Azimuth', 'Dip'])
-            for l, a, d in zip(lengths, azimuths, dips):
-                writer.writerow([l, a, d])
+            writer.writerow(['Length', 'Azimuth', 'Dip', 'mid_x', 'mid_y', 'mid_z', 'Polarity', 'Category', 'Accepted'])
+            
+            for i, (l, a, d) in enumerate(zip(lengths, azimuths, dips)):
+                p1, p2, _ = self.paths[i]
+                
+                # Determine acceptance status
+                is_accepted = True
+                if self.filter_by_frequency and self.kept_paths_indices is not None:
+                    is_accepted = i in self.kept_paths_indices
+                
+                # Calculate midpoint
+                p1_arr = np.array(p1)
+                p2_arr = np.array(p2)
+                mid_block = (p1_arr + p2_arr) / 2.0
+                
+                if hasattr(self, 'block_size') and self.block_size is not None and hasattr(self, 'min_bounds') and self.min_bounds is not None:
+                    bs = np.array(self.block_size)
+                    mb = np.array(self.min_bounds)
+                    mid_real = mb + mid_block * bs
+                    mid_x, mid_y, mid_z = mid_real
+                else:
+                    mid_x, mid_y, mid_z = mid_block
+                
+                writer.writerow([l, a, d, mid_x, mid_y, mid_z, 1, domain_name, is_accepted])
                 
         print(f"String Theory statistics for {domain_name} saved to {stats_dir}")
     
@@ -411,6 +445,7 @@ class StringTheoryInterpolator(InterpolatorBase):
         """
         Calculate Azimuth and Dip for a path between p1 and p2.
         Returns (azimuth, dip) in degrees.
+        Dip is always positive [0, 90] (downwards from horizontal).
         """
         # Calculate orientation using REAL coordinates if available
         if hasattr(self, 'block_size') and self.block_size is not None:
@@ -418,25 +453,41 @@ class StringTheoryInterpolator(InterpolatorBase):
             p1_real = np.array(p1) * bs
             p2_real = np.array(p2) * bs
             
-            dx = p2_real[0] - p1_real[0]
-            dy = p2_real[1] - p1_real[1]
-            dz = p2_real[2] - p1_real[2]
+            # Ensure p_start has higher Z (or equal)
+            if p1_real[2] < p2_real[2]:
+                p_start = p2_real
+                p_end = p1_real
+            else:
+                p_start = p1_real
+                p_end = p2_real
+            
+            dx = p_end[0] - p_start[0]
+            dy = p_end[1] - p_start[1]
+            dz = p_end[2] - p_start[2]
         else:
-            dx = p2[0] - p1[0]
-            dy = p2[1] - p1[1]
-            dz = p2[2] - p1[2]
+            # Ensure p_start has higher Z (or equal)
+            if p1[2] < p2[2]:
+                p_start = p2
+                p_end = p1
+            else:
+                p_start = p1
+                p_end = p2
+
+            dx = p_end[0] - p_start[0]
+            dy = p_end[1] - p_start[1]
+            dz = p_end[2] - p_start[2]
         
         # Azimuth (0-360)
         az = np.degrees(np.arctan2(dx, dy))
         if az < 0:
             az += 360
         
-        # Dip (-90 to 90)
+        # Dip (0 to 90)
         h_dist = np.sqrt(dx**2 + dy**2)
         if h_dist == 0:
-            dip = 90.0 if dz > 0 else -90.0
+            dip = 90.0 # Vertical
         else:
-            dip = np.degrees(np.arctan(dz / h_dist))
+            dip = np.degrees(np.arctan(abs(dz) / h_dist))
             
         return az, dip
 
@@ -504,7 +555,7 @@ class StringTheoryInterpolator(InterpolatorBase):
         max_az_freq = np.max(az_hist) if len(az_hist) > 0 else 0
         
         # Dip bins (5 degrees)
-        dip_bins = np.linspace(-90, 90, 37)
+        dip_bins = np.linspace(0, 90, 37)
         dip_hist, dip_bin_edges = np.histogram(dips, bins=dip_bins)
         max_dip_freq = np.max(dip_hist) if len(dip_hist) > 0 else 0
         
@@ -519,6 +570,7 @@ class StringTheoryInterpolator(InterpolatorBase):
         # 3. Filter and Fill
         kept_count = 0
         rejected_count = 0
+        self.kept_paths_indices = set()
         
         for i, (p1, p2, path) in enumerate(self.paths):
             az, dip = azimuths[i], dips[i]
@@ -539,6 +591,7 @@ class StringTheoryInterpolator(InterpolatorBase):
             if current_az_freq >= az_threshold_count and current_dip_freq >= dip_threshold_count:
                 # Keep path
                 kept_count += 1
+                self.kept_paths_indices.add(i)
                 
                 # Re-construct points_to_fill (excluding start/end which are samples)
                 # path contains [p1, ..., p2]
