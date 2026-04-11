@@ -314,6 +314,10 @@ class MolecularClockInterpolator(InterpolatorBase):
         # DBSCAN is strict (density-connected). We want to allow "hops" between dense clusters.
         # If the minimum distance between two clusters is < eps * 2.0, merge them.
         
+        # Post-processing: Merge clusters that are "close enough"
+        # DBSCAN is strict (density-connected). We want to allow "hops" between dense clusters.
+        # If the minimum distance between two clusters is < eps * 2.0, merge them.
+        
         if len(clusters) > 1:
             if self.verbose:
                 print(f"  Found {len(clusters)} initial clusters. Checking for merges...")

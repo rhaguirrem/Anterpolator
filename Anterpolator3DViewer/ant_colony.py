@@ -1,7 +1,7 @@
 import numpy as np
 from functools import lru_cache
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
 import random
 from tqdm import tqdm
 from interpolator_base import InterpolatorBase
@@ -19,6 +19,8 @@ class Block:
     distance_to_sample: int = 999999
     nearest_sample_value: float = 0.0
     domain: str = ""
+    # Used when interpolation_target == 'domain'
+    domain_pheromones: Dict[str, float] = field(default_factory=dict)
     heavy_reached: bool = False
 
 @dataclass
@@ -35,15 +37,26 @@ class Ant:
         self.steps_history = []
 
 class AntColonyInterpolator(InterpolatorBase):
-    def __init__(self, range_size=10, max_pheromone=150, ants_per_sample=3, verbose=False, background_value=0.0, background_distance=None, average_with_blocks=False,
+    def __init__(
+        self,
+        range_size=10,
+        max_pheromone=1000,
+        ants_per_sample=3,
+        verbose=False,
+        background_value=0.0,
+        background_distance=None,
+        average_with_blocks=False,
+        interpolation_target: str = 'value',
                  avoid_visited_threshold_enabled: bool = False,
                  avoid_visited_threshold: int = 100,
-                 ants_sampling_percentage: float = 100.0):
+                 ants_sampling_percentage: float = 100.0,
+                 pheromone_decay_rate: int = 1):
         super().__init__(verbose)
         self.range_size = range_size
         self.max_pheromone = max_pheromone
         self.ants_per_sample = ants_per_sample
         self.ants_sampling_percentage = ants_sampling_percentage
+        self.pheromone_decay_rate = pheromone_decay_rate
         # self.blocks inherited from InterpolatorBase
         self.ants: List[Ant] = []
         self.next_block_id = 1
@@ -51,6 +64,15 @@ class AntColonyInterpolator(InterpolatorBase):
         self.background_value = background_value
         self.background_distance = background_distance
         self.average_with_blocks = average_with_blocks
+        target = (interpolation_target or 'value').strip().lower()
+        if target in ('numeric', 'number', 'grade', 'value'):
+            target = 'value'
+        elif target in ('domain', 'domains', 'category', 'categorical'):
+            target = 'domain'
+        else:
+            target = 'value'
+        self.interpolation_target = target
+
         self.avoid_visited_threshold_enabled = avoid_visited_threshold_enabled
         self.avoid_visited_threshold = int(avoid_visited_threshold) if avoid_visited_threshold is not None else 100
         # Domain-level tracking for early stopping
@@ -75,10 +97,13 @@ class AntColonyInterpolator(InterpolatorBase):
         mark_class = value - (value % self.range_size) + self.range_size / 2
         return round(mark_class, decimals)
 
-    def initialize_blocks(self, sample_blocks: Dict[Tuple[int, int, int], float], dims: Tuple[int, int, int], min_bounds, block_size, use_domain_mapping: bool = False):
+    def initialize_blocks(self, sample_blocks: Dict[Tuple[int, int, int], float], dims: Tuple[int, int, int], min_bounds, block_size, use_domain_mapping: bool = False, **kwargs):
         print(f"Total volume: {dims[0]*dims[1]*dims[2]} blocks")
         print(f"Initializing {len(sample_blocks)} sample blocks...")
         self.dims = dims
+
+        sample_domain_mapping: Dict[Tuple[int, int, int], str] = kwargs.get('sample_domain_mapping', None) or {}
+
         if use_domain_mapping:
             if hasattr(self, 'allowed_grid_override'):
                 self.allowed_positions = self.allowed_grid_override
@@ -93,16 +118,32 @@ class AntColonyInterpolator(InterpolatorBase):
                 d = self.domain_mapping.get(pos, "Undomained")
                 self.domain_totals[d] = self.domain_totals.get(d, 0) + 1
         else:
-            self.domain_totals["default"] = len(self.allowed_positions)
+            if self.interpolation_target == 'domain':
+                # In domain interpolation, totals are unknown a priori.
+                # We still keep a placeholder to avoid division-by-zero logic elsewhere.
+                self.domain_totals["default"] = len(self.allowed_positions)
+            else:
+                self.domain_totals["default"] = len(self.allowed_positions)
         for d in list(self.domain_totals.keys()):
             self.domain_created_counts[d] = 0
             self.domain_heavy_counts[d] = 0
         self.blocks = {}
         for pos, value in sample_blocks.items():
-            mark_class = self.get_mark_class(value)
-            domain = self.domain_mapping.get(pos, "Undomained") if use_domain_mapping and hasattr(self, 'domain_mapping') else "default"
+            if self.interpolation_target == 'domain':
+                domain = sample_domain_mapping.get(pos)
+                if domain is None or str(domain).strip() == '':
+                    # Skip samples with no domain
+                    continue
+                domain = str(domain).strip()
+                mark_class = 0.0
+                value_to_store = 0.0
+            else:
+                mark_class = self.get_mark_class(value)
+                value_to_store = value
+                domain = self.domain_mapping.get(pos, "Undomained") if use_domain_mapping and hasattr(self, 'domain_mapping') else "default"
+
             self.blocks[pos] = Block(
-                value=value,
+                value=value_to_store,
                 is_sample=True,
                 mark_class=mark_class,
                 block_id=self.next_block_id,
@@ -111,8 +152,9 @@ class AntColonyInterpolator(InterpolatorBase):
                 visit_count=1,
                 ant_count=0,
                 distance_to_sample=0,
-                nearest_sample_value=value,
-                domain=domain
+                nearest_sample_value=value_to_store,
+                domain=domain,
+                domain_pheromones=({domain: float(self.max_pheromone)} if self.interpolation_target == 'domain' else {})
             )
             # Track domain created/heavy counters
             self.domain_created_counts[domain] = self.domain_created_counts.get(domain, 0) + 1
@@ -123,6 +165,10 @@ class AntColonyInterpolator(InterpolatorBase):
             self.next_block_id += 1
             # if self.verbose:
             #     print(f"Sample at {pos}: value={value:.2f}, mark_class={mark_class}, domain={domain}")
+
+        # In domain mode, keep a mapping of the current assigned domain for export/compat
+        if self.interpolation_target == 'domain':
+            self.domain_mapping = {pos: blk.domain for pos, blk in self.blocks.items() if blk.domain}
 
     @lru_cache(maxsize=1024)
     def get_neighbors(self, pos: Tuple[int, int, int], dims: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
@@ -221,6 +267,8 @@ class AntColonyInterpolator(InterpolatorBase):
         return float(self.background_value)
 
     def move_ants(self, dims: Tuple[int, int, int], quiet=False):
+        if self.interpolation_target == 'domain':
+            return self._move_ants_domain(dims, quiet=quiet)
         if not quiet:
             print("Moving ants...")
         changes_made = False
@@ -452,6 +500,123 @@ class AntColonyInterpolator(InterpolatorBase):
         
         return changes_made
 
+    def _update_block_domain_from_pheromones(self, block: Block):
+        if not block.domain_pheromones:
+            return
+        # Pick the domain with max pheromone; tie-breaker: keep current domain, else lexicographic.
+        items = list(block.domain_pheromones.items())
+        max_val = max(v for _, v in items)
+        best = [d for d, v in items if v == max_val]
+        if len(best) == 1:
+            block.domain = best[0]
+        else:
+            if block.domain in best:
+                return
+            block.domain = sorted(best)[0]
+
+    def _deposit_domain_pheromone(self, block: Block, domain: str, amount: float):
+        if domain is None or str(domain).strip() == '':
+            return
+        d = str(domain).strip()
+        block.domain_pheromones[d] = float(block.domain_pheromones.get(d, 0.0) + float(amount))
+        self._update_block_domain_from_pheromones(block)
+
+    def _move_ants_domain(self, dims: Tuple[int, int, int], quiet=False):
+        if not quiet:
+            print("Moving ants (domain mode)...")
+        changes_made = False
+
+        for block in self.blocks.values():
+            block.ant_count = 0
+
+        for ant in self.ants:
+            if ant.current_pos in self.blocks:
+                self.blocks[ant.current_pos].ant_count += 1
+
+        ant_iterator = self.ants if quiet else tqdm(self.ants)
+        for ant in ant_iterator:
+            if ant.current_pos not in self.blocks:
+                continue
+
+            current_block = self.blocks[ant.current_pos]
+            neighbors = self.get_neighbors(ant.current_pos, dims)
+            random.shuffle(neighbors)
+
+            # Domain mode: allow exploration anywhere in allowed_positions.
+            # Prefer: unassigned blocks, then blocks already owned by this domain.
+            candidates = []
+            for npos in neighbors:
+                if npos not in self.allowed_positions:
+                    continue
+                nb = self.blocks.get(npos)
+                if nb is not None and self.avoid_visited_threshold_enabled and nb.visit_count >= self.avoid_visited_threshold:
+                    # Still allow, but score low
+                    pass
+                if nb is None:
+                    score = 3
+                else:
+                    if nb.domain == ant.domain:
+                        score = 2
+                    elif nb.domain == "" or nb.domain is None:
+                        score = 1
+                    else:
+                        score = 0
+                # Avoid immediate backtracking
+                if ant.steps_history and npos == ant.steps_history[-1]:
+                    score -= 1
+                candidates.append((score, npos))
+
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            best_score = candidates[0][0]
+            best_positions = [npos for score, npos in candidates if score == best_score]
+            next_pos = random.choice(best_positions)
+
+            # Create block if needed
+            if next_pos not in self.blocks:
+                self.blocks[next_pos] = Block(
+                    value=0.0,
+                    is_sample=False,
+                    mark_class=0.0,
+                    block_id=self.next_block_id,
+                    pheromone=max(0, int(current_block.pheromone) - 1),
+                    visited=False,
+                    visit_count=0,
+                    ant_count=0,
+                    distance_to_sample=current_block.distance_to_sample + 1,
+                    nearest_sample_value=current_block.nearest_sample_value,
+                    domain="",
+                )
+                self.next_block_id += 1
+                changes_made = True
+
+            next_block = self.blocks[next_pos]
+
+            # Deposit domain pheromone and update label
+            deposit = float(max(1, int(current_block.pheromone)))
+            self._deposit_domain_pheromone(next_block, ant.domain, deposit)
+            next_block.pheromone = max(next_block.pheromone, int(deposit))
+            next_block.visited = True
+            next_block.visit_count += 1
+            next_block.ant_count += 1
+            changes_made = True
+
+            # Keep an export-friendly mapping of current domains
+            if not hasattr(self, 'domain_mapping') or self.domain_mapping is None:
+                self.domain_mapping = {}
+            if next_block.domain:
+                self.domain_mapping[next_pos] = next_block.domain
+
+            if ant.current_pos in self.blocks:
+                self.blocks[ant.current_pos].ant_count = max(0, self.blocks[ant.current_pos].ant_count - 1)
+            ant.current_pos = next_pos
+            ant.steps += 1
+            ant.steps_history.append(next_pos)
+
+        return changes_made
+
     def update_block_value(self, pos: Tuple[int, int, int], dims: Tuple[int, int, int]):
         block = self.blocks[pos]
         if block.is_sample:
@@ -501,9 +666,19 @@ class AntColonyInterpolator(InterpolatorBase):
         for pos in (tqdm(list(self.blocks.keys())) if not quiet else list(self.blocks.keys())):
             block = self.blocks[pos]
             if not block.is_sample:
-                block.pheromone = max(0, block.pheromone - 1)
-                if block.pheromone <= 0:
-                    blocks_to_remove.append(pos)
+                block.pheromone = max(0, block.pheromone - self.pheromone_decay_rate)
+                if self.interpolation_target == 'domain':
+                    # Decay per-domain pheromones, but do NOT delete blocks; we want a stable categorical field.
+                    if block.domain_pheromones:
+                        for d in list(block.domain_pheromones.keys()):
+                            block.domain_pheromones[d] = max(0.0, float(block.domain_pheromones[d]) - float(self.pheromone_decay_rate))
+                            if block.domain_pheromones[d] <= 0.0:
+                                del block.domain_pheromones[d]
+                        if block.domain_pheromones:
+                            self._update_block_domain_from_pheromones(block)
+                else:
+                    if block.pheromone <= 0:
+                        blocks_to_remove.append(pos)
         for pos in blocks_to_remove:
             if pos in self.blocks and not self.blocks[pos].is_sample:
                 del self.blocks[pos]

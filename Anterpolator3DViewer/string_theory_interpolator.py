@@ -4,17 +4,41 @@ from typing import Dict, Tuple, List, Set, Any
 from interpolator_base import InterpolatorBase
 
 class StringTheoryInterpolator(InterpolatorBase):
-    def __init__(self, distance_threshold: float = 10.0, grade_difference: float = 1.0, connect_to_all: bool = True, max_connections: int = 1, collision_policy: str = 'average', processing_order: str = 'ascending', filter_by_frequency: bool = False, min_azimuth_freq: float = 10.0, min_dip_freq: float = 10.0, verbose=False):
+    def __init__(
+        self,
+        distance_threshold: float = 10.0,
+        grade_difference: float = 1.0,
+        connect_to_all: bool = True,
+        max_connections: int = 1,
+        min_connections: int = 1,
+        collision_policy: str = 'average',
+        processing_order: str = 'ascending',
+        filter_by_frequency: bool = False,
+        min_azimuth_freq: float = 10.0,
+        min_dip_freq: float = 10.0,
+        interpolation_target: str = 'value',
+        verbose: bool = False,
+    ):
         super().__init__(verbose)
         self.distance_threshold = distance_threshold
         self.grade_difference = grade_difference
         self.connect_to_all = connect_to_all
         self.max_connections = max_connections
+        self.min_connections = min_connections
         self.collision_policy = collision_policy
         self.processing_order = processing_order
         self.filter_by_frequency = filter_by_frequency
         self.min_azimuth_freq = min_azimuth_freq
         self.min_dip_freq = min_dip_freq
+
+        target = (interpolation_target or 'value').strip().lower()
+        if target in ('numeric', 'number', 'grade', 'value'):
+            target = 'value'
+        elif target in ('domain', 'domains', 'category', 'categorical'):
+            target = 'domain'
+        else:
+            target = 'value'
+        self.interpolation_target = target
         
         # State
         self.sorted_samples: List[Tuple[Tuple[int, int, int], float]] = []
@@ -42,6 +66,10 @@ class StringTheoryInterpolator(InterpolatorBase):
         # We initialize with sample values.
         self.blocks: Dict[Tuple[int, int, int], dict] = {}
 
+        # Domain interpolation state
+        self.sample_domain_mapping: Dict[Tuple[int, int, int], str] = {}
+        # In domain mode, we also use self.domain_mapping as the evolving (pos -> domain) output mapping.
+
     def get_algorithm_name(self) -> str:
         return "String Theory"
 
@@ -50,11 +78,32 @@ class StringTheoryInterpolator(InterpolatorBase):
         self.dims = dims
         self.min_bounds = min_bounds
         self.block_size = block_size
+
+        # Numeric-mode domain mapping is a constraint (pos -> domain), typically coming from blocks file.
+        # Domain-mode domain mapping is the *target* being interpolated.
         self.use_domain_mapping = kwargs.get('use_domain_mapping', False)
+        self.sample_domain_mapping = kwargs.get('sample_domain_mapping', None) or {}
+
         self.sample_locations = set(sample_blocks.keys())
         self.blocks = {}
-        for pos, val in sample_blocks.items():
-            self.blocks[pos] = {'value': val, 'is_sample': True, 'count': 1}
+
+        if self.interpolation_target == 'domain':
+            # For domain interpolation, every sample block must have an assigned domain.
+            # Store domains both on blocks and on a mapping for quick access.
+            self.domain_mapping = {}
+            for pos, val in sample_blocks.items():
+                domain = self.sample_domain_mapping.get(pos)
+                if domain is None or str(domain).strip() == '':
+                    # Leave it unmapped; it will be skipped later.
+                    continue
+                domain = str(domain).strip()
+                self.domain_mapping[pos] = domain
+                self.blocks[pos] = {'value': float(val) if val is not None else 0.0, 'is_sample': True, 'count': 1, 'domain': domain}
+            # Domain interpolation should not use domain-mapping-as-constraint.
+            self.use_domain_mapping = False
+        else:
+            for pos, val in sample_blocks.items():
+                self.blocks[pos] = {'value': val, 'is_sample': True, 'count': 1}
         
         # Prepare samples for processing
         if self.processing_order == 'random':
@@ -65,10 +114,16 @@ class StringTheoryInterpolator(InterpolatorBase):
             if self.verbose:
                 print("String Theory: Processing samples in RANDOM order.")
         else:
-            # Sort by grade (value) ascending (default)
-            self.sorted_samples = sorted(sample_blocks.items(), key=lambda x: x[1])
-            if self.verbose:
-                print("String Theory: Processing samples in ASCENDING value order.")
+            if self.interpolation_target == 'domain':
+                # No grade in domain mode; keep deterministic ordering.
+                self.sorted_samples = sorted(sample_blocks.items(), key=lambda x: x[0])
+                if self.verbose:
+                    print("String Theory: Processing samples in ASCENDING coordinate order (domain mode).")
+            else:
+                # Sort by grade (value) ascending (default)
+                self.sorted_samples = sorted(sample_blocks.items(), key=lambda x: x[1])
+                if self.verbose:
+                    print("String Theory: Processing samples in ASCENDING value order.")
         
         # Prepare KDTree for fast spatial queries
         coords = np.array([list(k) for k in sample_blocks.keys()])
@@ -83,7 +138,10 @@ class StringTheoryInterpolator(InterpolatorBase):
         self.current_index = 0
         if self.verbose:
             print(f"Initialized StringTheory with {len(self.sorted_samples)} samples.")
-            print(f"Distance Threshold: {self.distance_threshold}, Grade Diff: {self.grade_difference}")
+            if self.interpolation_target == 'domain':
+                print(f"Distance Threshold: {self.distance_threshold} (domain mode)")
+            else:
+                print(f"Distance Threshold: {self.distance_threshold}, Grade Diff: {self.grade_difference}")
 
     def _bresenham_3d(self, p1: Tuple[int, int, int], p2: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
         """
@@ -155,6 +213,9 @@ class StringTheoryInterpolator(InterpolatorBase):
     def run_iteration(self, dims: Tuple[int, int, int]) -> bool:
         # Process ALL remaining samples in one go
         # String Theory is not iterative in the sense of convergence; it's a single pass algorithm.
+
+        if self.interpolation_target == 'domain':
+            return self._run_iteration_domain(dims)
         
         if self.kdtree is None:
             return False
@@ -209,8 +270,8 @@ class StringTheoryInterpolator(InterpolatorBase):
             # "search the equal or greater sample that makes the module of the difference smaller"
             candidates.sort(key=lambda x: (abs(x[2] - s1_val), x[0]))
             
-            path_found = False
-            connections_count = 0
+            valid_connections_buffer = []
+            
             for dist, s2_pos, s2_val in candidates:
                 # Get path
                 path = self._bresenham_3d(s1_pos, s2_pos)
@@ -266,20 +327,24 @@ class StringTheoryInterpolator(InterpolatorBase):
                     self.stats['obstacle_rejected'] += 1
                 else:
                     # Valid path found!
-                    path_found = True
+                    # Buffer it
+                    valid_connections_buffer.append((s1_pos, s1_val, s2_pos, s2_val, points_to_fill, path))
+                    
+                    # If not connecting to all, stop after max_connections
+                    if not self.connect_to_all and len(valid_connections_buffer) >= self.max_connections:
+                        break
+            
+            # Apply connections if minimum requirement is met
+            if len(valid_connections_buffer) >= self.min_connections:
+                for s1_p, s1_v, s2_p, s2_v, pts, pth in valid_connections_buffer:
                     self.stats['connections_made'] += 1
-                    connections_count += 1
                     
                     # Store path for statistics
-                    self.paths.append((s1_pos, s2_pos, path))
+                    self.paths.append((s1_p, s2_p, pth))
                     
                     # Fill blocks if NOT filtering by frequency (otherwise we do it later)
                     if not self.filter_by_frequency:
-                        self._fill_path_blocks(s1_pos, s1_val, s2_pos, s2_val, points_to_fill)
-                    
-                    # If not connecting to all, stop after max_connections
-                    if not self.connect_to_all and connections_count >= self.max_connections:
-                        break
+                        self._fill_path_blocks(s1_p, s1_v, s2_p, s2_v, pts)
         
         # Apply filtering if enabled
         if self.filter_by_frequency:
@@ -290,6 +355,94 @@ class StringTheoryInterpolator(InterpolatorBase):
         for k, v in self.stats.items():
             print(f"  {k}: {v}")
             
+        return False
+
+    def _run_iteration_domain(self, dims: Tuple[int, int, int]) -> bool:
+        if self.kdtree is None:
+            return False
+
+        total_samples = len(self.sorted_samples)
+        processed_count = 0
+
+        if self.verbose:
+            print("String Theory: Running DOMAIN interpolation.")
+
+        while self.current_index < total_samples:
+            s1_pos, s1_val = self.sorted_samples[self.current_index]
+            self.current_index += 1
+            processed_count += 1
+
+            d1 = None
+            if getattr(self, 'domain_mapping', None) is not None:
+                d1 = self.domain_mapping.get(s1_pos)
+            if d1 is None:
+                # Sample block has no domain; skip.
+                continue
+
+            neighbor_indices = self.kdtree.query_ball_point(s1_pos, self.distance_threshold)
+
+            candidates = []
+            for idx in neighbor_indices:
+                s2_pos = tuple(self.sample_coords[idx])
+                if s2_pos == s1_pos:
+                    continue
+
+                d2 = self.domain_mapping.get(s2_pos) if getattr(self, 'domain_mapping', None) is not None else None
+                if d2 != d1:
+                    self.stats['domain_rejected'] += 1
+                    continue
+
+                dist = float(np.linalg.norm(np.array(s1_pos) - np.array(s2_pos)))
+                candidates.append((dist, s2_pos))
+
+            self.stats['neighbors_found'] += len(candidates)
+            if not candidates:
+                self.stats['no_candidates'] += 1
+
+            candidates.sort(key=lambda x: x[0])
+
+            valid_connections_buffer = []
+
+            for dist, s2_pos in candidates:
+                path = self._bresenham_3d(s1_pos, s2_pos)
+
+                if len(path) <= 2:
+                    self.stats['adjacent_rejected'] += 1
+                    continue
+
+                obstacle_found = False
+                points_to_fill = []
+                if len(path) > 2:
+                    for pt in path[1:-1]:
+                        if pt in self.sample_locations:
+                            obstacle_found = True
+                            break
+                        points_to_fill.append(pt)
+
+                if obstacle_found:
+                    self.stats['obstacle_rejected'] += 1
+                    continue
+
+                valid_connections_buffer.append((s1_pos, s2_pos, d1, points_to_fill, path))
+                if not self.connect_to_all and len(valid_connections_buffer) >= self.max_connections:
+                    break
+
+            if len(valid_connections_buffer) >= self.min_connections:
+                for s1_p, s2_p, domain, pts, pth in valid_connections_buffer:
+                    self.stats['connections_made'] += 1
+                    self.paths.append((s1_p, s2_p, pth))
+                    if not self.filter_by_frequency:
+                        self._fill_path_blocks_domain(domain, pts)
+
+        if self.filter_by_frequency:
+            self._filter_and_fill_paths_domain()
+
+        if self.verbose:
+            print(f"String Theory: Finished processing {total_samples} samples (domain mode).")
+            print("String Theory Stats:")
+            for k, v in self.stats.items():
+                print(f"  {k}: {v}")
+
         return False
 
     def get_interpolated_values(self) -> Dict[Tuple[int, int, int], float]:
@@ -528,6 +681,93 @@ class StringTheoryInterpolator(InterpolatorBase):
                     self.blocks[pt]['count'] = count + 1
             else:
                 self.blocks[pt] = {'value': val, 'is_sample': False, 'count': 1}
+
+    def _fill_path_blocks_domain(self, domain: str, points_to_fill: List[Tuple[int, int, int]]):
+        domain = str(domain).strip()
+        for pt in points_to_fill:
+            if pt in self.blocks and self.blocks[pt].get('is_sample', False):
+                continue
+
+            existing = self.blocks.get(pt)
+            if existing is None:
+                self.blocks[pt] = {'value': 0.0, 'is_sample': False, 'count': 1, 'domain': domain}
+                if getattr(self, 'domain_mapping', None) is None:
+                    self.domain_mapping = {}
+                self.domain_mapping[pt] = domain
+                continue
+
+            existing_domain = existing.get('domain')
+            if existing_domain == domain:
+                continue
+
+            # Collision between domains: only 'overwrite' is meaningful here.
+            if self.collision_policy == 'overwrite':
+                existing['domain'] = domain
+                existing['value'] = 0.0
+                if getattr(self, 'domain_mapping', None) is None:
+                    self.domain_mapping = {}
+                self.domain_mapping[pt] = domain
+
+    def _filter_and_fill_paths_domain(self):
+        if not self.paths:
+            return
+
+        azimuths = []
+        dips = []
+        for p1, p2, _ in self.paths:
+            az, dip = self._calculate_path_orientation(p1, p2)
+            azimuths.append(az)
+            dips.append(dip)
+
+        az_bins = np.linspace(0, 360, 37)
+        az_hist, az_bin_edges = np.histogram(azimuths, bins=az_bins)
+        max_az_freq = np.max(az_hist) if len(az_hist) > 0 else 0
+
+        dip_bins = np.linspace(0, 90, 37)
+        dip_hist, dip_bin_edges = np.histogram(dips, bins=dip_bins)
+        max_dip_freq = np.max(dip_hist) if len(dip_hist) > 0 else 0
+
+        az_threshold_count = max_az_freq * (self.min_azimuth_freq / 100.0)
+        dip_threshold_count = max_dip_freq * (self.min_dip_freq / 100.0)
+
+        kept_count = 0
+        rejected_count = 0
+        self.kept_paths_indices = set()
+
+        for i, (p1, p2, path) in enumerate(self.paths):
+            az, dip = azimuths[i], dips[i]
+
+            az_idx = np.digitize([az], az_bin_edges)[0] - 1
+            if az_idx >= len(az_hist):
+                az_idx = len(az_hist) - 1
+            if az_idx < 0:
+                az_idx = 0
+
+            dip_idx = np.digitize([dip], dip_bin_edges)[0] - 1
+            if dip_idx >= len(dip_hist):
+                dip_idx = len(dip_hist) - 1
+            if dip_idx < 0:
+                dip_idx = 0
+
+            current_az_freq = az_hist[az_idx]
+            current_dip_freq = dip_hist[dip_idx]
+
+            if current_az_freq >= az_threshold_count and current_dip_freq >= dip_threshold_count:
+                kept_count += 1
+                self.kept_paths_indices.add(i)
+                domain = None
+                if getattr(self, 'domain_mapping', None) is not None:
+                    domain = self.domain_mapping.get(p1)
+                if domain is None:
+                    continue
+                if len(path) > 2:
+                    points_to_fill = path[1:-1]
+                    self._fill_path_blocks_domain(domain, points_to_fill)
+            else:
+                rejected_count += 1
+
+        if self.verbose:
+            print(f"String Theory Filtering (domain): Kept {kept_count} paths, Rejected {rejected_count} paths.")
 
     def _filter_and_fill_paths(self):
         """

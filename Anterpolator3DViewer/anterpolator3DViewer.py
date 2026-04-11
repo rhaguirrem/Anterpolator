@@ -1,7 +1,11 @@
 import pandas as pd
-import pyvista as pv
 import numpy as np
 import csv
+from collections import Counter
+import importlib.util
+import io
+import threading
+import time
 from tqdm import tqdm
 import sys
 import os
@@ -10,13 +14,36 @@ import xml.etree.ElementTree as ET
 from matplotlib.colors import ListedColormap
 import json
 from PyQt5 import QtWidgets, QtCore
-from sklearn.neighbors import NearestNeighbors
-from sklearn.decomposition import PCA
 sys.path.append("C:/Projects/Anterpolator")
-from ant_colony import AntColonyInterpolator
-from molecular_clock_interpolator import MolecularClockInterpolator
-from string_theory_interpolator import StringTheoryInterpolator
-from interpolator_base import InterpolatorBase
+
+pv = None
+taichi_runtime_module = None
+LARGE_BLOCK_FILE_THRESHOLD = 512 * 1024 * 1024
+INITIAL_BLOCK_RENDER_THRESHOLD = 5000
+
+
+def _require_pyvista():
+    global pv
+    if pv is None:
+        import pyvista as _pyvista
+
+        pv = _pyvista
+    return pv
+
+
+def _load_taichi_runtime_module():
+    global taichi_runtime_module
+    if taichi_runtime_module is not None:
+        return taichi_runtime_module
+
+    module_path = os.path.join(os.path.dirname(__file__), 'taichi', 'runtime.py')
+    spec = importlib.util.spec_from_file_location('anterpolator_taichi_runtime', module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load Taichi runtime from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    taichi_runtime_module = module
+    return taichi_runtime_module
 
 # --- Interpolator Factory ---
 def create_interpolator(config, domain=None, current_algorithm=None):
@@ -50,6 +77,9 @@ def create_interpolator(config, domain=None, current_algorithm=None):
                 config = {**config, 'molecular_clock_params': mc_params}
     
     if algo_type == 'ant_colony':
+        from ant_colony import AntColonyInterpolator
+
+        ant_target = config.get('ant_colony_interpolate_target', 'value')
         return AntColonyInterpolator(
             range_size=config.get('range_size', 10),
             max_pheromone=config.get('max_pheromone', 150),
@@ -60,10 +90,14 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             average_with_blocks=config.get('average_with_blocks', False),
             avoid_visited_threshold_enabled=config.get('avoid_visited_threshold_enabled', False),
             avoid_visited_threshold=config.get('avoid_visited_threshold', 100),
-            ants_sampling_percentage=config.get('ants_sampling_percentage', 100.0)
+            ants_sampling_percentage=config.get('ants_sampling_percentage', 100.0),
+            pheromone_decay_rate=config.get('pheromone_decay_rate', 1),
+            interpolation_target=ant_target,
         )
     
     elif algo_type == 'molecular_clock':
+        from molecular_clock_interpolator import MolecularClockInterpolator
+
         mc_params = config.get('molecular_clock_params', {})
         return MolecularClockInterpolator(
             spatial_weight=mc_params.get('spatial_weight', 1.0),
@@ -78,31 +112,39 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             ancestor_depth_offset=mc_params.get('ancestor_depth_offset', 1.0),
             verbose=config.get('verbose', False)
         )
+
     
     elif algo_type == 'string_theory' or algo_type == 'net_connector':
+        from string_theory_interpolator import StringTheoryInterpolator
+
         st_params = config.get('string_theory_params', {})
         # Fallback to root config if not in sub-dict (for backward compatibility or direct config usage)
         dist_thresh = st_params.get('distance_threshold', config.get('distance_threshold', 10.0))
         grade_diff = st_params.get('grade_difference', config.get('grade_difference', 1.0))
         connect_all = st_params.get('connect_to_all', config.get('connect_to_all', True))
         max_connections = st_params.get('max_connections', config.get('max_connections', 1))
+        min_connections = st_params.get('min_connections', config.get('min_connections', 1))
         collision_policy = st_params.get('collision_policy', config.get('collision_policy', 'average'))
         processing_order = st_params.get('processing_order', config.get('processing_order', 'ascending'))
         
         filter_by_frequency = st_params.get('filter_by_frequency', config.get('filter_by_frequency', False))
         min_azimuth_freq = st_params.get('min_azimuth_freq', config.get('min_azimuth_freq', 10.0))
         min_dip_freq = st_params.get('min_dip_freq', config.get('min_dip_freq', 10.0))
+
+        interpolate_target = st_params.get('interpolate_target', 'value')
         
         return StringTheoryInterpolator(
             distance_threshold=dist_thresh,
             grade_difference=grade_diff,
             connect_to_all=connect_all,
             max_connections=max_connections,
+            min_connections=min_connections,
             collision_policy=collision_policy,
             processing_order=processing_order,
             filter_by_frequency=filter_by_frequency,
             min_azimuth_freq=min_azimuth_freq,
             min_dip_freq=min_dip_freq,
+            interpolation_target=interpolate_target,
             verbose=config.get('verbose', False)
         )
     
@@ -133,36 +175,218 @@ def parse_header_line(path, delimiter, line_number):
     except UnicodeDecodeError:
         raise ValueError(f"Could not decode file '{path}' with utf-8 encoding.")
 
-def read_csv_with_selected_header(path, delimiter, header_line, expected_min_cols=1):
+def prepare_csv_read_kwargs(source, **read_csv_kwargs):
+    prepared = dict(read_csv_kwargs)
+    delimiter = prepared.get('delimiter', prepared.get('sep', ','))
+    if 'engine' not in prepared:
+        if delimiter is None or not isinstance(delimiter, str) or len(delimiter) != 1:
+            prepared['engine'] = 'python'
+    if isinstance(source, str) and prepared.get('engine', 'c') != 'python':
+        prepared.setdefault('memory_map', True)
+    return prepared
+
+class ProgressTextReader:
+    def __init__(self, path, label):
+        self.path = path
+        self.label = label
+        self.total_bytes = max(os.path.getsize(path), 1)
+        self._raw = open(path, 'rb')
+        self._text = io.TextIOWrapper(self._raw, encoding='utf-8', errors='ignore', newline='')
+        self._displayed_bytes = 0
+        self._started_at = time.perf_counter()
+        self._last_postfix_update = self._started_at - 1.0
+        self._refresh_bytes = max(512 * 1024, min(16 * 1024 * 1024, max(self.total_bytes // 2000, 1)))
+        self._monitor_interval = 0.25
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._pbar = tqdm(
+            total=self.total_bytes,
+            desc=label,
+            unit='B',
+            unit_scale=True,
+            unit_divisor=1024,
+        )
+        self._update_postfix(force=True)
+        self._monitor_thread = threading.Thread(target=self._monitor_progress, daemon=True)
+        self._monitor_thread.start()
+
+    def _sync_progress(self, force_postfix=False):
+        with self._lock:
+            current_bytes = self._raw.tell()
+            byte_delta = current_bytes - self._displayed_bytes
+            if byte_delta > 0:
+                self._pbar.update(byte_delta)
+                self._displayed_bytes = current_bytes
+            if force_postfix or byte_delta >= self._refresh_bytes:
+                self._update_postfix(force=force_postfix)
+
+    def _monitor_progress(self):
+        while not self._stop_event.wait(self._monitor_interval):
+            self._sync_progress()
+
+    def _update_postfix(self, force=False):
+        now = time.perf_counter()
+        if not force and (now - self._last_postfix_update) < 1.0:
+            return
+        elapsed_seconds = max(int(now - self._started_at), 0)
+        self._pbar.set_postfix_str(f"elapsed~{elapsed_seconds}s")
+        self._last_postfix_update = now
+
+    def _track_text(self, text):
+        return text
+
+    @property
+    def handle(self):
+        return self._text
+
+    def read(self, *args, **kwargs):
+        return self._track_text(self._text.read(*args, **kwargs))
+
+    def readline(self, *args, **kwargs):
+        return self._track_text(self._text.readline(*args, **kwargs))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if line == '':
+            raise StopIteration
+        return line
+
+    def __getattr__(self, name):
+        return getattr(self._text, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def close(self):
+        try:
+            self._stop_event.set()
+            if self._monitor_thread.is_alive():
+                self._monitor_thread.join(timeout=max(self._monitor_interval * 2, 0.5))
+            self._sync_progress(force_postfix=True)
+        finally:
+            self._pbar.close()
+            self._text.close()
+
+def read_csv_with_progress(path, progress_label, **read_csv_kwargs):
+    read_csv_kwargs = prepare_csv_read_kwargs(path, **read_csv_kwargs)
+    read_csv_kwargs.pop('memory_map', None)
+    with ProgressTextReader(path, progress_label) as reader:
+        df = pd.read_csv(reader.handle, **read_csv_kwargs)
+        reader._sync_progress(force_postfix=True)
+        print(f"{progress_label}: read {reader._displayed_bytes:,} bytes from {os.path.basename(path)}")
+        df._approx_bytes_read = reader._displayed_bytes
+    return df
+
+def iterate_csv_with_progress(path, progress_label, **read_csv_kwargs):
+    read_csv_kwargs = prepare_csv_read_kwargs(path, **read_csv_kwargs)
+    read_csv_kwargs.pop('memory_map', None)
+
+    def _generator():
+        with ProgressTextReader(path, progress_label) as reader:
+            for chunk in pd.read_csv(reader.handle, **read_csv_kwargs):
+                yield chunk
+            reader._sync_progress(force_postfix=True)
+            print(f"{progress_label}: read {reader._displayed_bytes:,} bytes from {os.path.basename(path)}")
+
+    return _generator()
+
+def build_unique_column_names(headers):
+    name_counts = {}
+    final_names = []
+    for header in headers:
+        key = header if header else 'Unnamed'
+        count = name_counts.get(key, 0)
+        final_names.append(f"{key}_{count}" if count > 0 else key)
+        name_counts[key] = count + 1
+    return final_names
+
+def read_selected_columns_with_header(path, delimiter, header_line, selected_columns, progress_label=None):
+    headers = parse_header_line(path, delimiter, header_line)
+    final_names = build_unique_column_names(headers)
+    missing = [col for col in selected_columns if col not in final_names]
+    if missing:
+        raise ValueError(f"Selected columns not found in file '{os.path.basename(path)}': {missing}")
+    read_kwargs = dict(
+        delimiter=delimiter,
+        header=None,
+        names=final_names,
+        skiprows=header_line,
+        comment='#',
+        usecols=selected_columns,
+    )
+    if progress_label:
+        df = read_csv_with_progress(path, progress_label, **read_kwargs)
+    else:
+        df = pd.read_csv(path, **prepare_csv_read_kwargs(path, **read_kwargs))
+    df._detected_delimiter = delimiter
+    return df, final_names
+
+def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_line=1,
+                          sample_x_col=None, sample_y_col=None, sample_z_col=None, sample_value_col=None,
+                          progress_label=None):
+    explicit_mapping = all([sample_x_col, sample_y_col, sample_z_col, sample_value_col])
+    if explicit_mapping:
+        delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
+        selected_columns = [sample_x_col, sample_y_col, sample_z_col, sample_value_col]
+        df, parsed_cols = read_selected_columns_with_header(
+            samples_file,
+            delimiter,
+            samples_header_line or 1,
+            selected_columns,
+            progress_label=progress_label,
+        )
+        rename_map = {
+            sample_x_col: 'x',
+            sample_y_col: 'y',
+            sample_z_col: 'z',
+            sample_value_col: 'Value',
+        }
+        df = df.rename(columns=rename_map)
+        return df, parsed_cols, rename_map
+
+    if samples_header_line and samples_header_line != 1 and samples_delimiter:
+        df, parsed_cols = read_csv_with_selected_header(
+            samples_file,
+            samples_delimiter,
+            samples_header_line,
+            expected_min_cols=4,
+            progress_label=progress_label,
+        )
+    else:
+        df = read_autodetect_csv(samples_file, forced_delimiter=samples_delimiter, progress_label=progress_label)
+        parsed_cols = None
+    return df, parsed_cols, None
+
+def quantize_grid_indices(coords, reference_origin, block_size):
+    scaled = (coords - reference_origin) / block_size
+    rounded = np.rint(scaled)
+    return rounded.astype(np.int64)
+
+def read_csv_with_selected_header(path, delimiter, header_line, expected_min_cols=1, progress_label=None):
     """Read CSV using a specific header line (1-based). Returns DataFrame.
     Uses manual header parsing to build names and then pandas read_csv with skiprows.
     """
     headers = parse_header_line(path, delimiter, header_line)
-    # Build a name list; allow duplicate names by enumerating duplicates
-    name_counts = {}
-    final_names = []
-    for h in headers:
-        key = h if h else 'Unnamed'
-        count = name_counts.get(key, 0)
-        if count > 0:
-            new_name = f"{key}_{count}"
-        else:
-            new_name = key
-        name_counts[key] = count + 1
-        final_names.append(new_name)
-    df = pd.read_csv(
-        path,
+    final_names = build_unique_column_names(headers)
+    read_kwargs = dict(
         delimiter=delimiter,
-        engine='python',
         header=None,
         names=final_names,
         skiprows=header_line-1,
         comment='#'
     )
-    # Drop the first data row if it actually contained the header again (defensive)
+    if progress_label:
+        df = read_csv_with_progress(path, progress_label, **read_kwargs)
+    else:
+        df = pd.read_csv(path, **prepare_csv_read_kwargs(path, **read_kwargs))
     if df.shape[0] and all(str(df.iloc[0, i]).strip() == final_names[i] for i in range(min(len(final_names), df.shape[1]))):
         df = df.iloc[1:].reset_index(drop=True)
-    # Remove fully empty columns
     def is_all_empty(series):
         return series.isna().all() or (series.astype(str).str.strip() == '').all()
     empty_cols = [c for c in df.columns if is_all_empty(df[c])]
@@ -184,7 +408,6 @@ def detect_csv_delimiter(path):
                     line = next(f)
                 except StopIteration:
                     break
-                # Collect non-comment, non-empty for delimiter sensing
                 if line.strip() and not line.lstrip().startswith(('#','//')):
                     lines.append(line)
                 if len(lines) >= 3:
@@ -193,19 +416,22 @@ def detect_csv_delimiter(path):
     except StopIteration:
         sample = ''
     counts = {d: sample.count(d) for d in [',',';','\t','|']}
-    # Prefer delimiter with highest count; fallback comma
     delim = max(counts, key=counts.get)
     return delim if counts[delim] > 0 else ','
 
-def read_autodetect_csv(path, min_cols=1, forced_delimiter=None):
+def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=None):
     """Read a CSV file detecting delimiter (comma, semicolon, tab, pipe) unless forced.
     Drops empty columns. Returns DataFrame."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"File not found: {path}")
     delim = forced_delimiter if forced_delimiter else detect_csv_delimiter(path)
-    # Read, skipping comment-like lines
+
     def base_read(delimiter):
-        return pd.read_csv(path, delimiter=delimiter, engine='python', comment='#')
+        read_kwargs = dict(delimiter=delimiter, comment='#')
+        if progress_label:
+            return read_csv_with_progress(path, progress_label, **read_kwargs)
+        return pd.read_csv(path, **prepare_csv_read_kwargs(path, **read_kwargs))
+
     try:
         df = base_read(delim)
     except Exception:
@@ -218,10 +444,10 @@ def read_autodetect_csv(path, min_cols=1, forced_delimiter=None):
                 raise ValueError(f"Failed to read CSV with delimiter '{delim}' and fallback '{alt}': {e2}")
         else:
             raise
-    # If single column but delimiter chars appear inside, attempt multi-try
+
     if df.shape[1] == 1:
-        text_sample = str(df.iloc[0,0]) if len(df) else ''
-        candidates = ['; ',',','\t','|']
+        text_sample = str(df.iloc[0, 0]) if len(df) else ''
+        candidates = ['; ', ',', '\t', '|']
         for cand in candidates:
             if cand.strip() in text_sample and cand != delim:
                 try:
@@ -246,11 +472,53 @@ def read_autodetect_csv(path, min_cols=1, forced_delimiter=None):
 def format_point_info(point, value):
     return f"Position: ({point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f})\nValue: {value:.2f}"
 
+def _collect_same_level_vectors(points, max_points=4096, max_points_per_level=256, neighbors_per_point=8):
+    if len(points) == 0:
+        return np.empty((0, 3), dtype=float)
+
+    if len(points) > max_points:
+        sample_indices = np.linspace(0, len(points) - 1, num=max_points, dtype=int)
+        sampled = points[sample_indices]
+    else:
+        sampled = points
+
+    z_keys = np.round(sampled[:, 2], decimals=6)
+    _, inverse = np.unique(z_keys, return_inverse=True)
+    vectors = []
+
+    for level_idx in range(inverse.max() + 1 if len(inverse) else 0):
+        level_points = sampled[inverse == level_idx]
+        if len(level_points) < 2:
+            continue
+
+        if len(level_points) > max_points_per_level:
+            level_points = level_points[:max_points_per_level]
+
+        xy = level_points[:, :2]
+        deltas = xy[:, None, :] - xy[None, :, :]
+        distance_sq = np.einsum('ijk,ijk->ij', deltas, deltas)
+        np.fill_diagonal(distance_sq, np.inf)
+
+        neighbor_count = min(neighbors_per_point, len(level_points) - 1)
+        if neighbor_count <= 0:
+            continue
+
+        nearest_indices = np.argsort(distance_sq, axis=1)[:, :neighbor_count]
+        for point_idx, neighbor_indices in enumerate(nearest_indices):
+            base_point = level_points[point_idx]
+            for neighbor_idx in neighbor_indices:
+                vector = level_points[neighbor_idx] - base_point
+                if vector[0] != 0 or vector[1] != 0:
+                    vectors.append(vector)
+
+    if not vectors:
+        return np.empty((0, 3), dtype=float)
+    return np.asarray(vectors, dtype=float)
+
 def middle_click_callback(plotter, event_id):
     if hasattr(plotter, 'picked_point'):
         point = plotter.picked_point
         if point is not None:
-            # Update camera focus
             plotter.camera_position = [
                 plotter.camera.position,
                 point,
@@ -269,39 +537,13 @@ def detect_grid_rotation(points, block_size_hint=None, sample_size=50000):
 
     print(f"Detecting rotation on {len(points)} points...")
 
-    # Use a contiguous chunk to ensure we have neighbors
-    chunk_size = min(len(points), 10000)
-    chunk = points[:chunk_size]
-    
-    # 2. Find nearest neighbors in 2D (XY plane) to speed up
-    # We only care about rotation around Z, so we look at XY vectors
-    nbrs = NearestNeighbors(n_neighbors=8, algorithm='auto').fit(chunk[:, :2])
-    distances, indices = nbrs.kneighbors(chunk[:, :2])
-    
-    # 3. Collect candidate vectors
-    vectors = []
-    for i in range(len(chunk)):
-        # Skip self (index 0)
-        for j in range(1, indices.shape[1]):
-            neighbor_idx = indices[i][j]
-            
-            # Check if on same Z level
-            if not np.isclose(chunk[i, 2], chunk[neighbor_idx, 2]):
-                continue
-                
-            vec = chunk[neighbor_idx] - chunk[i]
-            dist = distances[i][j]
-            
-            if dist > 0:
-                vectors.append(vec)
-    
-    if not vectors:
+    vectors = _collect_same_level_vectors(points, max_points=min(len(points), sample_size, 4096))
+
+    if len(vectors) == 0:
         print("No vectors found between neighbors on same Z level.")
         return np.eye(3), np.zeros(3), False
-        
-    vectors = np.array(vectors)
     norms = np.linalg.norm(vectors, axis=1)
-    
+
     # 4. Determine target block size
     target_length = None
     
@@ -412,6 +654,265 @@ def detect_grid_rotation(points, block_size_hint=None, sample_size=50000):
     center = np.mean(points, axis=0)
     return rotation_matrix, center, True
 
+def resolve_base_block_domains(grid_indices, domains, policy='majority'):
+    grouped_domains = {}
+    for idx, domain in zip(grid_indices, domains):
+        base_idx = tuple(int(v) for v in idx)
+        grouped_domains.setdefault(base_idx, []).append(str(domain))
+
+    return resolve_base_block_domains_from_counts(grouped_domains, policy=policy)
+
+def resolve_base_block_domains_from_counts(grouped_domains, policy='majority'):
+    domain_mapping = {}
+    subblock_counts = {}
+    mixed_domain_blocks = {}
+
+    for base_idx, block_domains in grouped_domains.items():
+        counts = block_domains if isinstance(block_domains, Counter) else Counter(block_domains)
+        subblock_counts[base_idx] = int(sum(counts.values()))
+
+        if len(counts) == 1:
+            domain_mapping[base_idx] = next(iter(counts))
+            continue
+
+        sorted_counts = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        mixed_domain_blocks[base_idx] = dict(sorted_counts)
+
+        if policy == 'strict':
+            continue
+        if policy != 'majority':
+            raise ValueError(f"Unsupported sub-block domain policy: {policy}")
+
+        domain_mapping[base_idx] = sorted_counts[0][0]
+
+    if policy == 'strict' and mixed_domain_blocks:
+        examples = list(mixed_domain_blocks.items())[:5]
+        detail = '; '.join(f"{idx}: {counts}" for idx, counts in examples)
+        raise ValueError(
+            f"Found {len(mixed_domain_blocks)} base blocks with mixed sub-block domains under strict policy. "
+            f"Examples: {detail}"
+        )
+
+    return domain_mapping, subblock_counts, mixed_domain_blocks
+
+def plan_block_file_columns(header_names, block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None):
+    available_cols = [c for c in header_names if str(c).strip() != '']
+    if block_x_col and block_y_col and block_z_col:
+        rename_map = {}
+        for src, tgt in [(block_x_col, 'x'), (block_y_col, 'y'), (block_z_col, 'z')]:
+            if src not in header_names:
+                raise ValueError(f"Selected blocks column '{src}' not found in file.")
+            rename_map[src] = tgt
+        selected_columns = [block_x_col, block_y_col, block_z_col]
+        domain_copy_source = None
+        if block_domain_col:
+            if block_domain_col not in header_names:
+                raise ValueError(f"Selected domain column '{block_domain_col}' not found in blocks file.")
+            if block_domain_col in selected_columns:
+                domain_copy_source = block_domain_col
+            else:
+                selected_columns.append(block_domain_col)
+                rename_map[block_domain_col] = 'Domain'
+        mapping_mode = 'explicit'
+    else:
+        if len(available_cols) < 3:
+            raise ValueError(f"Blocks file must provide at least 3 non-empty columns. Parsed headers: {header_names}")
+        selected_columns = available_cols[:4]
+        rename_map = {src: tgt for src, tgt in zip(selected_columns, ['x', 'y', 'z', 'Domain'])}
+        domain_copy_source = None
+        mapping_mode = 'positional'
+    return selected_columns, rename_map, domain_copy_source, mapping_mode
+
+def normalize_block_chunk(chunk, rename_map, domain_copy_source=None):
+    if domain_copy_source and 'Domain' not in chunk.columns and domain_copy_source in chunk.columns:
+        chunk['Domain'] = chunk[domain_copy_source]
+    if rename_map:
+        chunk = chunk.rename(columns=rename_map)
+    keep_columns = [c for c in ['x', 'y', 'z', 'Domain'] if c in chunk.columns]
+    chunk = chunk.loc[:, keep_columns].copy()
+    rows_before = len(chunk)
+    for column in ['x', 'y', 'z']:
+        if column not in chunk.columns:
+            raise ValueError(f"Blocks file missing required coordinate column '{column}' after mapping.")
+        chunk.loc[:, column] = pd.to_numeric(chunk[column], errors='coerce')
+    chunk = chunk.dropna(subset=['x', 'y', 'z'])
+    return chunk, rows_before - len(chunk)
+
+def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, points,
+                               block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
+                               config=None):
+    headers = parse_header_line(blocks_file, delimiter, header_line)
+    final_names = build_unique_column_names(headers)
+    selected_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
+        final_names,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=block_domain_col,
+    )
+    chunksize = 250_000
+    skipped_domains = set()
+    if config and 'domain_algorithm_overrides' in config:
+        skipped_domains = {
+            domain for domain, cfg in config['domain_algorithm_overrides'].items()
+            if cfg.get('skip', False)
+        }
+
+    print(f"Streaming large blocks file ({os.path.getsize(blocks_file) / 1024**3:.2f} GiB) with chunks of {chunksize:,} rows.")
+    if mapping_mode == 'explicit':
+        print(f"Applied user block column mapping: {rename_map}")
+    else:
+        print(f"Applied generic positional mapping to first columns: {rename_map}")
+    print(f"Blocks selected headers: {selected_columns}")
+
+    base_read_kwargs = dict(
+        delimiter=delimiter,
+        header=None,
+        names=final_names,
+        skiprows=header_line,
+        comment='#',
+        usecols=selected_columns,
+        chunksize=chunksize,
+    )
+
+    rotation_sample_target = 10_000
+    rotation_samples = []
+    print("Reading grid file (rotation sample)")
+    for chunk in iterate_csv_with_progress(blocks_file, "Reading grid file (rotation sample)", **base_read_kwargs):
+        chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
+        if len(chunk) == 0:
+            continue
+        rotation_samples.append(chunk[['x', 'y', 'z']].to_numpy())
+        if sum(len(arr) for arr in rotation_samples) >= rotation_sample_target:
+            break
+
+    if not rotation_samples:
+        raise ValueError("Blocks file had no valid coordinate rows to sample for rotation detection.")
+
+    sample_points = np.concatenate(rotation_samples, axis=0)
+    rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(sample_points, block_size_hint=block_size)
+
+    if block_size is not None:
+        if isinstance(block_size, (list, tuple, np.ndarray)):
+            unified_dims = np.array(block_size, dtype=float)
+        else:
+            unified_dims = np.array([block_size, block_size, block_size], dtype=float)
+        print(f"Using configured block size: {unified_dims}")
+    else:
+        raise ValueError("Block size must be specified when streaming large blocks files.")
+
+    print("Building bounds and domain mapping...")
+    min_quantized_idx = None
+    max_quantized_idx = None
+    grid_reference = None
+    grouped_domain_counts = {}
+    skipped_count_total = 0
+    resolved_rows = 0
+
+    full_read_kwargs = dict(base_read_kwargs)
+
+    for chunk in iterate_csv_with_progress(blocks_file, "Reading grid file (bounds + domain mapping)", **full_read_kwargs):
+        chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
+        if len(chunk) == 0:
+            continue
+
+        coords = chunk[['x', 'y', 'z']].to_numpy(copy=False)
+        if is_rotated:
+            coords = (coords - rotation_center) @ rotation_matrix.T
+            chunk.loc[:, 'x'] = coords[:, 0]
+            chunk.loc[:, 'y'] = coords[:, 1]
+            chunk.loc[:, 'z'] = coords[:, 2]
+
+        if grid_reference is None:
+            grid_reference = coords[0]
+
+        quantized_indices = quantize_grid_indices(coords, grid_reference, unified_dims)
+        if min_quantized_idx is None:
+            min_quantized_idx = quantized_indices.min(axis=0)
+            max_quantized_idx = quantized_indices.max(axis=0)
+        else:
+            min_quantized_idx = np.minimum(min_quantized_idx, quantized_indices.min(axis=0))
+            max_quantized_idx = np.maximum(max_quantized_idx, quantized_indices.max(axis=0))
+
+        if 'Domain' in chunk.columns:
+            domains = chunk['Domain'].fillna("Undomained").astype(str).str.strip().replace('', "Undomained")
+        else:
+            domains = pd.Series(["Undomained"] * len(chunk))
+
+        if skipped_domains:
+            keep_mask = ~domains.isin(skipped_domains)
+            skipped_count_total += int((~keep_mask).sum())
+            quantized_indices = quantized_indices[keep_mask.to_numpy()]
+            domains = domains[keep_mask].reset_index(drop=True)
+
+        if len(domains) == 0:
+            continue
+
+        resolved_rows += len(domains)
+        grouped = pd.DataFrame(
+            {
+                'ix': quantized_indices[:, 0],
+                'iy': quantized_indices[:, 1],
+                'iz': quantized_indices[:, 2],
+                'Domain': domains.to_numpy(copy=False),
+            }
+        ).groupby(['ix', 'iy', 'iz', 'Domain'], sort=False).size()
+
+        for (ix, iy, iz, domain), count in grouped.items():
+            base_idx = (int(ix), int(iy), int(iz))
+            domain_counts = grouped_domain_counts.setdefault(base_idx, Counter())
+            domain_counts[str(domain)] += int(count)
+
+    if grid_reference is None or min_quantized_idx is None or max_quantized_idx is None:
+        raise ValueError('Could not determine grid bounds from blocks file.')
+
+    all_min_bounds = grid_reference + min_quantized_idx * unified_dims
+    all_max_bounds = grid_reference + max_quantized_idx * unified_dims
+    dims_grid = (max_quantized_idx - min_quantized_idx).astype(int)
+    print('Calculated grid dimensions:', dims_grid)
+
+    if skipped_domains:
+        print(f"Skipping domains: {skipped_domains}")
+        if skipped_count_total > 0:
+            print(f"Skipped {skipped_count_total:,} sub-block rows due to domain overrides.")
+
+    subblock_domain_policy = 'majority'
+    if config:
+        subblock_domain_policy = str(config.get('subblock_domain_policy', 'majority')).strip().lower() or 'majority'
+
+    shifted_domain_counts = {
+        (
+            int(base_idx[0] - min_quantized_idx[0]),
+            int(base_idx[1] - min_quantized_idx[1]),
+            int(base_idx[2] - min_quantized_idx[2]),
+        ): counts
+        for base_idx, counts in grouped_domain_counts.items()
+    }
+
+    domain_mapping, subblock_counts, mixed_domain_blocks = resolve_base_block_domains_from_counts(
+        shifted_domain_counts,
+        policy=subblock_domain_policy,
+    )
+
+    print(
+        f"Resolved {resolved_rows:,} sub-block rows into {len(domain_mapping):,} base blocks "
+        f"using '{subblock_domain_policy}' policy."
+    )
+
+    return {
+        'all_min_bounds': all_min_bounds,
+        'all_max_bounds': all_max_bounds,
+        'unified_dims': unified_dims,
+        'domain_mapping': domain_mapping,
+        'subblock_counts': subblock_counts,
+        'mixed_domain_blocks': mixed_domain_blocks,
+        'rotation_matrix': rotation_matrix,
+        'rotation_center': rotation_center,
+        'is_rotated': is_rotated,
+        'grid_reference': grid_reference,
+        'min_quantized_idx': min_quantized_idx,
+    }
+
 def create_blocks(points, values, block_size=10, verbose=False, range_size=10, max_pheromone=150,
                   ants_per_sample=3, blocks_file=None, background_value=0.0, background_distance=None, average_with_blocks=False,
                   blocks_delimiter=None,
@@ -419,169 +920,227 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                   avoid_visited_threshold=100,
                   blocks_header_line=1,
                   block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
-                  config=None):
+                  config=None,
+                  sample_domains=None):
+    pv = _require_pyvista()
+    # Domain interpolation in String Theory must ignore blocks_file as input.
+    st_target = None
+    if config and config.get('algorithm') in ('string_theory', 'net_connector'):
+        st_target = config.get('string_theory_params', {}).get('interpolate_target', 'value')
+    if isinstance(st_target, str) and st_target.strip().lower() == 'domain':
+        blocks_file = None
+
     if blocks_file and str(blocks_file).strip():
-        print(f"Loading predefined cells from blocks_file: {blocks_file}...")
-        if blocks_header_line and blocks_header_line != 1 and blocks_delimiter:
+        print("Loading predefined cells from blocks_file...")
+        load_pbar = tqdm(total=7, desc="Blocks loading phases", unit="phase")
+        load_pbar.set_postfix_str("reading blocks file")
+        use_streaming_blocks = os.path.getsize(blocks_file) >= LARGE_BLOCK_FILE_THRESHOLD
+        if use_streaming_blocks:
+            if not blocks_delimiter:
+                blocks_delimiter = detect_csv_delimiter(blocks_file)
+            metadata = load_large_blocks_metadata(
+                blocks_file,
+                blocks_delimiter,
+                blocks_header_line or 1,
+                block_size,
+                points,
+                block_x_col=block_x_col,
+                block_y_col=block_y_col,
+                block_z_col=block_z_col,
+                block_domain_col=block_domain_col,
+                config=config,
+            )
+            all_min_bounds = metadata['all_min_bounds']
+            all_max_bounds = metadata['all_max_bounds']
+            unified_dims = metadata['unified_dims']
+            domain_mapping = metadata['domain_mapping']
+            subblock_counts = metadata['subblock_counts']
+            mixed_domain_blocks = metadata['mixed_domain_blocks']
+            rotation_matrix = metadata['rotation_matrix']
+            rotation_center = metadata['rotation_center']
+            is_rotated = metadata['is_rotated']
+            load_pbar.update(4)
+        elif blocks_header_line and blocks_header_line != 1 and blocks_delimiter:
             # Use custom header line parsing
-            df_blocks, parsed_cols = read_csv_with_selected_header(blocks_file, blocks_delimiter, blocks_header_line, expected_min_cols=3)
+            df_blocks, parsed_cols = read_csv_with_selected_header(
+                blocks_file,
+                blocks_delimiter,
+                blocks_header_line,
+                expected_min_cols=3,
+                progress_label="Reading grid file",
+            )
             print(f"Blocks file (custom header line {blocks_header_line}) parsed columns: {parsed_cols}")
         else:
-            df_blocks = read_autodetect_csv(blocks_file, forced_delimiter=blocks_delimiter)
+            df_blocks = read_autodetect_csv(
+                blocks_file,
+                forced_delimiter=blocks_delimiter,
+                progress_label="Reading grid file",
+            )
             print(f"Blocks file delimiter used: '{df_blocks._detected_delimiter}'")
-        # If only one column but delimiter appears inside, attempt alternate reparse
-        if df_blocks.shape[1] == 1:
-            sole_col = df_blocks.columns[0]
-            sample_val = str(df_blocks.iloc[0,0]) if len(df_blocks) else ''
-            if (';' in sample_val and df_blocks._detected_delimiter != ';') or (',' in sample_val and df_blocks._detected_delimiter != ','):
-                alt = ';' if df_blocks._detected_delimiter == ',' else ','
-                try:
-                    df_blocks = read_autodetect_csv(blocks_file, forced_delimiter=alt)
-                    print(f"Reparsed blocks file with alternate delimiter '{alt}' -> columns: {list(df_blocks.columns)}")
-                except Exception as e:
-                    print(f"Alternate delimiter parse failed: {e}")
-        # Robust header normalization for blocks
-        # Apply explicit user mapping if provided
-        if block_x_col and block_y_col and block_z_col:
-            rename_map = {}
-            for src, tgt in [(block_x_col, 'x'), (block_y_col, 'y'), (block_z_col, 'z')]:
-                if src not in df_blocks.columns:
-                    raise ValueError(f"Selected blocks column '{src}' not found in file.")
-                rename_map[src] = tgt
-            if block_domain_col:
-                if block_domain_col in [block_x_col, block_y_col, block_z_col]:
-                    # Domain column could coincide; keep as Domain copy
-                    if block_domain_col in df_blocks.columns:
-                        df_blocks['Domain'] = df_blocks[block_domain_col]
-                else:
-                    if block_domain_col not in df_blocks.columns:
-                        raise ValueError(f"Selected domain column '{block_domain_col}' not found in blocks file.")
-                    rename_map[block_domain_col] = 'Domain'
-            df_blocks = df_blocks.rename(columns=rename_map)
-            print(f"Applied user block column mapping: {rename_map}")
-        else:
-            # Legacy auto-mapping fallback
-            needed = ['x','y','z']
-            if not all(n in df_blocks.columns for n in needed):
-                cols = [c for c in df_blocks.columns if str(c).strip() != '']
-                if len(cols) >= 3:
-                    mapping = {}
-                    for new, old in zip(['x','y','z'], cols[:3]):
-                        mapping[old] = new
-                    if len(cols) >= 4:
-                        mapping[cols[3]] = 'Domain'
-                    df_blocks = df_blocks.rename(columns=mapping)
-                    print(f"Blocks header auto-mapped: {mapping}")
-            # Generic positional mapping (first 4 columns -> x,y,z,Domain) if not already set
-            cols = df_blocks.columns.tolist()
-            if len(cols) >= 4:
-                positional_targets = ['x', 'y', 'z', 'Domain']
-                if any(cols[i] != positional_targets[i] for i in range(4)):
-                    pos_map = {cols[i]: positional_targets[i] for i in range(4)}
-                    df_blocks = df_blocks.rename(columns=pos_map)
-                    print(f"Applied generic positional mapping to first four columns: {pos_map}")
-
-        print(f"Blocks final headers: {list(df_blocks.columns)}")
-        # Ensure coordinate columns are numeric
-        coord_before = len(df_blocks)
-        for c in ['x','y','z']:
-            if c in df_blocks.columns:
-                df_blocks[c] = pd.to_numeric(df_blocks[c], errors='coerce')
-        # Drop rows with non-numeric coordinates
-        df_blocks = df_blocks.dropna(subset=['x','y','z'])
-        dropped = coord_before - len(df_blocks)
-        if dropped > 0:
-            print(f"Dropped {dropped} block rows with non-numeric coordinates.")
-        if len(df_blocks) == 0:
-            raise ValueError("All block rows have non-numeric coordinates after conversion.")
-        missing_coords = [c for c in ['x','y','z'] if c not in df_blocks.columns]
-        if missing_coords:
-            raise ValueError(f"Blocks file missing required coordinate columns after mapping: {missing_coords}. Parsed headers: {list(df_blocks.columns)}")
-        # Use ALL rows from df_blocks for boundaries
-        centroids_all = df_blocks[['x','y','z']].values
-        
-        # Detect and apply rotation if needed
-        rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(centroids_all, block_size_hint=block_size)
-        
-        # Calculate azimuth of the Grid Y-axis (Row 1)
-        # theta is angle of Grid Y-axis relative to World X-axis (East)
-        theta_rad = np.arctan2(rotation_matrix[1, 1], rotation_matrix[1, 0])
-        theta_deg = np.degrees(theta_rad)
-        # Azimuth is clockwise from North (World Y)
-        # Math angle is CCW from East (World X)
-        # Azimuth = 90 - theta
-        azimuth = (90 - theta_deg) % 360
-        
-        if is_rotated:
-            print(f"Detected rotated block model (Azimuth: {azimuth:.2f}°). Applying rotation correction to align with axes.")
-            print(f"Rotation center: {rotation_center}")
-            print(f"Rotation matrix:\n{rotation_matrix}")
-            
-            # Rotate blocks
-            # P_aligned = (P - Center) @ R.T
-            # We use R.T because rotation_matrix rows are the new axes
-            centroids_all = (centroids_all - rotation_center) @ rotation_matrix.T
-            df_blocks['x'] = centroids_all[:, 0]
-            df_blocks['y'] = centroids_all[:, 1]
-            df_blocks['z'] = centroids_all[:, 2]
-            
-            # Rotate samples
-            # Use in-place update so the caller sees the rotated points (for visualization consistency)
-            points[:] = (points - rotation_center) @ rotation_matrix.T
-            print("Applied rotation to sample points.")
-            
-        else:
-            print(f"No significant rotation detected (Azimuth: {azimuth:.2f}°).")
-            
-        all_min_bounds = np.min(centroids_all, axis=0)
-        all_max_bounds = np.max(centroids_all, axis=0)
-        
-        # Determine unified block dimensions
-        # Prefer user-provided block_size if available, as auto-detection on rotated/float coordinates is unreliable
-        if block_size is not None:
-            if isinstance(block_size, (list, tuple, np.ndarray)):
-                unified_dims = np.array(block_size, dtype=float)
+        if not use_streaming_blocks:
+            # If only one column but delimiter appears inside, attempt alternate reparse
+            if df_blocks.shape[1] == 1:
+                sole_col = df_blocks.columns[0]
+                sample_val = str(df_blocks.iloc[0, 0]) if len(df_blocks) else ''
+                if (';' in sample_val and df_blocks._detected_delimiter != ';') or (',' in sample_val and df_blocks._detected_delimiter != ','):
+                    alt = ';' if df_blocks._detected_delimiter == ',' else ','
+                    try:
+                        df_blocks = read_autodetect_csv(
+                            blocks_file,
+                            forced_delimiter=alt,
+                            progress_label="Reading grid file",
+                        )
+                        print(f"Reparsed blocks file with alternate delimiter '{alt}' -> columns: {list(df_blocks.columns)}")
+                        print(f"Predefined cells read from blocks_file: {len(df_blocks):,}")
+                    except Exception as e:
+                        print(f"Alternate delimiter parse failed: {e}")
+            load_pbar.update(1)
+            load_pbar.set_postfix_str("normalizing headers")
+            # Robust header normalization for blocks
+            # Apply explicit user mapping if provided
+            if block_x_col and block_y_col and block_z_col:
+                rename_map = {}
+                for src, tgt in [(block_x_col, 'x'), (block_y_col, 'y'), (block_z_col, 'z')]:
+                    if src not in df_blocks.columns:
+                        raise ValueError(f"Selected blocks column '{src}' not found in file.")
+                    rename_map[src] = tgt
+                if block_domain_col:
+                    if block_domain_col in [block_x_col, block_y_col, block_z_col]:
+                        if block_domain_col in df_blocks.columns:
+                            df_blocks['Domain'] = df_blocks[block_domain_col]
+                    else:
+                        if block_domain_col not in df_blocks.columns:
+                            raise ValueError(f"Selected domain column '{block_domain_col}' not found in blocks file.")
+                        rename_map[block_domain_col] = 'Domain'
+                df_blocks = df_blocks.rename(columns=rename_map)
+                print(f"Applied user block column mapping: {rename_map}")
             else:
-                unified_dims = np.array([block_size, block_size, block_size], dtype=float)
-            print(f"Using configured block size: {unified_dims}")
-        else:
-            # Fallback to auto-detection (legacy behavior)
-            dims_all = []
-            for col in ['x','y','z']:
-                uniq = np.sort(df_blocks[col].unique())
-                diffs = np.diff(uniq)
-                positive_diffs = diffs[diffs > 0]
-                dim = positive_diffs.min() if len(positive_diffs) > 0 else 10
-                dims_all.append(dim)
-            unified_dims = np.array(dims_all)
-            print(f"Auto-detected block dimensions: {unified_dims}")
+                needed = ['x', 'y', 'z']
+                if not all(n in df_blocks.columns for n in needed):
+                    cols = [c for c in df_blocks.columns if str(c).strip() != '']
+                    if len(cols) >= 3:
+                        mapping = {}
+                        for new, old in zip(['x', 'y', 'z'], cols[:3]):
+                            mapping[old] = new
+                        if len(cols) >= 4:
+                            mapping[cols[3]] = 'Domain'
+                        df_blocks = df_blocks.rename(columns=mapping)
+                        print(f"Blocks header auto-mapped: {mapping}")
+                cols = df_blocks.columns.tolist()
+                if len(cols) >= 4:
+                    positional_targets = ['x', 'y', 'z', 'Domain']
+                    if any(cols[i] != positional_targets[i] for i in range(4)):
+                        pos_map = {cols[i]: positional_targets[i] for i in range(4)}
+                        df_blocks = df_blocks.rename(columns=pos_map)
+                        print(f"Applied generic positional mapping to first four columns: {pos_map}")
 
-        dims_grid = np.ceil((all_max_bounds - all_min_bounds) / unified_dims).astype(int)
-        print("Calculated grid dimensions:", dims_grid)
-        # Build mapping from grid index to Domain using ALL rows from df_blocks (VECTORIZED)
-        print("Building domain mapping...")
-        centroids = df_blocks[['x', 'y', 'z']].values
-        grid_indices = np.floor((centroids - all_min_bounds) / unified_dims + 1e-6).astype(int)
+            print(f"Blocks final headers: {list(df_blocks.columns)}")
+            coord_before = len(df_blocks)
+            for c in ['x', 'y', 'z']:
+                if c in df_blocks.columns:
+                    df_blocks[c] = pd.to_numeric(df_blocks[c], errors='coerce')
+            df_blocks = df_blocks.dropna(subset=['x', 'y', 'z'])
+            dropped = coord_before - len(df_blocks)
+            if dropped > 0:
+                print(f"Dropped {dropped} block rows with non-numeric coordinates.")
+            if len(df_blocks) == 0:
+                raise ValueError("All block rows have non-numeric coordinates after conversion.")
+            missing_coords = [c for c in ['x', 'y', 'z'] if c not in df_blocks.columns]
+            if missing_coords:
+                raise ValueError(f"Blocks file missing required coordinate columns after mapping: {missing_coords}. Parsed headers: {list(df_blocks.columns)}")
+            load_pbar.update(1)
+            load_pbar.set_postfix_str("detecting rotation")
+            centroids_all = df_blocks[['x', 'y', 'z']].values
+
+            rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(centroids_all, block_size_hint=block_size)
+
+            theta_rad = np.arctan2(rotation_matrix[1, 1], rotation_matrix[1, 0])
+            theta_deg = np.degrees(theta_rad)
+            azimuth = (90 - theta_deg) % 360
+
+            if is_rotated:
+                print(f"Detected rotated block model (Azimuth: {azimuth:.2f}°). Applying rotation correction to align with axes.")
+                print(f"Rotation center: {rotation_center}")
+                print(f"Rotation matrix:\n{rotation_matrix}")
+                centroids_all = (centroids_all - rotation_center) @ rotation_matrix.T
+                df_blocks['x'] = centroids_all[:, 0]
+                df_blocks['y'] = centroids_all[:, 1]
+                df_blocks['z'] = centroids_all[:, 2]
+                points[:] = (points - rotation_center) @ rotation_matrix.T
+                print("Applied rotation to sample points.")
+            else:
+                print(f"No significant rotation detected (Azimuth: {azimuth:.2f}°).")
+
+            all_min_bounds = np.min(centroids_all, axis=0)
+            all_max_bounds = np.max(centroids_all, axis=0)
+            load_pbar.update(1)
+            load_pbar.set_postfix_str("mapping domains")
+
+            if block_size is not None:
+                if isinstance(block_size, (list, tuple, np.ndarray)):
+                    unified_dims = np.array(block_size, dtype=float)
+                else:
+                    unified_dims = np.array([block_size, block_size, block_size], dtype=float)
+                print(f"Using configured block size: {unified_dims}")
+            else:
+                dims_all = []
+                for col in ['x', 'y', 'z']:
+                    uniq = np.sort(df_blocks[col].unique())
+                    diffs = np.diff(uniq)
+                    positive_diffs = diffs[diffs > 0]
+                    dim = positive_diffs.min() if len(positive_diffs) > 0 else 10
+                    dims_all.append(dim)
+                unified_dims = np.array(dims_all)
+                print(f"Auto-detected block dimensions: {unified_dims}")
+
+            dims_grid = np.ceil((all_max_bounds - all_min_bounds) / unified_dims).astype(int)
+            print("Calculated grid dimensions:", dims_grid)
+            print("Building domain mapping...")
+            centroids = df_blocks[['x', 'y', 'z']].values
+            grid_indices = np.floor((centroids - all_min_bounds) / unified_dims + 1e-6).astype(int)
+
+            if 'Domain' in df_blocks.columns:
+                domains = df_blocks['Domain'].fillna("Undomained").astype(str).str.strip()
+                domains = domains.replace("", "Undomained")
+            else:
+                domains = pd.Series(["Undomained"] * len(df_blocks))
+
+            if config and 'domain_algorithm_overrides' in config:
+                skipped_domains = {domain for domain, cfg in config['domain_algorithm_overrides'].items()
+                                 if cfg.get('skip', False)}
+                if skipped_domains:
+                    print(f"Skipping domains: {skipped_domains}")
+                    keep_mask = ~domains.isin(skipped_domains)
+                    skipped_count = int((~keep_mask).sum())
+                    grid_indices = grid_indices[keep_mask.to_numpy()]
+                    domains = domains[keep_mask].reset_index(drop=True)
+                    if skipped_count > 0:
+                        print(f"Skipped {skipped_count:,} sub-block rows due to domain overrides.")
+
+            subblock_domain_policy = 'majority'
+            if config:
+                subblock_domain_policy = str(config.get('subblock_domain_policy', 'majority')).strip().lower() or 'majority'
+
+            domain_mapping, subblock_counts, mixed_domain_blocks = resolve_base_block_domains(
+                grid_indices,
+                domains,
+                policy=subblock_domain_policy,
+            )
+
+            print(
+                f"Resolved {len(domains):,} sub-block rows into {len(domain_mapping):,} base blocks "
+                f"using '{subblock_domain_policy}' policy."
+            )
         
-        # Handle domain column with default "Undomained"
-        if 'Domain' in df_blocks.columns:
-            domains = df_blocks['Domain'].fillna("Undomained").astype(str).str.strip()
-            domains = domains.replace("", "Undomained")
-        else:
-            domains = pd.Series(["Undomained"] * len(df_blocks))
-        
-        # Create mapping dictionary
-        domain_mapping = {tuple(idx): domain for idx, domain in zip(grid_indices, domains)}
-        
-        # Filter out skipped domains if config is provided
-        if config and 'domain_algorithm_overrides' in config:
-            skipped_domains = {domain for domain, cfg in config['domain_algorithm_overrides'].items() 
-                             if cfg.get('skip', False)}
-            if skipped_domains:
-                print(f"Skipping domains: {skipped_domains}")
-                domain_mapping = {idx: domain for idx, domain in domain_mapping.items() 
-                                if domain not in skipped_domains}
-        
+        if mixed_domain_blocks:
+            print(f"Warning: {len(mixed_domain_blocks):,} base blocks contain mixed sub-block domains.")
+            preview = list(mixed_domain_blocks.items())[:5]
+            for idx, counts in preview:
+                chosen = domain_mapping.get(idx)
+                print(f"  Base block {idx}: {counts} -> selected '{chosen}'")
+            if len(mixed_domain_blocks) > len(preview):
+                print(f"  ... and {len(mixed_domain_blocks) - len(preview):,} more mixed base blocks")
+
         allowed_grid = set(domain_mapping.keys())
         
         # Count blocks per domain for debugging
@@ -593,7 +1152,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         for domain, count in sorted(domain_block_counts.items()):
             print(f"  {domain}: {count} blocks")
         print(f"  Total allowed blocks: {len(allowed_grid)}")
-        
+        load_pbar.update(1)
+        load_pbar.set_postfix_str("assigning points")
+
         # Group sample points using the same all_min_bounds (VECTORIZED)
         print("Assigning points to blocks...")
         # Compute all block indices at once
@@ -625,7 +1186,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         for domain, count in sorted(sample_domain_counts.items()):
             print(f"  {domain}: {count} sample blocks")
         print(f"  Total sample blocks: {len(sample_blocks_dict)}")
-        
+        load_pbar.update(1)
+        load_pbar.set_postfix_str("creating blocks")
+
         block_data = []
         for idx in tqdm(sample_blocks_dict.keys(), desc="Creating blocks"):
             corner = all_min_bounds + np.array(idx) * unified_dims
@@ -649,12 +1212,16 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'allowed_grid': list(allowed_grid),
             'rotation_matrix': rotation_matrix if is_rotated else None,
             'rotation_center': rotation_center if is_rotated else None,
-            'domain_mapping': domain_mapping
+            'domain_mapping': domain_mapping,
+            'subblock_counts': subblock_counts,
+            'mixed_domain_blocks': mixed_domain_blocks
         }
         multiblock = pv.MultiBlock(block_data)
         # Store metadata on multiblock with private-style names to avoid PyVista attribute restrictions
         multiblock._block_info = block_info
         multiblock._sample_blocks = {idx: np.mean(vals) for idx, vals in block_values.items()}
+        load_pbar.update(1)
+        load_pbar.set_postfix_str("initializing interpolator")
         
         # Check if we should process domains sequentially with different algorithms
         process_sequentially = config and config.get('process_domains_sequentially', False)
@@ -882,14 +1449,20 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 
                 multiblock._ant_colony = interpolator
         
+        load_pbar.update(1)
+        load_pbar.close()
         return multiblock
     else:
         print("Assigning points to blocks...")
         min_bounds = np.min(points, axis=0)
         max_bounds = np.max(points, axis=0)
-        dims = np.ceil((max_bounds - min_bounds) / np.array(block_size)).astype(int)
+        # Ensure at least 1 cell per axis (e.g. all samples at a constant Z)
+        # and include the upper boundary so points exactly on max edge still fit.
+        dims = np.ceil((max_bounds - min_bounds) / np.array(block_size)).astype(int) + 1
+        dims = np.maximum(dims, 1)
         blocks = {}
         block_values = {}
+        block_domains = {}
         block_info = {
             'min_bounds': min_bounds,
             'dims': dims,
@@ -898,6 +1471,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         # Vectorized block assignment
         points_array = np.array(points)
         values_array = np.array(values)
+        domains_array = None
+        if sample_domains is not None:
+            domains_array = np.array(sample_domains)
         block_indices = ((points_array - min_bounds) // np.array(block_size)).astype(int)
         
         for i in tqdm(range(len(points_array)), desc="Assigning points to blocks"):
@@ -905,10 +1481,75 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             if block_idx not in blocks:
                 blocks[block_idx] = []
                 block_values[block_idx] = []
+                if domains_array is not None:
+                    block_domains[block_idx] = []
             blocks[block_idx].append(points_array[i])
             block_values[block_idx].append(values_array[i])
+            if domains_array is not None:
+                block_domains[block_idx].append(domains_array[i])
         block_data = []
         next_block_id = 1
+
+        # Detect domain interpolation mode (String Theory)
+        is_st_domain_interpolation = bool(
+            config
+            and config.get('algorithm') in ('string_theory', 'net_connector')
+            and str(config.get('string_theory_params', {}).get('interpolate_target', 'value')).strip().lower() == 'domain'
+        )
+
+
+        # Detect domain interpolation mode (Ant Colony)
+        is_ant_domain_interpolation = bool(
+            config
+            and config.get('algorithm') == 'ant_colony'
+            and str(config.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
+        )
+
+        sample_block_domain_mapping = {}
+        if is_st_domain_interpolation or is_ant_domain_interpolation:
+            if domains_array is None:
+                raise ValueError("Domain interpolation requires a 'Domain' column in the samples file.")
+
+            bs = np.array(block_size, dtype=float)
+            for idx, pts in blocks.items():
+                doms_raw = block_domains.get(idx, [])
+                # Clean domains: treat blanks as missing.
+                doms = []
+                aligned_pts = []
+                for p, d in zip(pts, doms_raw):
+                    ds = str(d).strip() if d is not None else ''
+                    if ds == '' or ds.lower() == 'nan':
+                        continue
+                    doms.append(ds)
+                    aligned_pts.append(p)
+
+                if not doms:
+                    continue
+
+                # Majority vote
+                counts = {}
+                for ds in doms:
+                    counts[ds] = counts.get(ds, 0) + 1
+                max_count = max(counts.values())
+                tied = [ds for ds, c in counts.items() if c == max_count]
+
+                if len(tied) == 1:
+                    winner = tied[0]
+                else:
+                    # Tie-breaker: lower average distance to block centroid
+                    corner = min_bounds + np.array(idx, dtype=float) * bs
+                    centroid = corner + bs / 2.0
+                    best = None
+                    for ds in tied:
+                        dists = [float(np.linalg.norm(np.array(p) - centroid)) for p, d in zip(aligned_pts, doms) if d == ds]
+                        avg = float(np.mean(dists)) if dists else float('inf')
+                        cand = (avg, ds)
+                        if best is None or cand < best:
+                            best = cand
+                    winner = best[1] if best is not None else sorted(tied)[0]
+
+                sample_block_domain_mapping[idx] = winner
+
         for idx in tqdm(blocks.keys(), desc="Creating blocks"):
             corner = min_bounds + np.array(idx) * np.array(block_size)
             cell = pv.Box(bounds=(
@@ -921,11 +1562,18 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             cell.cell_data['Is_Sample'] = np.full(cell.n_cells, True)
             cell.cell_data['Block_ID'] = np.full(cell.n_cells, next_block_id)
             next_block_id += 1
+            if is_st_domain_interpolation or is_ant_domain_interpolation:
+                dom = sample_block_domain_mapping.get(idx, "")
+                cell.cell_data['Domain'] = np.full(cell.n_cells, dom)
             block_data.append(cell)
         sample_blocks = {idx: np.mean(vals) for idx, vals in block_values.items()}
         multiblock = pv.MultiBlock(block_data)
         multiblock._block_info = block_info
         multiblock._sample_blocks = sample_blocks
+
+        if is_st_domain_interpolation or is_ant_domain_interpolation:
+            # Preserve sample block domains for export.
+            multiblock._block_info['domain_mapping'] = dict(sample_block_domain_mapping)
         
         # Create interpolator using factory (with config if available, otherwise build from params)
         if config is None:
@@ -942,6 +1590,48 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 'avoid_visited_threshold': avoid_visited_threshold
             }
         
+        # Domain interpolation (String Theory) is a special case: the domain is the output, so we don't
+        # generate a fake full-grid domain mapping.
+        if is_st_domain_interpolation:
+            algo2 = config.get('second_pass_algorithm', 'skip')
+            if algo2 != 'skip':
+                print("Warning: second pass is not supported for String Theory domain interpolation; ignoring second pass.")
+
+            interpolator = create_interpolator(config)
+            # Provide sample-block domains to the interpolator
+            interpolator.domain_mapping = dict(sample_block_domain_mapping)
+            interpolator.initialize_blocks(
+                sample_blocks,
+                tuple(block_info['dims']),
+                min_bounds,
+                block_size,
+                use_domain_mapping=False,
+                sample_domain_mapping=sample_block_domain_mapping,
+            )
+            multiblock._ant_colony = interpolator
+            return multiblock
+
+
+        # Ant Colony domain interpolation: initialize ants with sample_block domains and allow domains to expand.
+        if is_ant_domain_interpolation:
+            algo2 = config.get('second_pass_algorithm', 'skip')
+            if algo2 != 'skip':
+                print("Warning: second pass is not supported for Ant Colony domain interpolation; ignoring second pass.")
+
+            interpolator = create_interpolator(config)
+            interpolator.initialize_blocks(
+                sample_blocks,
+                tuple(block_info['dims']),
+                min_bounds,
+                block_size,
+                use_domain_mapping=False,
+                sample_domain_mapping=sample_block_domain_mapping,
+            )
+            if hasattr(interpolator, 'create_ants'):
+                interpolator.create_ants()
+            multiblock._ant_colony = interpolator
+            return multiblock
+
         # Generate full grid domain mapping for "Undomained" mode
         # This ensures that algorithms like String Theory (which rely on domain mapping)
         # treat the entire bounding box as a valid domain.
@@ -1025,208 +1715,315 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         return multiblock
 
 def toggle_blocks(plotter):
+    if not hasattr(plotter, '_blocks_actor') or plotter._blocks_actor is None:
+        if hasattr(plotter, '_blocks_data'):
+            print(f"Preparing blocks display: blocks={len(plotter._blocks_data)}")
+        _ensure_blocks_actor(plotter, visible=True)
+        if hasattr(plotter, '_block_lookup') and plotter._block_lookup is not None:
+            print(f"Blocks lookup size: {len(plotter._block_lookup)}")
+        if hasattr(plotter, '_visible_blocks') and plotter._visible_blocks is not None:
+            print(f"Visible blocks: {len(plotter._visible_blocks)}")
+        plotter.render()
+        return
     if hasattr(plotter, '_blocks_actor'):
         is_visible = not plotter._blocks_actor.GetVisibility()
         plotter._blocks_actor.SetVisibility(is_visible)
         plotter.render()
 
+def _get_block_raw_value(block):
+    if 'Raw_Value' in block.cell_data:
+        return float(block.cell_data['Raw_Value'][0])
+    return float(block.cell_data['Value'][0])
+
+def _classify_block_value(plotter, raw_value):
+    if getattr(plotter, '_value_is_indexed', False) and hasattr(plotter, '_lfc_bins') and isinstance(plotter._colormap, ListedColormap):
+        bins_np = np.array(plotter._lfc_bins)
+        n_colors = len(plotter._colormap.colors)
+        threshold_style = (n_colors == len(bins_np) + 1)
+        if threshold_style:
+            idx_val = np.searchsorted(bins_np, [raw_value], side='right')[0]
+        else:
+            idx_val = np.digitize([raw_value], bins_np, right=False)[0] - 1
+        return max(0, min(idx_val, n_colors - 1))
+    return float(raw_value)
+
+def _set_block_display_value(plotter, block, raw_value):
+    raw_value = float(raw_value)
+    display_value = _classify_block_value(plotter, raw_value)
+    if 'Raw_Value' in block.cell_data:
+        block.cell_data['Raw_Value'][:] = raw_value
+    elif getattr(plotter, '_value_is_indexed', False):
+        block.cell_data['Raw_Value'] = np.full(block.n_cells, raw_value)
+    if 'Value' in block.cell_data:
+        block.cell_data['Value'][:] = display_value
+    else:
+        block.cell_data['Value'] = np.full(block.n_cells, display_value)
+    block.Modified()
+
+def _get_block_grid_position(block, min_bounds, block_size):
+    corner = np.array(block.bounds[::2], dtype=float)
+    return tuple(np.floor((corner - np.array(min_bounds)) / np.array(block_size) + 1e-6).astype(int))
+
+def _build_block_lookup(blocks, min_bounds, block_size):
+    lookup = {}
+    for block in blocks:
+        pos = _get_block_grid_position(block, min_bounds, block_size)
+        lookup[pos] = block
+    return lookup
+
+def _should_display_block(plotter, pos, block):
+    if pos in plotter._blocks_data._sample_blocks:
+        return True
+    return _get_block_raw_value(block) >= plotter._value_filter
+
+def _create_visible_blocks(plotter):
+    pv = _require_pyvista()
+    visible_blocks = pv.MultiBlock()
+    visible_positions = set()
+    for pos, block in plotter._block_lookup.items():
+        if _should_display_block(plotter, pos, block):
+            visible_blocks.append(block)
+            visible_positions.add(pos)
+    if len(visible_blocks) == 0 and len(plotter._block_lookup) > 0:
+        for block in plotter._block_lookup.values():
+            visible_blocks.append(block)
+        visible_positions = set(plotter._block_lookup.keys())
+    return visible_blocks, visible_positions
+
+def _get_blocks_mesh_kwargs(plotter):
+    if getattr(plotter, '_value_is_indexed', False):
+        annotations = {i: plotter._lfc_tick_labels[i] for i in range(len(plotter._lfc_tick_labels))}
+        return dict(
+            style='surface',
+            scalars='Value',
+            opacity=0.5,
+            show_edges=True,
+            cmap=plotter._colormap,
+            categories=True,
+            annotations=annotations,
+            clim=[-0.5, len(plotter._colormap.colors) - 0.5],
+            show_scalar_bar=False,
+        )
+    return dict(
+        style='surface',
+        scalars='Value',
+        opacity=0.5,
+        show_edges=True,
+        cmap=plotter._colormap,
+        clim=list(getattr(plotter, '_scalar_range', (0.0, 1.0))),
+        show_scalar_bar=False,
+    )
+
+def _prepare_blocks_for_display(plotter):
+    if getattr(plotter, '_blocks_display_prepared', False):
+        return
+    if getattr(plotter, '_value_is_indexed', False) and hasattr(plotter, '_lfc_bins') and isinstance(plotter._colormap, ListedColormap):
+        bins_np = np.array(plotter._lfc_bins)
+        n_colors = len(plotter._colormap.colors)
+        threshold_style = (n_colors == len(bins_np) + 1)
+        for block in plotter._blocks_data:
+            if 'Raw_Value' in block.cell_data:
+                raw_val = block.cell_data['Raw_Value'][0]
+            else:
+                raw_val = block.cell_data['Value'][0]
+                block.cell_data['Raw_Value'] = np.full(block.n_cells, raw_val)
+            if threshold_style:
+                idx_val = np.searchsorted(bins_np, [raw_val], side='right')[0]
+            else:
+                idx_val = np.digitize([raw_val], bins_np, right=False)[0] - 1
+            idx_val = max(0, min(idx_val, n_colors - 1))
+            block.cell_data['Value'][:] = idx_val
+    plotter._blocks_display_prepared = True
+
+def _ensure_blocks_actor(plotter, visible=True):
+    if not hasattr(plotter, '_block_lookup') or plotter._block_lookup is None:
+        plotter._block_lookup = _build_block_lookup(
+            plotter._blocks_data,
+            plotter._blocks_data._block_info['min_bounds'],
+            plotter._blocks_data._block_info['block_size'],
+        )
+    if not hasattr(plotter, '_visible_blocks') or plotter._visible_blocks is None or not hasattr(plotter, '_visible_positions') or plotter._visible_positions is None:
+        plotter._visible_blocks, plotter._visible_positions = _create_visible_blocks(plotter)
+    _prepare_blocks_for_display(plotter)
+    if not hasattr(plotter, '_blocks_actor') or plotter._blocks_actor is None:
+        plotter._blocks_actor = plotter.add_mesh(plotter._visible_blocks, **_get_blocks_mesh_kwargs(plotter))
+    plotter._blocks_actor.SetVisibility(visible)
+
+def _rebuild_blocks_actor(plotter):
+    _prepare_blocks_for_display(plotter)
+    visible = True
+    if hasattr(plotter, '_blocks_actor') and plotter._blocks_actor is not None:
+        visible = bool(plotter._blocks_actor.GetVisibility())
+        plotter.remove_actor(plotter._blocks_actor)
+    plotter._visible_blocks, plotter._visible_positions = _create_visible_blocks(plotter)
+    plotter._blocks_actor = plotter.add_mesh(plotter._visible_blocks, **_get_blocks_mesh_kwargs(plotter))
+    plotter._blocks_actor.SetVisibility(visible)
+
+def _mark_block_datasets_modified(plotter):
+    if hasattr(plotter, '_blocks_data'):
+        plotter._blocks_data.Modified()
+    if hasattr(plotter, '_visible_blocks'):
+        plotter._visible_blocks.Modified()
+    if hasattr(plotter, '_blocks_actor') and hasattr(plotter._blocks_actor, 'mapper'):
+        plotter._blocks_actor.mapper.Modified()
+
 def update_interpolation(plotter):
+    pv = _require_pyvista()
     print("Checking ant colony data...")
     if not hasattr(plotter, '_blocks_data'):
         print("No blocks data found")
         return
-        
+
     blocks = plotter._blocks_data
     if not hasattr(blocks, '_ant_colony'):
         print("No ant colony found in blocks")
         return
-        
+
     print("Found ant colony, updating interpolation...")
     interpolator = blocks._ant_colony
     dims = tuple(blocks._block_info['dims'])
     min_bounds = blocks._block_info['min_bounds']
     block_size = blocks._block_info['block_size']
-    
-    # Helper for classification of continuous to discrete indices
-    def classify(val_array, bins, n_colors):
-        bins_np = np.array(bins)
-        threshold_style = (n_colors == len(bins_np) + 1)
-        if threshold_style:
-            idx = np.searchsorted(bins_np, val_array, side='right')
-        else:
-            if len(bins_np) == n_colors + 1:
-                idx = np.digitize(val_array, bins_np, right=False) - 1
-            else:
-                idx = np.digitize(val_array, bins_np, right=False) - 1
-        return np.clip(idx, 0, n_colors-1)
 
-    # Move ants and track if changes were made
+    if not hasattr(plotter, '_block_lookup') or plotter._block_lookup is None:
+        plotter._block_lookup = _build_block_lookup(blocks, min_bounds, block_size)
+    if not hasattr(plotter, '_visible_blocks') or plotter._visible_blocks is None or not hasattr(plotter, '_visible_positions') or plotter._visible_positions is None:
+        plotter._visible_blocks, plotter._visible_positions = _create_visible_blocks(plotter)
+
     print("Moving ants...")
     changes_made = False
-    
-    # Handle multiple interpolators (Scenario 3) or single (Scenario 1 & 2)
+
     interpolators = []
     if hasattr(blocks, '_interpolators') and blocks._interpolators:
-        # blocks._interpolators is now domain -> list of interpolators
-        # In interactive mode, we currently only run the FIRST pass for each domain
-        # to avoid complexity with data transfer between passes.
-        for domain_list in blocks._interpolators.values():
-            if domain_list:
-                interpolators.append(domain_list[0])
+        for entry in blocks._interpolators.values():
+            if isinstance(entry, list):
+                if entry:
+                    interpolators.append(entry[0])
+            else:
+                interpolators.append(entry)
     else:
         interpolators = [interpolator]
-        
+
     for interp in interpolators:
+        try:
+            previous_blocks = len(interp.get_interpolated_values())
+        except Exception:
+            previous_blocks = len(getattr(interp, 'blocks', {}) or {})
         if interp.run_iteration(dims):
             changes_made = True
-        
-        # Optional domain-wise fill of unvisited blocks (ant colony specific)
+        else:
+            try:
+                current_blocks = len(interp.get_interpolated_values())
+            except Exception:
+                current_blocks = len(getattr(interp, 'blocks', {}) or {})
+            if current_blocks > previous_blocks:
+                changes_made = True
+
         if getattr(plotter, '_fill_unvisited_domainwise', False):
             try:
                 if hasattr(interp, 'fill_unvisited_blocks_domainwise'):
                     created, assigned = interp.fill_unvisited_blocks_domainwise(dims)
-                    if (created or assigned):
+                    if created or assigned:
                         changes_made = True
             except Exception as e:
                 print(f"Domain-wise fill error: {e}")
-    
+
     if changes_made:
         colony_blocks = {}
-        # Map positions to their source interpolator to use correct next_block_id
         pos_to_interpolator = {}
-        
+
         for interp in interpolators:
             vals = interp.get_interpolated_values()
             colony_blocks.update(vals)
             for pos in vals:
                 pos_to_interpolator[pos] = interp
-        
-        # Track blocks by both position and ID
-        block_mapping = {}
-        id_mapping = {}
-        
-        # First pass: map existing blocks and track IDs - no value filtering here
-        for i, block in enumerate(blocks):
-            corner = block.bounds[::2]
-            pos = tuple(np.floor((corner - min_bounds) / np.array(block_size)).astype(int))
-            if 'Block_ID' in block.cell_data:
-                block_id = block.cell_data['Block_ID'][0]
-            else:
-                block_id = -1
-            
-            if pos in blocks._sample_blocks:
-                block_mapping[pos] = (i, block)
-                id_mapping[block_id] = pos
-            else:
-                # Keep track of all non-sample blocks regardless of value
-                block_mapping[pos] = (i, block)
-        
-        # Process blocks
-        new_blocks = []
-        modified = False
-        
-        # Update blocks - create all blocks, filter only for display
+
+        actor_rebuild_needed = False
+        actor_dataset_changed = False
+        new_block_count = 0
+        new_visible_added = False
+        scalar_min, scalar_max = getattr(plotter, '_scalar_range', (0.0, 0.0))
+
         for pos, value in colony_blocks.items():
             try:
                 if pos in blocks._sample_blocks:
                     continue
-                
-                if pos not in block_mapping:
-                    # Create new interpolated block regardless of value
+
+                if pos not in plotter._block_lookup:
                     corner = min_bounds + np.array(pos) * np.array(block_size)
                     half_size = np.array(block_size) / 2
                     center = corner + half_size
-                    
+
                     new_block = pv.Box(bounds=(
                         center[0] - half_size[0]/2, center[0] + half_size[0]/2,
                         center[1] - half_size[1]/2, center[1] + half_size[1]/2,
                         center[2] - half_size[2]/2, center[2] + half_size[2]/2
                     ))
-                    if getattr(plotter, '_value_is_indexed', False) and hasattr(plotter, '_lfc_bins'):
-                        raw_val = value
-                        if isinstance(plotter._colormap, ListedColormap):
-                            n_colors = len(plotter._colormap.colors)
-                            idx_val = classify(np.array([raw_val]), plotter._lfc_bins, n_colors)[0]
-                            new_block.cell_data['Raw_Value'] = np.full(new_block.n_cells, raw_val)
-                            new_block.cell_data['Value'] = np.full(new_block.n_cells, idx_val)
-                        else:
-                            new_block.cell_data['Value'] = np.full(new_block.n_cells, raw_val)
-                    else:
-                        new_block.cell_data['Value'] = np.full(new_block.n_cells, value)
                     new_block.cell_data['Is_Sample'] = np.full(new_block.n_cells, False)
-                    
+                    _set_block_display_value(plotter, new_block, value)
+
                     target_interp = pos_to_interpolator.get(pos, interpolator)
+                    if not hasattr(target_interp, 'next_block_id'):
+                        existing_ids = [
+                            int(block.cell_data['Block_ID'][0])
+                            for block in blocks
+                            if 'Block_ID' in block.cell_data
+                        ]
+                        target_interp.next_block_id = (max(existing_ids) + 1) if existing_ids else 1
                     new_block.cell_data['Block_ID'] = np.full(new_block.n_cells, target_interp.next_block_id)
                     target_interp.next_block_id += 1
-                    
-                    # Set domain if available
+
                     if hasattr(target_interp, 'domain_mapping'):
                         domain = target_interp.domain_mapping.get(pos, "Undomained")
                         new_block.cell_data['Domain'] = np.full(new_block.n_cells, domain)
-                    
-                    new_blocks.append(new_block)
-                elif pos in block_mapping:
-                    _, block = block_mapping[pos]
-                    base_val = block.cell_data['Raw_Value'][0] if 'Raw_Value' in block.cell_data else block.cell_data['Value'][0]
+
+                    blocks.append(new_block)
+                    plotter._block_lookup[pos] = new_block
+                    blocks.Modified()
+                    new_block_count += 1
+
+                    if _should_display_block(plotter, pos, new_block):
+                        plotter._visible_blocks.append(new_block)
+                        plotter._visible_positions.add(pos)
+                        actor_dataset_changed = True
+                        new_visible_added = True
+                else:
+                    block = plotter._block_lookup[pos]
+                    base_val = _get_block_raw_value(block)
                     if abs(base_val - value) > 0.0001:
-                        if getattr(plotter, '_value_is_indexed', False) and hasattr(plotter, '_lfc_bins') and isinstance(plotter._colormap, ListedColormap):
-                            n_colors = len(plotter._colormap.colors)
-                            idx_val = classify(np.array([value]), plotter._lfc_bins, n_colors)[0]
-                            block.cell_data['Raw_Value'][:] = value
-                            block.cell_data['Value'][:] = idx_val
-                        else:
-                            block.cell_data['Value'][:] = value
-                        modified = True
+                        was_visible = pos in plotter._visible_positions
+                        _set_block_display_value(plotter, block, value)
+                        is_visible = _should_display_block(plotter, pos, block)
+                        if was_visible and not is_visible:
+                            actor_rebuild_needed = True
+                        elif (not was_visible) and is_visible:
+                            plotter._visible_blocks.append(block)
+                            plotter._visible_positions.add(pos)
+                            actor_dataset_changed = True
+
+                scalar_min = min(scalar_min, float(value))
+                scalar_max = max(scalar_max, float(value))
             except Exception as e:
                 print(f"Error processing position {pos}: {str(e)}")
                 continue
 
-        # Add all new blocks to the multiblock
-        if new_blocks:
-            print(f"Adding {len(new_blocks)} new blocks...")
-            for block in new_blocks:
-                blocks.append(block)
-        
-        # Filter blocks for display only
-        visible_blocks = pv.MultiBlock()
-        for block in blocks:
-            if block.cell_data['Is_Sample'][0]:  # Always show sample blocks
-                visible_blocks.append(block)
-            else:
-                raw_val = block.cell_data['Raw_Value'][0] if 'Raw_Value' in block.cell_data else block.cell_data['Value'][0]
-                if raw_val >= plotter._value_filter:
-                    visible_blocks.append(block)
-        
-        # Use the colormap stored in the plotter
-        colormap = getattr(plotter, '_colormap', 'rainbow')
+        if not getattr(plotter, '_value_is_indexed', False):
+            current_min, current_max = getattr(plotter, '_scalar_range', (scalar_min, scalar_max))
+            plotter._scalar_range = (min(current_min, scalar_min), max(current_max, scalar_max))
 
-        # Create fresh mesh actor with filtered blocks
-        plotter.remove_actor(plotter._blocks_actor)
-        if getattr(plotter, '_value_is_indexed', False) and hasattr(plotter, '_lfc_bins') and isinstance(colormap, ListedColormap):
-            annotations = {i: plotter._lfc_tick_labels[i] for i in range(len(plotter._lfc_tick_labels))} if hasattr(plotter, '_lfc_tick_labels') else None
-            clim = [-0.5, len(colormap.colors)-0.5]
-            plotter._blocks_actor = plotter.add_mesh(
-                visible_blocks,
-                style='surface',
-                scalars='Value',
-                opacity=0.5,
-                show_edges=True,
-                cmap=colormap,
-                categories=True,
-                annotations=annotations,
-                clim=clim,
-            )
+        if actor_rebuild_needed:
+            _rebuild_blocks_actor(plotter)
         else:
-            clim = [0, max(colony_blocks.values())]
-            plotter._blocks_actor = plotter.add_mesh(
-                visible_blocks,
-                style='surface',
-                scalars='Value',
-                opacity=0.5,
-                show_edges=True,
-                cmap=colormap,
-                clim=clim,
+            _mark_block_datasets_modified(plotter)
+            if not getattr(plotter, '_value_is_indexed', False) and hasattr(plotter, '_blocks_actor') and hasattr(plotter._blocks_actor, 'mapper'):
+                plotter._blocks_actor.mapper.SetScalarRange(*plotter._scalar_range)
+
+        if new_block_count > 0 and not new_visible_added:
+            print(
+                "New blocks were created, but none passed the visibility filter. "
+                f"Current value_filter={plotter._value_filter}."
             )
+
         plotter.render()
         print("Visualization updated")
     else:
@@ -1708,6 +2505,143 @@ def load_lfc_colormap(lfc_file):
         print(f"Error loading colormap from {lfc_file}: {e}")
     return ListedColormap([]), [], []
 
+
+def launch_taichi_viewer_from_config(config):
+    taichi_runtime = _load_taichi_runtime_module()
+
+    samples_file = config['samples_file']
+    print(f"Loading sample file from {samples_file}...")
+
+    wants_st_domain = bool(
+        config.get('algorithm') in ('string_theory', 'net_connector')
+        and str(config.get('string_theory_params', {}).get('interpolate_target', 'value')).strip().lower() == 'domain'
+    )
+    wants_ant_domain = bool(
+        config.get('algorithm') == 'ant_colony'
+        and str(config.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
+    )
+    wants_domain_any = wants_st_domain or wants_ant_domain
+
+    df, parsed_cols, explicit_sample_map = load_samples_dataframe(
+        samples_file,
+        samples_delimiter=config.get('samples_delimiter'),
+        samples_header_line=config.get('samples_header_line', 1),
+        sample_x_col=config.get('sample_x_col'),
+        sample_y_col=config.get('sample_y_col'),
+        sample_z_col=config.get('sample_z_col'),
+        sample_value_col=config.get('sample_value_col'),
+        progress_label='Reading sample file',
+    )
+    if parsed_cols is not None:
+        print(f"Samples file (custom header line {config.get('samples_header_line', 1)}) parsed columns: {parsed_cols}")
+    elif hasattr(df, '_detected_delimiter'):
+        print(f"Samples file delimiter used: '{df._detected_delimiter}'")
+
+    if wants_domain_any and explicit_sample_map:
+        if config.get('samples_header_line', 1) and config.get('samples_header_line', 1) != 1 and config.get('samples_delimiter'):
+            df, parsed_cols = read_csv_with_selected_header(
+                samples_file,
+                config.get('samples_delimiter'),
+                config.get('samples_header_line', 1),
+                expected_min_cols=4,
+                progress_label='Reading sample file',
+            )
+            print(f"Samples file (custom header line {config.get('samples_header_line', 1)}) parsed columns: {parsed_cols}")
+        else:
+            df = read_autodetect_csv(
+                samples_file,
+                forced_delimiter=config.get('samples_delimiter'),
+                progress_label='Reading sample file',
+            )
+            print(f"Samples file delimiter used: '{df._detected_delimiter}'")
+        explicit_sample_map = None
+
+    if explicit_sample_map:
+        print(f"Applied user sample column mapping: {explicit_sample_map}")
+    elif config.get('sample_x_col') and config.get('sample_y_col') and config.get('sample_z_col') and config.get('sample_value_col'):
+        rename_map = {
+            config.get('sample_x_col'): 'x',
+            config.get('sample_y_col'): 'y',
+            config.get('sample_z_col'): 'z',
+            config.get('sample_value_col'): 'Value',
+        }
+        df = df.rename(columns=rename_map)
+
+    df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
+    nan_before = int(df['Value'].isna().sum())
+
+    domain_like = None
+    for column_name in df.columns:
+        if str(column_name).strip().lower() == 'domain':
+            domain_like = column_name
+            break
+    if domain_like and domain_like != 'Domain':
+        df = df.rename(columns={domain_like: 'Domain'})
+
+    if wants_domain_any:
+        if 'Domain' not in df.columns:
+            raise ValueError("Domain interpolation selected but samples file has no 'Domain' column.")
+        df['Domain'] = df['Domain'].astype(str).str.strip()
+        blank_domain = df['Domain'].isna() | (df['Domain'].str.strip() == '') | (df['Domain'].str.lower() == 'nan')
+        blank_count = int(blank_domain.sum())
+        if blank_count:
+            print(f"Detected {blank_count} sample rows with blank Domain; these will be excluded from domain interpolation.")
+            df = df.loc[~blank_domain].copy()
+
+        if nan_before:
+            print(f"Detected {nan_before} sample rows with blank/non-numeric Value; filling with 0.0 for domain interpolation.")
+            df['Value'] = df['Value'].fillna(0.0)
+    else:
+        df = df.dropna(subset=['Value'])
+
+    points = df[['x', 'y', 'z']].values
+    values = df['Value'].values
+    sample_domains = df['Domain'].values if 'Domain' in df.columns else None
+    print(f"Loaded {len(values)} samples from {samples_file}.")
+
+    blocks = create_blocks(
+        points,
+        values,
+        block_size=config['block_size'],
+        verbose=config['verbose'],
+        range_size=config['range_size'],
+        max_pheromone=config['max_pheromone'],
+        ants_per_sample=config['ants_per_sample'],
+        blocks_file=config['blocks_file'],
+        background_value=config['background_value'],
+        background_distance=config['background_distance'],
+        average_with_blocks=config['average_with_blocks'],
+        blocks_delimiter=config.get('blocks_delimiter'),
+        avoid_visited_threshold_enabled=config.get('avoid_visited_threshold_enabled', False),
+        avoid_visited_threshold=config.get('avoid_visited_threshold', 100),
+        blocks_header_line=config.get('blocks_header_line', 1),
+        block_x_col=config.get('block_x_col'),
+        block_y_col=config.get('block_y_col'),
+        block_z_col=config.get('block_z_col'),
+        block_domain_col=config.get('block_domain_col'),
+        config=config,
+        sample_domains=sample_domains,
+    )
+
+    lfc_colormap, lfc_bins, lfc_labels = load_lfc_colormap(config.get('color_file'))
+    lfc_colors = [tuple(map(float, color)) for color in getattr(lfc_colormap, 'colors', [])]
+    tick_labels = lfc_labels or taichi_runtime.build_lfc_tick_labels(lfc_colors, lfc_bins)
+
+    viewer = taichi_runtime.TaichiInterpolationViewer(
+        sample_points=np.asarray(points, dtype=np.float32),
+        sample_values=np.asarray(values, dtype=np.float32),
+        sample_domains=sample_domains,
+        blocks_data=blocks,
+        block_size=config['block_size'],
+        value_filter=config.get('value_filter', 0.0),
+        lfc_colors=lfc_colors,
+        lfc_bins=lfc_bins,
+        lfc_tick_labels=tick_labels,
+        config=config,
+        window_title='Anterpolator Taichi Viewer',
+    )
+    viewer.run()
+
 def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, verbose=False, iterations=100, range_size=10, max_pheromone=150, ants_per_sample=3, blocks_file=None, color_file=None, background_value=0.0, background_distance=None, average_with_blocks=False,
                                samples_delimiter=None, blocks_delimiter=None, fill_unvisited_domainwise=False,
                                avoid_visited_threshold_enabled=False,
@@ -1717,20 +2651,59 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
                                blocks_header_line=1,
                                block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
                                config=None):
+    pv = _require_pyvista()
     try:
-        # Display message about loading the sample file
         print(f"Loading sample file from {samples_file}...")
-        
-        # Read CSV
-        if samples_header_line and samples_header_line != 1 and samples_delimiter:
-            df, parsed_cols = read_csv_with_selected_header(samples_file, samples_delimiter, samples_header_line, expected_min_cols=4)
+
+        wants_st_domain = bool(
+            config
+            and config.get('algorithm') in ('string_theory', 'net_connector')
+            and str(config.get('string_theory_params', {}).get('interpolate_target', 'value')).strip().lower() == 'domain'
+        )
+        wants_ant_domain = bool(
+            config
+            and config.get('algorithm') == 'ant_colony'
+            and str(config.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
+        )
+        wants_domain_any = wants_st_domain or wants_ant_domain
+
+        df, parsed_cols, explicit_sample_map = load_samples_dataframe(
+            samples_file,
+            samples_delimiter=samples_delimiter,
+            samples_header_line=samples_header_line,
+            sample_x_col=sample_x_col,
+            sample_y_col=sample_y_col,
+            sample_z_col=sample_z_col,
+            sample_value_col=sample_value_col,
+            progress_label='Reading sample file',
+        )
+        if parsed_cols is not None:
             print(f"Samples file (custom header line {samples_header_line}) parsed columns: {parsed_cols}")
-        else:
-            df = read_autodetect_csv(samples_file, forced_delimiter=samples_delimiter)
+        elif hasattr(df, '_detected_delimiter'):
             print(f"Samples file delimiter used: '{df._detected_delimiter}'")
 
-        # Apply explicit mapping if provided
-        if sample_x_col and sample_y_col and sample_z_col and sample_value_col:
+        if wants_domain_any and explicit_sample_map:
+            if samples_header_line and samples_header_line != 1 and samples_delimiter:
+                df, parsed_cols = read_csv_with_selected_header(
+                    samples_file,
+                    samples_delimiter,
+                    samples_header_line,
+                    expected_min_cols=4,
+                    progress_label='Reading sample file',
+                )
+                print(f"Samples file (custom header line {samples_header_line}) parsed columns: {parsed_cols}")
+            else:
+                df = read_autodetect_csv(
+                    samples_file,
+                    forced_delimiter=samples_delimiter,
+                    progress_label='Reading sample file',
+                )
+                print(f"Samples file delimiter used: '{df._detected_delimiter}'")
+            explicit_sample_map = None
+
+        if explicit_sample_map:
+            print(f"Applied user sample column mapping: {explicit_sample_map}")
+        elif sample_x_col and sample_y_col and sample_z_col and sample_value_col:
             for chosen in [sample_x_col, sample_y_col, sample_z_col, sample_value_col]:
                 if chosen not in df.columns:
                     raise ValueError(f"Selected samples column '{chosen}' not present in file.")
@@ -1738,8 +2711,7 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             df = df.rename(columns=rename_map)
             print(f"Applied user sample column mapping: {rename_map}")
         else:
-            # Legacy fallback auto mapping
-            expected = ['x','y','z','Value']
+            expected = ['x', 'y', 'z', 'Value']
             missing_any = any(col not in df.columns for col in expected)
             if missing_any:
                 if 'Value' not in df.columns:
@@ -1758,24 +2730,49 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
         for col in ['x','y','z','Value']:
             if col not in df.columns:
                 raise ValueError(f"Required column '{col}' not found after mapping.")
+
+        # Optional Domain column (string). Used by String Theory domain interpolation.
+        domain_like = None
+        for c in df.columns:
+            if str(c).strip().lower() == 'domain':
+                domain_like = c
+                break
+        if domain_like and domain_like != 'Domain':
+            df = df.rename(columns={domain_like: 'Domain'})
+
+        if wants_domain_any:
+            if 'Domain' not in df.columns:
+                raise ValueError("Domain interpolation selected but samples file has no 'Domain' column.")
+            df['Domain'] = df['Domain'].astype(str).str.strip()
+            blank_domain = df['Domain'].isna() | (df['Domain'].str.strip() == '') | (df['Domain'].str.lower() == 'nan')
+            blank_count = int(blank_domain.sum())
+            if blank_count:
+                print(f"Detected {blank_count} sample rows with blank Domain; these will be excluded from domain interpolation.")
+                df = df.loc[~blank_domain].copy()
         print(f"Samples final headers: {list(df.columns)}")
-        # --- Ensure the selected Value column is strictly honored and blanks handled ---
-        # Coerce Value to numeric; blank strings or invalid entries become NaN
+        # --- Ensure the selected Value column is handled ---
+        # For domain interpolation, Value is not used; keep rows even if Value is non-numeric.
         try:
             df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
         except Exception as e:
             print(f"Warning: could not coerce 'Value' column to numeric directly: {e}")
-        # Count and drop rows with NaN Value (true blanks)
-        nan_before = df['Value'].isna().sum()
-        if nan_before:
-            print(f"Detected {nan_before} sample rows with blank/non-numeric values in the selected value column; these will be excluded from samples.")
-            df = df.dropna(subset=['Value'])
-        if len(df) == 0:
-            raise ValueError("After removing blank/non-numeric sample values, no samples remain. Check the configured 'sample_value_col'.")
-        # Explicitly report the effective value range post-cleaning
+
+        nan_before = int(df['Value'].isna().sum())
+        if wants_domain_any:
+            if nan_before:
+                print(f"Detected {nan_before} sample rows with blank/non-numeric Value; filling with 0.0 for domain interpolation.")
+                df['Value'] = df['Value'].fillna(0.0)
+        else:
+            if nan_before:
+                print(f"Detected {nan_before} sample rows with blank/non-numeric values in the selected value column; these will be excluded from samples.")
+                df = df.dropna(subset=['Value'])
+            if len(df) == 0:
+                raise ValueError("After removing blank/non-numeric sample values, no samples remain. Check the configured 'sample_value_col'.")
+
         print(f"Cleaned sample count: {len(df)} (removed {nan_before} blank value rows)")
         points = df[['x','y','z']].values
         values = df['Value'].values
+        sample_domains = df['Domain'].values if 'Domain' in df.columns else None
         # Store scalar range early
         data_min, data_max = float(np.nanmin(values)), float(np.nanmax(values))
         print(f"Sample value range: min={data_min} max={data_max}")
@@ -1800,6 +2797,11 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             discrete_cmap = 'rainbow'
 
         plotter = pv.Plotter()
+        if hasattr(pv, 'set_new_attribute'):
+            if not hasattr(plotter, 'pickpoint'):
+                pv.set_new_attribute(plotter, 'pickpoint', None)
+            if not hasattr(plotter, 'picked_point'):
+                pv.set_new_attribute(plotter, 'picked_point', None)
         plotter.set_background('white')
 
         # Store colormap in the plotter for reuse
@@ -1823,7 +2825,8 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             avoid_visited_threshold=avoid_visited_threshold,
             blocks_header_line=blocks_header_line,
             block_x_col=block_x_col, block_y_col=block_y_col, block_z_col=block_z_col, block_domain_col=block_domain_col,
-            config=config
+            config=config,
+            sample_domains=sample_domains
         )
 
         # Store settings in plotter
@@ -1833,6 +2836,11 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
         plotter._fill_unvisited_domainwise = fill_unvisited_domainwise
         plotter._avoid_visited_threshold_enabled = avoid_visited_threshold_enabled
         plotter._avoid_visited_threshold = avoid_visited_threshold
+        plotter._block_lookup = None
+        plotter._visible_blocks = None
+        plotter._visible_positions = None
+        plotter._blocks_actor = None
+        plotter._blocks_display_prepared = False
 
         # Add point cloud with scalar bar settings
         cloud = pv.PolyData(points)
@@ -1930,55 +2938,14 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
                 scalar_bar_args=sargs,
             )
 
-        # Add blocks without scalar bar
-        if getattr(plotter, '_value_is_indexed', False) and hasattr(plotter, '_lfc_bins') and isinstance(plotter._colormap, ListedColormap):
-            annotations = {i: plotter._lfc_tick_labels[i] for i in range(len(plotter._lfc_tick_labels))}
-            plotter._blocks_actor = plotter.add_mesh(
-                blocks,
-                style='surface',
-                scalars='Value',
-                opacity=0.5,
-                show_edges=True,
-                cmap=plotter._colormap,
-                categories=True,
-                annotations=annotations,
-                clim=[-0.5, len(plotter._colormap.colors)-0.5],
-                show_scalar_bar=False,
-            )
-        else:
-            plotter._blocks_actor = plotter.add_mesh(
-                blocks,
-                style='surface',
-                scalars='Value',
-                opacity=0.5,
-                show_edges=True,
-                cmap=plotter._colormap,
-                clim=[data_min, data_max],
-                show_scalar_bar=False,
-            )
-        # Persist range on plotter for later updates
         plotter._scalar_range = (data_min, data_max)
-
-        # If discrete mode active, classify existing sample blocks too
-        if getattr(plotter, '_value_is_indexed', False) and hasattr(plotter, '_lfc_bins') and isinstance(plotter._colormap, ListedColormap):
-            bins_np = np.array(plotter._lfc_bins)
-            n_colors = len(plotter._colormap.colors)
-            threshold_style = (n_colors == len(bins_np) + 1)
-            for block in plotter._blocks_data:
-                if 'Raw_Value' in block.cell_data:
-                    raw_val = block.cell_data['Raw_Value'][0]
-                else:
-                    raw_val = block.cell_data['Value'][0]
-                    block.cell_data['Raw_Value'] = np.full(block.n_cells, raw_val)
-                if threshold_style:
-                    idx_val = np.searchsorted(bins_np, [raw_val], side='right')[0]
-                else:
-                    if len(bins_np) == n_colors + 1:
-                        idx_val = np.digitize([raw_val], bins_np, right=False)[0] - 1
-                    else:
-                        idx_val = np.digitize([raw_val], bins_np, right=False)[0] - 1
-                idx_val = max(0, min(idx_val, n_colors-1))
-                block.cell_data['Value'][:] = idx_val
+        if len(blocks) <= INITIAL_BLOCK_RENDER_THRESHOLD:
+            _ensure_blocks_actor(plotter, visible=True)
+        else:
+            print(
+                f"Deferring initial block rendering for {len(blocks):,} blocks. "
+                "Press 'b' after the window opens to build/show block meshes."
+            )
 
         # Add controls
         plotter.add_key_event('b', lambda: toggle_blocks(plotter))
@@ -2221,6 +3188,7 @@ if __name__ == "__main__":
         def __init__(self):
             super().__init__()
             self.should_visualize = True
+            self.viewer_backend = 'pyvista'
             self.setWindowTitle("Anterpolator 3D Viewer Configuration")
             self.resize(700, 600)
             
@@ -2249,7 +3217,7 @@ if __name__ == "__main__":
             mc_form = QtWidgets.QFormLayout()
             mc_tab.setLayout(mc_form)
             tabs.addTab(mc_tab, "Molecular Clock")
-            
+
             st_tab = QtWidgets.QWidget()
             st_form = QtWidgets.QFormLayout()
             st_tab.setLayout(st_form)
@@ -2440,28 +3408,54 @@ if __name__ == "__main__":
                 s = QtWidgets.QSpinBox(); s.setRange(minv, maxv); s.setSingleStep(step); s.setValue(default); return s
 
             self.range_size = dbl_spin(0.2, 0.0001, 1e6, 0.1)
+            self.range_size.setToolTip('Value tolerance / Bin size for grade classification.\nUnit: Grade units (e.g., %, ppm).\nLarger: Ants are more tolerant of grade differences (broader categories).\nSmaller: Ants are stricter about grade similarity (finer categories).')
+
             self.max_pheromone = int_spin(1000, 1, 10_000_000, 10)
+            self.max_pheromone.setToolTip('Maximum pheromone level allowed in a single block.\nDetermines how far ants can travel and how long blocks persist.\nEquivalent to the maximum lifespan of a block in iterations.')
+
             self.ants_per_sample = int_spin(16, 1, 10000, 1)
+            self.ants_per_sample.setToolTip('Number of ants spawned from each sample point per iteration.\nMore ants = better coverage but slower performance.')
+
             self.ants_sampling_percentage = dbl_spin(100.0, 0.001, 100.0, 1.0)
             self.ants_sampling_percentage.setToolTip('Percentage of samples that will spawn ants (0-100%).\nUseful for second pass interpolation where input blocks are numerous.')
             
+            self.pheromone_decay_rate = int_spin(1, 0, 10, 1)
+            self.pheromone_decay_rate.setToolTip('Amount of pheromone decay per iteration.\n0 = No decay (blocks persist indefinitely).\nHigher = Faster decay (blocks disappear quickly).')
+
             self.iterations = int_spin(500, 1, 10_000_000, 50)
+            self.iterations.setToolTip('Number of iterations to run the simulation (if running in silent mode).\nNot used in visual mode.')
+
             self.background_value = dbl_spin(0.0, -1e9, 1e9, 0.1)
+            self.background_value.setToolTip('Default value assigned to blocks that are not visited by any ants.')
+
             self.background_distance = dbl_spin(32.0, 0.0, 1e9, 1.0)
+            self.background_distance.setToolTip('Distance from samples beyond which the background value is applied.\nUnit: Grid blocks.')
+
             self.value_filter = dbl_spin(0.0, -1e9, 1e9, 1.0)
+            self.value_filter.setToolTip('Minimum value threshold for samples to spawn ants.\nSamples with values below this will be ignored.')
+
             self.avoid_visited_enabled = QtWidgets.QCheckBox(); self.avoid_visited_enabled.setChecked(False)
+            self.avoid_visited_enabled.setToolTip('If checked, ants will avoid moving into blocks that have already been visited more than the threshold.')
+
             self.avoid_visited_threshold = QtWidgets.QSpinBox(); self.avoid_visited_threshold.setRange(1, 10_000_000); self.avoid_visited_threshold.setValue(100)
+            self.avoid_visited_threshold.setToolTip('Maximum number of visits allowed per block before ants start avoiding it.\nRequires "Avoid Visited" to be checked.')
 
             ant_form.addRow('Range Size', self.range_size)
             ant_form.addRow('Max Pheromone', self.max_pheromone)
             ant_form.addRow('Ants per Sample', self.ants_per_sample)
             ant_form.addRow('Samples with Ants (%)', self.ants_sampling_percentage)
+            ant_form.addRow('Pheromone Decay Rate', self.pheromone_decay_rate)
             ant_form.addRow('Iterations (silent)', self.iterations)
             ant_form.addRow('Background Value', self.background_value)
             ant_form.addRow('Background Distance', self.background_distance)
             ant_form.addRow('Value Filter', self.value_filter)
             ant_form.addRow('Avoid Heavily-Visited', self.avoid_visited_enabled)
             ant_form.addRow('Visited Threshold', self.avoid_visited_threshold)
+
+            # Ant Colony domain interpolation toggle
+            self.ant_interpolate_target = QtWidgets.QComboBox(); self.ant_interpolate_target.addItems(['Value', 'Domain'])
+            self.ant_interpolate_target.setToolTip('Select what Ant Colony should interpolate:\nValue: numeric grade/value (current behavior).\nDomain: categorical domain strings from samples (requires a Domain column in samples).')
+            ant_form.addRow('Interpolate', self.ant_interpolate_target)
 
             # === MOLECULAR CLOCK TAB ===
             self.mc_spatial_weight = dbl_spin(1.0, 0.0, 100.0, 0.1)
@@ -2500,9 +3494,25 @@ if __name__ == "__main__":
             # === STRING THEORY TAB ===
             self.st_distance_threshold = dbl_spin(10.0, 0.1, 1000.0, 1.0)
             self.st_distance_threshold.setToolTip('Maximum distance to search for a connection (in blocks).')
+
+            self.st_interpolate_target = QtWidgets.QComboBox()
+            self.st_interpolate_target.addItems(['Value', 'Domain'])
+            self.st_interpolate_target.setToolTip('Select what String Theory should interpolate:\nValue: numeric grade/value (current behavior).\nDomain: categorical domain strings from samples (requires a Domain column in samples).')
             
             self.st_grade_difference = dbl_spin(1.0, 0.0, 1000.0, 0.1)
             self.st_grade_difference.setToolTip('Maximum grade difference allowed for a connection.')
+
+            def update_st_target_ui():
+                is_domain = (self.st_interpolate_target.currentText().strip().lower() == 'domain')
+                self.st_grade_difference.setEnabled(not is_domain)
+                if is_domain:
+                    self.st_grade_difference.setToolTip('Not used in Domain mode.')
+                else:
+                    self.st_grade_difference.setToolTip('Maximum grade difference allowed for a connection.')
+
+            self.st_interpolate_target.currentIndexChanged.connect(update_st_target_ui)
+            self._update_st_target_ui = update_st_target_ui
+            self._update_st_target_ui()
             
             self.st_connect_to_all = QtWidgets.QCheckBox(); self.st_connect_to_all.setChecked(True)
             self.st_connect_to_all.setToolTip('If checked, connects to ALL valid samples within threshold.\nIf unchecked, connects only to the single best match (closest grade, then closest distance).')
@@ -2510,7 +3520,32 @@ if __name__ == "__main__":
             self.st_max_connections = int_spin(1, 1, 1000, 1)
             self.st_max_connections.setToolTip('Number of valid samples to connect to when "Connect to All Valid" is unchecked.\nMinimum: 1.')
             self.st_max_connections.setEnabled(False)
-            self.st_connect_to_all.toggled.connect(lambda checked: self.st_max_connections.setEnabled(not checked))
+            
+            self.st_min_connections = int_spin(1, 1, 1000, 1)
+            self.st_min_connections.setToolTip('Minimum number of connections required. If a sample has fewer valid candidates than this, no connections are made.')
+            self.st_min_connections.setEnabled(False)
+
+            def update_connections_enabled(checked):
+                self.st_max_connections.setEnabled(not checked)
+                self.st_min_connections.setEnabled(not checked)
+
+            self.st_connect_to_all.toggled.connect(update_connections_enabled)
+
+            # Validation: Max >= Min
+            def validate_connections():
+                min_val = self.st_min_connections.value()
+                max_val = self.st_max_connections.value()
+                if max_val < min_val:
+                    self.st_max_connections.setValue(min_val)
+
+            self.st_min_connections.valueChanged.connect(validate_connections)
+            self.st_max_connections.valueChanged.connect(validate_connections)
+
+            conn_layout = QtWidgets.QHBoxLayout()
+            conn_layout.addWidget(QtWidgets.QLabel("Min:"))
+            conn_layout.addWidget(self.st_min_connections)
+            conn_layout.addWidget(QtWidgets.QLabel("Max:"))
+            conn_layout.addWidget(self.st_max_connections)
 
             self.st_collision_policy = QtWidgets.QComboBox()
             self.st_collision_policy.addItems(['overwrite', 'average', 'min', 'max'])
@@ -2536,10 +3571,11 @@ if __name__ == "__main__":
             self.st_filter_by_frequency.toggled.connect(lambda checked: self.st_min_azimuth_freq.setEnabled(checked))
             self.st_filter_by_frequency.toggled.connect(lambda checked: self.st_min_dip_freq.setEnabled(checked))
 
+            st_form.addRow('Interpolate', self.st_interpolate_target)
             st_form.addRow('Distance Threshold', self.st_distance_threshold)
             st_form.addRow('Grade Difference', self.st_grade_difference)
             st_form.addRow('Connect to All Valid', self.st_connect_to_all)
-            st_form.addRow('Max Connections (if unchecked)', self.st_max_connections)
+            st_form.addRow('Connections (Min/Max)', conn_layout)
             st_form.addRow('Collision Policy', self.st_collision_policy)
             st_form.addRow('Processing Order', self.st_processing_order)
             st_form.addRow('Filter by Frequency', self.st_filter_by_frequency)
@@ -2568,17 +3604,29 @@ if __name__ == "__main__":
             self.save_btn = QtWidgets.QPushButton('Save Config')
             self.run_only_btn = QtWidgets.QPushButton('Run Interpolation Only')
             self.start_btn = QtWidgets.QPushButton('Start with Visualization')
+            self.start_taichi_btn = QtWidgets.QPushButton('Start with Taichi Viewer')
             self.cancel_btn = QtWidgets.QPushButton('Cancel')
             btn_box.addWidget(self.load_btn); btn_box.addWidget(self.save_btn)
             btn_box.addStretch(1)
-            btn_box.addWidget(self.run_only_btn); btn_box.addWidget(self.start_btn); btn_box.addWidget(self.cancel_btn)
+            btn_box.addWidget(self.run_only_btn); btn_box.addWidget(self.start_btn); btn_box.addWidget(self.start_taichi_btn); btn_box.addWidget(self.cancel_btn)
             main_layout.addLayout(btn_box)
 
             self.load_btn.clicked.connect(self.load_config)
             self.save_btn.clicked.connect(self.save_config)
             self.run_only_btn.clicked.connect(self.run_interpolation_only)
-            self.start_btn.clicked.connect(self.accept)
+            self.start_btn.clicked.connect(self.start_pyvista_viewer)
+            self.start_taichi_btn.clicked.connect(self.start_taichi_viewer)
             self.cancel_btn.clicked.connect(self.reject)
+
+        def start_pyvista_viewer(self):
+            self.should_visualize = True
+            self.viewer_backend = 'pyvista'
+            self.accept()
+
+        def start_taichi_viewer(self):
+            self.should_visualize = True
+            self.viewer_backend = 'taichi'
+            self.accept()
 
         def to_dict(self):
             return {
@@ -2605,12 +3653,14 @@ if __name__ == "__main__":
                 'max_pheromone': self.max_pheromone.value(),
                 'ants_per_sample': self.ants_per_sample.value(),
                 'ants_sampling_percentage': self.ants_sampling_percentage.value(),
+                'pheromone_decay_rate': self.pheromone_decay_rate.value(),
                 'iterations': self.iterations.value(),
                 'background_value': self.background_value.value(),
                 'background_distance': self.background_distance.value(),
                 'value_filter': self.value_filter.value(),
                 'avoid_visited_threshold_enabled': self.avoid_visited_enabled.isChecked(),
                 'avoid_visited_threshold': self.avoid_visited_threshold.value(),
+                'ant_colony_interpolate_target': self.ant_interpolate_target.currentText().strip().lower(),
                 'molecular_clock_params': {
                     'spatial_weight': self.mc_spatial_weight.value(),
                     'attr_weight': self.mc_attr_weight.value(),
@@ -2622,10 +3672,12 @@ if __name__ == "__main__":
                     'interp_method': self.mc_interp_method.currentText()
                 },
                 'string_theory_params': {
+                    'interpolate_target': self.st_interpolate_target.currentText().strip().lower(),
                     'distance_threshold': self.st_distance_threshold.value(),
                     'grade_difference': self.st_grade_difference.value(),
                     'connect_to_all': self.st_connect_to_all.isChecked(),
                     'max_connections': self.st_max_connections.value(),
+                    'min_connections': self.st_min_connections.value(),
                     'collision_policy': self.st_collision_policy.currentText(),
                     'processing_order': self.st_processing_order.currentText(),
                     'filter_by_frequency': self.st_filter_by_frequency.isChecked(),
@@ -2636,6 +3688,7 @@ if __name__ == "__main__":
                 'fill_unvisited_domainwise': self.fill_unvisited_domainwise.isChecked(),
                 'process_domains_sequentially': self.process_domains_sequentially.isChecked(),
                 'verbose': self.verbose.isChecked(),
+                'viewer_backend': self.viewer_backend,
                 'domain_algorithm_overrides': self.domain_overrides
             }
 
@@ -2675,12 +3728,16 @@ if __name__ == "__main__":
             if 'max_pheromone' in config: self.max_pheromone.setValue(config['max_pheromone'])
             if 'ants_per_sample' in config: self.ants_per_sample.setValue(config['ants_per_sample'])
             if 'ants_sampling_percentage' in config: self.ants_sampling_percentage.setValue(config['ants_sampling_percentage'])
+            if 'pheromone_decay_rate' in config: self.pheromone_decay_rate.setValue(config['pheromone_decay_rate'])
             if 'iterations' in config: self.iterations.setValue(config['iterations'])
             if 'background_value' in config: self.background_value.setValue(config['background_value'])
             if 'background_distance' in config: self.background_distance.setValue(config['background_distance'])
             if 'value_filter' in config: self.value_filter.setValue(config['value_filter'])
             if 'avoid_visited_threshold_enabled' in config: self.avoid_visited_enabled.setChecked(config['avoid_visited_threshold_enabled'])
             if 'avoid_visited_threshold' in config: self.avoid_visited_threshold.setValue(config['avoid_visited_threshold'])
+            if 'ant_colony_interpolate_target' in config:
+                tgt = str(config['ant_colony_interpolate_target']).strip().lower()
+                self.ant_interpolate_target.setCurrentText('Domain' if tgt == 'domain' else 'Value')
             
             if 'molecular_clock_params' in config:
                 mc = config['molecular_clock_params']
@@ -2695,12 +3752,19 @@ if __name__ == "__main__":
 
             if 'string_theory_params' in config:
                 st = config['string_theory_params']
+                if 'interpolate_target' in st:
+                    tgt = str(st['interpolate_target']).strip().lower()
+                    self.st_interpolate_target.setCurrentText('Domain' if tgt == 'domain' else 'Value')
+                    if hasattr(self, '_update_st_target_ui'):
+                        self._update_st_target_ui()
                 if 'distance_threshold' in st: self.st_distance_threshold.setValue(st['distance_threshold'])
                 if 'grade_difference' in st: self.st_grade_difference.setValue(st['grade_difference'])
                 if 'connect_to_all' in st: 
                     self.st_connect_to_all.setChecked(st['connect_to_all'])
                     self.st_max_connections.setEnabled(not st['connect_to_all'])
+                    self.st_min_connections.setEnabled(not st['connect_to_all'])
                 if 'max_connections' in st: self.st_max_connections.setValue(st['max_connections'])
+                if 'min_connections' in st: self.st_min_connections.setValue(st['min_connections'])
                 if 'collision_policy' in st: self.st_collision_policy.setCurrentText(st['collision_policy'])
                 if 'processing_order' in st: self.st_processing_order.setCurrentText(st['processing_order'])
                 if 'filter_by_frequency' in st: 
@@ -2718,6 +3782,7 @@ if __name__ == "__main__":
             if 'fill_unvisited_domainwise' in config: self.fill_unvisited_domainwise.setChecked(config['fill_unvisited_domainwise'])
             if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
             if 'verbose' in config: self.verbose.setChecked(config['verbose'])
+            if 'viewer_backend' in config: self.viewer_backend = config['viewer_backend']
             if 'domain_algorithm_overrides' in config: self.domain_overrides = config['domain_algorithm_overrides']
 
         def save_config(self):
@@ -2793,26 +3858,85 @@ if __name__ == "__main__":
                 samples_header_line = cfg.get('samples_header_line', 1)
                 
                 print(f"Loading sample file from {samples_file}...")
-                if samples_header_line and samples_header_line != 1 and samples_delimiter:
-                    df, _ = read_csv_with_selected_header(samples_file, samples_delimiter, samples_header_line, expected_min_cols=4)
-                else:
-                    df = read_autodetect_csv(samples_file, forced_delimiter=samples_delimiter)
-                
-                # Apply column mapping
                 sample_x_col = cfg.get('sample_x_col')
                 sample_y_col = cfg.get('sample_y_col')
                 sample_z_col = cfg.get('sample_z_col')
                 sample_value_col = cfg.get('sample_value_col')
-                
-                if sample_x_col and sample_y_col and sample_z_col and sample_value_col:
+                wants_domain = bool(
+                    cfg.get('algorithm') in ('string_theory', 'net_connector')
+                    and str(cfg.get('string_theory_params', {}).get('interpolate_target', 'value')).strip().lower() == 'domain'
+                )
+                wants_ant_domain = bool(
+                    cfg.get('algorithm') == 'ant_colony'
+                    and str(cfg.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
+                )
+                wants_domain_any = wants_domain or wants_ant_domain
+
+                df, _, explicit_sample_map = load_samples_dataframe(
+                    samples_file,
+                    samples_delimiter=samples_delimiter,
+                    samples_header_line=samples_header_line,
+                    sample_x_col=sample_x_col,
+                    sample_y_col=sample_y_col,
+                    sample_z_col=sample_z_col,
+                    sample_value_col=sample_value_col,
+                    progress_label='Reading sample file',
+                )
+
+                if wants_domain_any and explicit_sample_map:
+                    if samples_header_line and samples_header_line != 1 and samples_delimiter:
+                        df, _ = read_csv_with_selected_header(
+                            samples_file,
+                            samples_delimiter,
+                            samples_header_line,
+                            expected_min_cols=4,
+                            progress_label='Reading sample file',
+                        )
+                    else:
+                        df = read_autodetect_csv(
+                            samples_file,
+                            forced_delimiter=samples_delimiter,
+                            progress_label='Reading sample file',
+                        )
+                    explicit_sample_map = None
+
+                if explicit_sample_map:
+                    pass
+                elif sample_x_col and sample_y_col and sample_z_col and sample_value_col:
                     rename_map = {sample_x_col: 'x', sample_y_col: 'y', sample_z_col: 'z', sample_value_col: 'Value'}
                     df = df.rename(columns=rename_map)
                 
                 df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
-                df = df.dropna(subset=['Value'])
+                nan_before = int(df['Value'].isna().sum())
+
+                # Optional Domain column (string)
+                domain_like = None
+                for c in df.columns:
+                    if str(c).strip().lower() == 'domain':
+                        domain_like = c
+                        break
+                if domain_like and domain_like != 'Domain':
+                    df = df.rename(columns={domain_like: 'Domain'})
+
+                if wants_domain_any:
+                    if 'Domain' not in df.columns:
+                        raise ValueError("Domain interpolation selected but samples file has no 'Domain' column.")
+                    df['Domain'] = df['Domain'].astype(str).str.strip()
+                    blank_domain = df['Domain'].isna() | (df['Domain'].str.strip() == '') | (df['Domain'].str.lower() == 'nan')
+                    blank_count = int(blank_domain.sum())
+                    if blank_count:
+                        print(f"Detected {blank_count} sample rows with blank Domain; these will be excluded from domain interpolation.")
+                        df = df.loc[~blank_domain].copy()
+
+                    if nan_before:
+                        print(f"Detected {nan_before} sample rows with blank/non-numeric Value; filling with 0.0 for domain interpolation.")
+                        df['Value'] = df['Value'].fillna(0.0)
+                else:
+                    df = df.dropna(subset=['Value'])
                 
                 points = df[['x','y','z']].values
                 values = df['Value'].values
+                sample_domains = df['Domain'].values if 'Domain' in df.columns else None
                 print(f"Loaded {len(values)} samples from {samples_file}.")
                 
                 # Create blocks with samples
@@ -2836,7 +3960,8 @@ if __name__ == "__main__":
                     block_y_col=cfg.get('block_y_col'),
                     block_z_col=cfg.get('block_z_col'),
                     block_domain_col=cfg.get('block_domain_col'),
-                    config=cfg
+                    config=cfg,
+                    sample_domains=sample_domains
                 )
                 
                 # Run interpolation (handle both single and sequential domain processing)
@@ -2954,38 +4079,39 @@ if __name__ == "__main__":
     if dialog.exec_() == QtWidgets.QDialog.Accepted:
         if dialog.should_visualize:
             cfg = dialog.to_dict()
-            
-            # Run visualization with config
-            load_and_visualize_samples(
-                samples_file=cfg['samples_file'],
-                block_size=cfg['block_size'],
-                value_filter=cfg['value_filter'],
-                verbose=cfg['verbose'],
-                iterations=cfg['iterations'],
-                range_size=cfg['range_size'],
-                max_pheromone=cfg['max_pheromone'],
-                ants_per_sample=cfg['ants_per_sample'],
-                blocks_file=cfg['blocks_file'],
-                color_file=cfg['color_file'],
-                background_value=cfg['background_value'],
-                background_distance=cfg['background_distance'],
-                average_with_blocks=cfg['average_with_blocks'],
-                samples_delimiter=cfg.get('samples_delimiter'),
-                blocks_delimiter=cfg.get('blocks_delimiter'),
-                fill_unvisited_domainwise=cfg.get('fill_unvisited_domainwise', False),
-                avoid_visited_threshold_enabled=cfg.get('avoid_visited_threshold_enabled', False),
-                avoid_visited_threshold=cfg.get('avoid_visited_threshold', 100),
-                samples_header_line=cfg.get('samples_header_line', 1),
-                sample_x_col=cfg.get('sample_x_col'),
-                sample_y_col=cfg.get('sample_y_col'),
-                sample_z_col=cfg.get('sample_z_col'),
-                sample_value_col=cfg.get('sample_value_col'),
-                blocks_header_line=cfg.get('blocks_header_line', 1),
-                block_x_col=cfg.get('block_x_col'),
-                block_y_col=cfg.get('block_y_col'),
-                block_z_col=cfg.get('block_z_col'),
-                block_domain_col=cfg.get('block_domain_col'),
-                config=cfg
-            )
+            if cfg.get('viewer_backend') == 'taichi':
+                launch_taichi_viewer_from_config(cfg)
+            else:
+                load_and_visualize_samples(
+                    samples_file=cfg['samples_file'],
+                    block_size=cfg['block_size'],
+                    value_filter=cfg['value_filter'],
+                    verbose=cfg['verbose'],
+                    iterations=cfg['iterations'],
+                    range_size=cfg['range_size'],
+                    max_pheromone=cfg['max_pheromone'],
+                    ants_per_sample=cfg['ants_per_sample'],
+                    blocks_file=cfg['blocks_file'],
+                    color_file=cfg['color_file'],
+                    background_value=cfg['background_value'],
+                    background_distance=cfg['background_distance'],
+                    average_with_blocks=cfg['average_with_blocks'],
+                    samples_delimiter=cfg.get('samples_delimiter'),
+                    blocks_delimiter=cfg.get('blocks_delimiter'),
+                    fill_unvisited_domainwise=cfg.get('fill_unvisited_domainwise', False),
+                    avoid_visited_threshold_enabled=cfg.get('avoid_visited_threshold_enabled', False),
+                    avoid_visited_threshold=cfg.get('avoid_visited_threshold', 100),
+                    samples_header_line=cfg.get('samples_header_line', 1),
+                    sample_x_col=cfg.get('sample_x_col'),
+                    sample_y_col=cfg.get('sample_y_col'),
+                    sample_z_col=cfg.get('sample_z_col'),
+                    sample_value_col=cfg.get('sample_value_col'),
+                    blocks_header_line=cfg.get('blocks_header_line', 1),
+                    block_x_col=cfg.get('block_x_col'),
+                    block_y_col=cfg.get('block_y_col'),
+                    block_z_col=cfg.get('block_z_col'),
+                    block_domain_col=cfg.get('block_domain_col'),
+                    config=cfg
+                )
     
     sys.exit(0)
