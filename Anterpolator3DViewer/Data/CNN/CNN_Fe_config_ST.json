@@ -26,12 +26,14 @@
     "max_pheromone": 1000,
     "ants_per_sample": 16,
     "ants_sampling_percentage": 100.0,
+    "pheromone_decay_rate": 1,
     "iterations": 500,
     "background_value": 0.0,
     "background_distance": 32.0,
     "value_filter": 0.0,
     "avoid_visited_threshold_enabled": false,
     "avoid_visited_threshold": 100,
+    "ant_colony_interpolate_target": "value",
     "molecular_clock_params": {
         "spatial_weight": 1.0,
         "attr_weight": 1.0,
@@ -43,16 +45,26 @@
         "interp_method": "linear"
     },
     "string_theory_params": {
+        "interpolate_target": "value",
         "distance_threshold": 15.0,
         "grade_difference": 5.0,
         "connect_to_all": false,
         "max_connections": 8,
-        "collision_policy": "average"
+        "min_connections": 1,
+        "collision_policy": "average",
+        "processing_order": "ascending",
+        "filter_by_frequency": false,
+        "min_azimuth_freq": 10.0,
+        "min_dip_freq": 10.0
     },
     "average_with_blocks": true,
     "fill_unvisited_domainwise": false,
     "process_domains_sequentially": true,
     "verbose": false,
+    "viewer_backend": "taichi",
+    "taichi_block_render_mode": "mesh",
+    "taichi_transparent_blocks": false,
+    "taichi_sample_diameter": 1.0,
     "domain_algorithm_overrides": {
         "APL": {
             "skip": true

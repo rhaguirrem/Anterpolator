@@ -1,11 +1,15 @@
 import pandas as pd
 import numpy as np
 import csv
+import atexit
 from collections import Counter
 import importlib.util
 import io
 import threading
 import time
+import tempfile
+import subprocess
+import traceback
 from tqdm import tqdm
 import sys
 import os
@@ -44,6 +48,26 @@ def _load_taichi_runtime_module():
     spec.loader.exec_module(module)
     taichi_runtime_module = module
     return taichi_runtime_module
+
+
+def _normalize_viewer_backend(viewer_backend):
+    backend = str(viewer_backend or 'taichi').strip().lower()
+    if backend == 'pyvista':
+        print("PyVista viewer is deprecated. Falling back to Taichi viewer.")
+        return 'taichi'
+    return 'taichi'
+
+
+def _normalize_taichi_block_render_mode(block_render_mode):
+    return 'mesh'
+
+
+def _write_json_atomic(path, data):
+    directory = os.path.dirname(path) or '.'
+    with tempfile.NamedTemporaryFile('w', suffix='.json', prefix='anterpolator_cfg_', dir=directory, delete=False, encoding='utf-8') as handle:
+        json.dump(data, handle, indent=4)
+        temp_path = handle.name
+    os.replace(temp_path, path)
 
 # --- Interpolator Factory ---
 def create_interpolator(config, domain=None, current_algorithm=None):
@@ -2506,7 +2530,7 @@ def load_lfc_colormap(lfc_file):
     return ListedColormap([]), [], []
 
 
-def launch_taichi_viewer_from_config(config):
+def build_taichi_viewer_state_from_config(config):
     taichi_runtime = _load_taichi_runtime_module()
 
     samples_file = config['samples_file']
@@ -2627,20 +2651,60 @@ def launch_taichi_viewer_from_config(config):
     lfc_colors = [tuple(map(float, color)) for color in getattr(lfc_colormap, 'colors', [])]
     tick_labels = lfc_labels or taichi_runtime.build_lfc_tick_labels(lfc_colors, lfc_bins)
 
+    return {
+        'sample_points': np.asarray(points, dtype=np.float32),
+        'sample_values': np.asarray(values, dtype=np.float32),
+        'sample_domains': sample_domains,
+        'blocks_data': blocks,
+        'block_size': config['block_size'],
+        'value_filter': config.get('value_filter', 0.0),
+        'lfc_colors': lfc_colors,
+        'lfc_bins': lfc_bins,
+        'lfc_tick_labels': tick_labels,
+        'config': config,
+        'window_title': 'Anterpolator Taichi Viewer',
+    }
+
+
+def build_taichi_viewer_state_from_existing_state(config, existing_state):
+    taichi_runtime = _load_taichi_runtime_module()
+    lfc_colormap, lfc_bins, lfc_labels = load_lfc_colormap(config.get('color_file'))
+    lfc_colors = [tuple(map(float, color)) for color in getattr(lfc_colormap, 'colors', [])]
+    tick_labels = lfc_labels or taichi_runtime.build_lfc_tick_labels(lfc_colors, lfc_bins)
+
+    merged_config = dict(existing_state.get('config', {}) or {})
+    merged_config.update(config)
+
+    sample_values = existing_state.get('sample_values')
+    sample_domains = existing_state.get('sample_domains')
+
+    return {
+        'sample_points': np.asarray(existing_state['sample_points'], dtype=np.float32),
+        'sample_values': None if sample_values is None else np.asarray(sample_values, dtype=np.float32),
+        'sample_domains': None if sample_domains is None else np.asarray(sample_domains, dtype=object),
+        'blocks_data': existing_state['blocks_data'],
+        'block_size': np.asarray(existing_state['block_size'], dtype=np.float32),
+        'value_filter': config.get('value_filter', existing_state.get('value_filter', 0.0)),
+        'lfc_colors': lfc_colors,
+        'lfc_bins': lfc_bins,
+        'lfc_tick_labels': tick_labels,
+        'config': merged_config,
+        'window_title': existing_state.get('window_title', 'Anterpolator Taichi Viewer'),
+    }
+
+
+def launch_taichi_viewer_with_state(viewer_state, external_state_callback=None):
+    taichi_runtime = _load_taichi_runtime_module()
     viewer = taichi_runtime.TaichiInterpolationViewer(
-        sample_points=np.asarray(points, dtype=np.float32),
-        sample_values=np.asarray(values, dtype=np.float32),
-        sample_domains=sample_domains,
-        blocks_data=blocks,
-        block_size=config['block_size'],
-        value_filter=config.get('value_filter', 0.0),
-        lfc_colors=lfc_colors,
-        lfc_bins=lfc_bins,
-        lfc_tick_labels=tick_labels,
-        config=config,
-        window_title='Anterpolator Taichi Viewer',
+        external_state_callback=external_state_callback,
+        **viewer_state,
     )
     viewer.run()
+
+
+def launch_taichi_viewer_from_config(config, external_state_callback=None):
+    viewer_state = build_taichi_viewer_state_from_config(config)
+    launch_taichi_viewer_with_state(viewer_state, external_state_callback=external_state_callback)
 
 def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, verbose=False, iterations=100, range_size=10, max_pheromone=150, ants_per_sample=3, blocks_file=None, color_file=None, background_value=0.0, background_distance=None, average_with_blocks=False,
                                samples_delimiter=None, blocks_delimiter=None, fill_unvisited_domainwise=False,
@@ -2970,6 +3034,42 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
         print(f"Error: {str(e)}")
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == '--launch-viewer-config':
+        config_path = sys.argv[2]
+        with open(config_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        cfg['viewer_backend'] = _normalize_viewer_backend(cfg.get('viewer_backend'))
+        cfg.pop('_viewer_reload_mode', None)
+        last_mtime = [os.path.getmtime(config_path) if os.path.isfile(config_path) else 0.0]
+        current_state = [build_taichi_viewer_state_from_config(cfg)]
+
+        def reload_callback():
+            try:
+                current_mtime = os.path.getmtime(config_path)
+            except OSError:
+                return None
+            if current_mtime <= last_mtime[0]:
+                return None
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    updated_cfg = json.load(f)
+                updated_cfg['viewer_backend'] = _normalize_viewer_backend(updated_cfg.get('viewer_backend'))
+                reload_mode = str(updated_cfg.pop('_viewer_reload_mode', 'refresh')).strip().lower()
+                if reload_mode == 'reload':
+                    state = build_taichi_viewer_state_from_config(updated_cfg)
+                else:
+                    state = build_taichi_viewer_state_from_existing_state(updated_cfg, current_state[0])
+                last_mtime[0] = current_mtime
+                current_state[0] = state
+                return state
+            except Exception:
+                print('Failed to live-reload viewer config:')
+                traceback.print_exc()
+                return None
+
+        launch_taichi_viewer_with_state(current_state[0], external_state_callback=reload_callback)
+        sys.exit(0)
+
     class DomainAlgorithmDialog(QtWidgets.QDialog):
         """Dialog for configuring algorithm per domain"""
         def __init__(self, blocks_file, blocks_delimiter, blocks_header_line, block_domain_col, parent=None):
@@ -3188,7 +3288,17 @@ if __name__ == "__main__":
         def __init__(self):
             super().__init__()
             self.should_visualize = True
-            self.viewer_backend = 'pyvista'
+            self.viewer_backend = 'taichi'
+            self._viewer_process = None
+            self._viewer_config_path = None
+            self._viewer_render_mode = None
+            self._suspend_auto_viewer_refresh = False
+            self._viewer_process_timer = QtCore.QTimer(self)
+            self._viewer_process_timer.setInterval(2000)
+            self._viewer_process_timer.timeout.connect(self._cleanup_finished_viewer)
+            self._viewer_process_timer.start()
+            self.taichi_block_render_mode_default = 'mesh'
+            self.taichi_transparent_blocks_default = False
             self.setWindowTitle("Anterpolator 3D Viewer Configuration")
             self.resize(700, 600)
             
@@ -3223,7 +3333,12 @@ if __name__ == "__main__":
             st_tab.setLayout(st_form)
             tabs.addTab(st_tab, "String Theory")
 
-            # Tab 5: Advanced Options
+            display_tab = QtWidgets.QWidget()
+            display_form = QtWidgets.QFormLayout()
+            display_tab.setLayout(display_form)
+            tabs.addTab(display_tab, "Display")
+
+            # Tab 6: Advanced Options
             advanced_tab = QtWidgets.QWidget()
             advanced_form = QtWidgets.QFormLayout()
             advanced_tab.setLayout(advanced_form)
@@ -3587,6 +3702,12 @@ if __name__ == "__main__":
             self.verbose = QtWidgets.QCheckBox(); self.verbose.setChecked(False)
             self.fill_unvisited_domainwise = QtWidgets.QCheckBox(); self.fill_unvisited_domainwise.setChecked(False)
             self.process_domains_sequentially = QtWidgets.QCheckBox(); self.process_domains_sequentially.setChecked(True)
+
+            # === DISPLAY TAB ===
+            self.taichi_sample_diameter = dbl_spin(1.0, 0.001, 1e6, 0.1)
+            self.taichi_sample_diameter.setToolTip('Sample diameter in model units for the Taichi mesh viewer. Default is 1 unit.')
+            display_form.addRow('Sample Diameter', self.taichi_sample_diameter)
+
             advanced_form.addRow('Average With Blocks', self.average_with_blocks)
             advanced_form.addRow('Fill Unvisited (Domain-wise)', self.fill_unvisited_domainwise)
             advanced_form.addRow('Process Domains Sequentially', self.process_domains_sequentially)
@@ -3603,30 +3724,154 @@ if __name__ == "__main__":
             self.load_btn = QtWidgets.QPushButton('Load Config')
             self.save_btn = QtWidgets.QPushButton('Save Config')
             self.run_only_btn = QtWidgets.QPushButton('Run Interpolation Only')
-            self.start_btn = QtWidgets.QPushButton('Start with Visualization')
-            self.start_taichi_btn = QtWidgets.QPushButton('Start with Taichi Viewer')
+            self.start_viewer_btn = QtWidgets.QPushButton('Open Viewer')
+            self.refresh_viewer_btn = QtWidgets.QPushButton('Refresh Viewer')
+            self.reload_data_btn = QtWidgets.QPushButton('Reload Data')
             self.cancel_btn = QtWidgets.QPushButton('Cancel')
+            self.viewer_status_label = QtWidgets.QLabel('Viewer: stopped')
             btn_box.addWidget(self.load_btn); btn_box.addWidget(self.save_btn)
             btn_box.addStretch(1)
-            btn_box.addWidget(self.run_only_btn); btn_box.addWidget(self.start_btn); btn_box.addWidget(self.start_taichi_btn); btn_box.addWidget(self.cancel_btn)
+            btn_box.addWidget(self.viewer_status_label)
+            btn_box.addWidget(self.run_only_btn); btn_box.addWidget(self.start_viewer_btn); btn_box.addWidget(self.refresh_viewer_btn); btn_box.addWidget(self.reload_data_btn); btn_box.addWidget(self.cancel_btn)
             main_layout.addLayout(btn_box)
 
             self.load_btn.clicked.connect(self.load_config)
             self.save_btn.clicked.connect(self.save_config)
             self.run_only_btn.clicked.connect(self.run_interpolation_only)
-            self.start_btn.clicked.connect(self.start_pyvista_viewer)
-            self.start_taichi_btn.clicked.connect(self.start_taichi_viewer)
+            self.start_viewer_btn.clicked.connect(self.start_viewer)
+            self.refresh_viewer_btn.clicked.connect(self.refresh_viewer)
+            self.reload_data_btn.clicked.connect(self.reload_viewer_data)
             self.cancel_btn.clicked.connect(self.reject)
 
-        def start_pyvista_viewer(self):
-            self.should_visualize = True
-            self.viewer_backend = 'pyvista'
-            self.accept()
+            self._update_viewer_status()
 
-        def start_taichi_viewer(self):
+        def start_viewer(self):
             self.should_visualize = True
             self.viewer_backend = 'taichi'
-            self.accept()
+            self.launch_viewer_process()
+
+        def _is_viewer_running(self):
+            return self._viewer_process is not None and self._viewer_process.poll() is None
+
+        def _update_viewer_status(self):
+            if self._is_viewer_running():
+                self.viewer_status_label.setText('Viewer: running')
+                self.start_viewer_btn.setEnabled(False)
+                self.refresh_viewer_btn.setEnabled(True)
+                self.reload_data_btn.setEnabled(True)
+            else:
+                self.viewer_status_label.setText('Viewer: stopped')
+                self.start_viewer_btn.setEnabled(True)
+                self.refresh_viewer_btn.setEnabled(False)
+                self.reload_data_btn.setEnabled(False)
+
+        def _cleanup_finished_viewer(self):
+            if self._is_viewer_running():
+                self._update_viewer_status()
+                return
+            if self._viewer_process is not None:
+                self._viewer_process = None
+            self._viewer_render_mode = None
+            if self._viewer_config_path and os.path.isfile(self._viewer_config_path):
+                try:
+                    os.remove(self._viewer_config_path)
+                except OSError:
+                    pass
+            self._viewer_config_path = None
+            self._update_viewer_status()
+
+        def _terminate_viewer_process(self):
+            if not self._is_viewer_running():
+                self._cleanup_finished_viewer()
+                return
+            try:
+                self._viewer_process.terminate()
+                self._viewer_process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._viewer_process.kill()
+                except Exception:
+                    pass
+            self._cleanup_finished_viewer()
+
+        def refresh_viewer(self):
+            if not self._is_viewer_running():
+                self._cleanup_finished_viewer()
+                return
+            cfg = self.to_dict()
+            cfg['viewer_backend'] = _normalize_viewer_backend(cfg.get('viewer_backend'))
+            if self._viewer_mode_requires_restart(cfg):
+                self.launch_viewer_process(config_override=cfg, force_restart=True)
+                return
+            self._write_current_viewer_config(reload_mode='refresh', config_override=cfg)
+
+        def reload_viewer_data(self):
+            if not self._is_viewer_running():
+                self._cleanup_finished_viewer()
+                return
+            cfg = self.to_dict()
+            cfg['viewer_backend'] = _normalize_viewer_backend(cfg.get('viewer_backend'))
+            if self._viewer_mode_requires_restart(cfg):
+                self.launch_viewer_process(config_override=cfg, force_restart=True)
+                return
+            self._write_current_viewer_config(reload_mode='reload', config_override=cfg)
+
+        def _viewer_mode_requires_restart(self, config):
+            return False
+
+        def _write_current_viewer_config(self, reload_mode='refresh', config_override=None):
+            if not self._viewer_config_path:
+                return
+            cfg = dict(config_override or self.to_dict())
+            cfg['viewer_backend'] = _normalize_viewer_backend(cfg.get('viewer_backend'))
+            cfg['_viewer_reload_mode'] = reload_mode
+            self._viewer_render_mode = _normalize_taichi_block_render_mode(cfg.get('taichi_block_render_mode'))
+            _write_json_atomic(self._viewer_config_path, cfg)
+
+        def launch_viewer_process(self, config_override=None, force_restart=False):
+            try:
+                cfg = dict(config_override or self.to_dict())
+                cfg['viewer_backend'] = _normalize_viewer_backend(cfg.get('viewer_backend'))
+                cfg['_viewer_reload_mode'] = 'reload'
+                cfg['taichi_block_render_mode'] = _normalize_taichi_block_render_mode(cfg.get('taichi_block_render_mode'))
+                if force_restart and self._is_viewer_running():
+                    self._terminate_viewer_process()
+                if self._is_viewer_running():
+                    self._update_viewer_status()
+                    return
+                handle = tempfile.NamedTemporaryFile(
+                    mode='w',
+                    suffix='.json',
+                    prefix='anterpolator_viewer_',
+                    delete=False,
+                    encoding='utf-8',
+                )
+                with handle:
+                    json.dump(cfg, handle, indent=4)
+                    config_path = handle.name
+
+                script_path = os.path.abspath(__file__)
+                popen_kwargs = {
+                    'cwd': os.path.dirname(script_path),
+                }
+                if os.name == 'nt':
+                    popen_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+                else:
+                    popen_kwargs['start_new_session'] = True
+                process = subprocess.Popen(
+                    [sys.executable, script_path, '--launch-viewer-config', config_path],
+                    **popen_kwargs,
+                )
+                self._viewer_process = process
+                self._viewer_config_path = config_path
+                self._viewer_render_mode = cfg['taichi_block_render_mode']
+                self._update_viewer_status()
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to launch viewer: {e}')
+
+        def closeEvent(self, event):
+            self._terminate_viewer_process()
+            super().closeEvent(event)
 
         def to_dict(self):
             return {
@@ -3689,102 +3934,110 @@ if __name__ == "__main__":
                 'process_domains_sequentially': self.process_domains_sequentially.isChecked(),
                 'verbose': self.verbose.isChecked(),
                 'viewer_backend': self.viewer_backend,
+                'taichi_block_render_mode': 'mesh',
+                'taichi_transparent_blocks': False,
+                'taichi_sample_diameter': self.taichi_sample_diameter.value(),
                 'domain_algorithm_overrides': self.domain_overrides
             }
 
         def from_dict(self, config):
-            if 'samples_file' in config: self.samples_edit.setText(config['samples_file'])
-            if 'blocks_file' in config: self.blocks_edit.setText(config['blocks_file'])
-            if 'color_file' in config: self.color_edit.setText(config['color_file'])
-            if 'interpolation_file' in config: self.interp_edit.setText(config['interpolation_file'])
-            if 'algorithm' in config: self.algorithm_combo.setCurrentText(config['algorithm'])
-            if 'second_pass_algorithm' in config: self.second_pass_combo.setCurrentText(config['second_pass_algorithm'])
-            if 'samples_delimiter' in config: self.samples_delim.setCurrentText(config['samples_delimiter'])
-            if 'blocks_delimiter' in config: self.blocks_delim.setCurrentText(config['blocks_delimiter'])
-            if 'samples_header_line' in config: self.samples_header_line.setValue(config['samples_header_line'])
-            if 'blocks_header_line' in config: self.blocks_header_line.setValue(config['blocks_header_line'])
+            was_running = self._is_viewer_running()
+            self._suspend_auto_viewer_refresh = True
+            try:
+                if 'samples_file' in config: self.samples_edit.setText(config['samples_file'])
+                if 'blocks_file' in config: self.blocks_edit.setText(config['blocks_file'])
+                if 'color_file' in config: self.color_edit.setText(config['color_file'])
+                if 'interpolation_file' in config: self.interp_edit.setText(config['interpolation_file'])
+                if 'algorithm' in config: self.algorithm_combo.setCurrentText(config['algorithm'])
+                if 'second_pass_algorithm' in config: self.second_pass_combo.setCurrentText(config['second_pass_algorithm'])
+                if 'samples_delimiter' in config: self.samples_delim.setCurrentText(config['samples_delimiter'])
+                if 'blocks_delimiter' in config: self.blocks_delim.setCurrentText(config['blocks_delimiter'])
+                if 'samples_header_line' in config: self.samples_header_line.setValue(config['samples_header_line'])
+                if 'blocks_header_line' in config: self.blocks_header_line.setValue(config['blocks_header_line'])
             # Columns might need refresh first, but we can try setting text
-            if 'sample_x_col' in config: self.sample_x_col.setCurrentText(config['sample_x_col'])
-            if 'sample_y_col' in config: self.sample_y_col.setCurrentText(config['sample_y_col'])
-            if 'sample_z_col' in config: self.sample_z_col.setCurrentText(config['sample_z_col'])
-            if 'sample_value_col' in config: self.sample_value_col.setCurrentText(config['sample_value_col'])
-            if 'block_x_col' in config: self.block_x_col.setCurrentText(config['block_x_col'])
-            if 'block_y_col' in config: self.block_y_col.setCurrentText(config['block_y_col'])
-            if 'block_z_col' in config: self.block_z_col.setCurrentText(config['block_z_col'])
-            if 'block_domain_col' in config: self.block_domain_col.setCurrentText(config['block_domain_col'])
+                if 'sample_x_col' in config: self.sample_x_col.setCurrentText(config['sample_x_col'])
+                if 'sample_y_col' in config: self.sample_y_col.setCurrentText(config['sample_y_col'])
+                if 'sample_z_col' in config: self.sample_z_col.setCurrentText(config['sample_z_col'])
+                if 'sample_value_col' in config: self.sample_value_col.setCurrentText(config['sample_value_col'])
+                if 'block_x_col' in config: self.block_x_col.setCurrentText(config['block_x_col'])
+                if 'block_y_col' in config: self.block_y_col.setCurrentText(config['block_y_col'])
+                if 'block_z_col' in config: self.block_z_col.setCurrentText(config['block_z_col'])
+                if 'block_domain_col' in config: self.block_domain_col.setCurrentText(config['block_domain_col'])
             
-            if 'block_size' in config:
-                bs = config['block_size']
-                if isinstance(bs, (list, tuple)) and len(bs) == 3:
-                    self.block_x.setValue(bs[0])
-                    self.block_y.setValue(bs[1])
-                    self.block_z.setValue(bs[2])
-                elif isinstance(bs, (int, float)):
-                    self.block_x.setValue(int(bs))
-                    self.block_y.setValue(int(bs))
-                    self.block_z.setValue(int(bs))
+                if 'block_size' in config:
+                    bs = config['block_size']
+                    if isinstance(bs, (list, tuple)) and len(bs) == 3:
+                        self.block_x.setValue(bs[0])
+                        self.block_y.setValue(bs[1])
+                        self.block_z.setValue(bs[2])
+                    elif isinstance(bs, (int, float)):
+                        self.block_x.setValue(int(bs))
+                        self.block_y.setValue(int(bs))
+                        self.block_z.setValue(int(bs))
             
-            if 'range_size' in config: self.range_size.setValue(config['range_size'])
-            if 'max_pheromone' in config: self.max_pheromone.setValue(config['max_pheromone'])
-            if 'ants_per_sample' in config: self.ants_per_sample.setValue(config['ants_per_sample'])
-            if 'ants_sampling_percentage' in config: self.ants_sampling_percentage.setValue(config['ants_sampling_percentage'])
-            if 'pheromone_decay_rate' in config: self.pheromone_decay_rate.setValue(config['pheromone_decay_rate'])
-            if 'iterations' in config: self.iterations.setValue(config['iterations'])
-            if 'background_value' in config: self.background_value.setValue(config['background_value'])
-            if 'background_distance' in config: self.background_distance.setValue(config['background_distance'])
-            if 'value_filter' in config: self.value_filter.setValue(config['value_filter'])
-            if 'avoid_visited_threshold_enabled' in config: self.avoid_visited_enabled.setChecked(config['avoid_visited_threshold_enabled'])
-            if 'avoid_visited_threshold' in config: self.avoid_visited_threshold.setValue(config['avoid_visited_threshold'])
-            if 'ant_colony_interpolate_target' in config:
-                tgt = str(config['ant_colony_interpolate_target']).strip().lower()
-                self.ant_interpolate_target.setCurrentText('Domain' if tgt == 'domain' else 'Value')
+                if 'range_size' in config: self.range_size.setValue(config['range_size'])
+                if 'max_pheromone' in config: self.max_pheromone.setValue(config['max_pheromone'])
+                if 'ants_per_sample' in config: self.ants_per_sample.setValue(config['ants_per_sample'])
+                if 'ants_sampling_percentage' in config: self.ants_sampling_percentage.setValue(config['ants_sampling_percentage'])
+                if 'pheromone_decay_rate' in config: self.pheromone_decay_rate.setValue(config['pheromone_decay_rate'])
+                if 'iterations' in config: self.iterations.setValue(config['iterations'])
+                if 'background_value' in config: self.background_value.setValue(config['background_value'])
+                if 'background_distance' in config: self.background_distance.setValue(config['background_distance'])
+                if 'value_filter' in config: self.value_filter.setValue(config['value_filter'])
+                if 'avoid_visited_threshold_enabled' in config: self.avoid_visited_enabled.setChecked(config['avoid_visited_threshold_enabled'])
+                if 'avoid_visited_threshold' in config: self.avoid_visited_threshold.setValue(config['avoid_visited_threshold'])
+                if 'ant_colony_interpolate_target' in config:
+                    tgt = str(config['ant_colony_interpolate_target']).strip().lower()
+                    self.ant_interpolate_target.setCurrentText('Domain' if tgt == 'domain' else 'Value')
             
-            if 'molecular_clock_params' in config:
-                mc = config['molecular_clock_params']
-                if 'spatial_weight' in mc: self.mc_spatial_weight.setValue(mc['spatial_weight'])
-                if 'attr_weight' in mc: self.mc_attr_weight.setValue(mc['attr_weight'])
-                if 'ancestor_depth_offset' in mc: self.mc_ancestor_depth_offset.setValue(mc['ancestor_depth_offset'])
-                if 'branch_threshold' in mc: self.mc_branch_threshold.setValue(mc['branch_threshold'])
-                if 'min_samples' in mc: self.mc_min_samples.setValue(mc['min_samples'])
-                if 'max_samples' in mc: self.mc_max_samples.setValue(mc['max_samples'])
-                if 'detect_multiple' in mc: self.mc_detect_multiple.setChecked(mc['detect_multiple'])
-                if 'interp_method' in mc: self.mc_interp_method.setCurrentText(mc['interp_method'])
+                if 'molecular_clock_params' in config:
+                    mc = config['molecular_clock_params']
+                    if 'spatial_weight' in mc: self.mc_spatial_weight.setValue(mc['spatial_weight'])
+                    if 'attr_weight' in mc: self.mc_attr_weight.setValue(mc['attr_weight'])
+                    if 'ancestor_depth_offset' in mc: self.mc_ancestor_depth_offset.setValue(mc['ancestor_depth_offset'])
+                    if 'branch_threshold' in mc: self.mc_branch_threshold.setValue(mc['branch_threshold'])
+                    if 'min_samples' in mc: self.mc_min_samples.setValue(mc['min_samples'])
+                    if 'max_samples' in mc: self.mc_max_samples.setValue(mc['max_samples'])
+                    if 'detect_multiple' in mc: self.mc_detect_multiple.setChecked(mc['detect_multiple'])
+                    if 'interp_method' in mc: self.mc_interp_method.setCurrentText(mc['interp_method'])
 
-            if 'string_theory_params' in config:
-                st = config['string_theory_params']
-                if 'interpolate_target' in st:
-                    tgt = str(st['interpolate_target']).strip().lower()
-                    self.st_interpolate_target.setCurrentText('Domain' if tgt == 'domain' else 'Value')
-                    if hasattr(self, '_update_st_target_ui'):
-                        self._update_st_target_ui()
-                if 'distance_threshold' in st: self.st_distance_threshold.setValue(st['distance_threshold'])
-                if 'grade_difference' in st: self.st_grade_difference.setValue(st['grade_difference'])
-                if 'connect_to_all' in st: 
-                    self.st_connect_to_all.setChecked(st['connect_to_all'])
-                    self.st_max_connections.setEnabled(not st['connect_to_all'])
-                    self.st_min_connections.setEnabled(not st['connect_to_all'])
-                if 'max_connections' in st: self.st_max_connections.setValue(st['max_connections'])
-                if 'min_connections' in st: self.st_min_connections.setValue(st['min_connections'])
-                if 'collision_policy' in st: self.st_collision_policy.setCurrentText(st['collision_policy'])
-                if 'processing_order' in st: self.st_processing_order.setCurrentText(st['processing_order'])
-                if 'filter_by_frequency' in st: 
-                    self.st_filter_by_frequency.setChecked(st['filter_by_frequency'])
-                    self.st_min_azimuth_freq.setEnabled(st['filter_by_frequency'])
-                    self.st_min_dip_freq.setEnabled(st['filter_by_frequency'])
-                if 'min_azimuth_freq' in st: self.st_min_azimuth_freq.setValue(st['min_azimuth_freq'])
-                if 'min_dip_freq' in st: self.st_min_dip_freq.setValue(st['min_dip_freq'])
+                if 'string_theory_params' in config:
+                    st = config['string_theory_params']
+                    if 'interpolate_target' in st:
+                        tgt = str(st['interpolate_target']).strip().lower()
+                        self.st_interpolate_target.setCurrentText('Domain' if tgt == 'domain' else 'Value')
+                        if hasattr(self, '_update_st_target_ui'):
+                            self._update_st_target_ui()
+                    if 'distance_threshold' in st: self.st_distance_threshold.setValue(st['distance_threshold'])
+                    if 'grade_difference' in st: self.st_grade_difference.setValue(st['grade_difference'])
+                    if 'connect_to_all' in st: 
+                        self.st_connect_to_all.setChecked(st['connect_to_all'])
+                        self.st_max_connections.setEnabled(not st['connect_to_all'])
+                        self.st_min_connections.setEnabled(not st['connect_to_all'])
+                    if 'max_connections' in st: self.st_max_connections.setValue(st['max_connections'])
+                    if 'min_connections' in st: self.st_min_connections.setValue(st['min_connections'])
+                    if 'collision_policy' in st: self.st_collision_policy.setCurrentText(st['collision_policy'])
+                    if 'processing_order' in st: self.st_processing_order.setCurrentText(st['processing_order'])
+                    if 'filter_by_frequency' in st: 
+                        self.st_filter_by_frequency.setChecked(st['filter_by_frequency'])
+                        self.st_min_azimuth_freq.setEnabled(st['filter_by_frequency'])
+                        self.st_min_dip_freq.setEnabled(st['filter_by_frequency'])
+                    if 'min_azimuth_freq' in st: self.st_min_azimuth_freq.setValue(st['min_azimuth_freq'])
+                    if 'min_dip_freq' in st: self.st_min_dip_freq.setValue(st['min_dip_freq'])
                 
                 # Backward compatibility for tolerance params (ignore or convert?)
                 # If old params exist but new ones don't, we could try to map them, but they are different concepts.
                 # We'll just ignore them for now.
 
-            if 'average_with_blocks' in config: self.average_with_blocks.setChecked(config['average_with_blocks'])
-            if 'fill_unvisited_domainwise' in config: self.fill_unvisited_domainwise.setChecked(config['fill_unvisited_domainwise'])
-            if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
-            if 'verbose' in config: self.verbose.setChecked(config['verbose'])
-            if 'viewer_backend' in config: self.viewer_backend = config['viewer_backend']
-            if 'domain_algorithm_overrides' in config: self.domain_overrides = config['domain_algorithm_overrides']
-
+                if 'average_with_blocks' in config: self.average_with_blocks.setChecked(config['average_with_blocks'])
+                if 'fill_unvisited_domainwise' in config: self.fill_unvisited_domainwise.setChecked(config['fill_unvisited_domainwise'])
+                if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
+                if 'verbose' in config: self.verbose.setChecked(config['verbose'])
+                if 'viewer_backend' in config: self.viewer_backend = _normalize_viewer_backend(config['viewer_backend'])
+                if 'taichi_sample_diameter' in config: self.taichi_sample_diameter.setValue(config['taichi_sample_diameter'])
+                if 'domain_algorithm_overrides' in config: self.domain_overrides = config['domain_algorithm_overrides']
+            finally:
+                self._suspend_auto_viewer_refresh = False
         def save_config(self):
             path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Configuration", ".", "JSON Files (*.json)")
             if path:
@@ -4076,42 +4329,8 @@ if __name__ == "__main__":
     # Create and run application
     app = QtWidgets.QApplication(sys.argv)
     dialog = ConfigDialog()
-    if dialog.exec_() == QtWidgets.QDialog.Accepted:
-        if dialog.should_visualize:
-            cfg = dialog.to_dict()
-            if cfg.get('viewer_backend') == 'taichi':
-                launch_taichi_viewer_from_config(cfg)
-            else:
-                load_and_visualize_samples(
-                    samples_file=cfg['samples_file'],
-                    block_size=cfg['block_size'],
-                    value_filter=cfg['value_filter'],
-                    verbose=cfg['verbose'],
-                    iterations=cfg['iterations'],
-                    range_size=cfg['range_size'],
-                    max_pheromone=cfg['max_pheromone'],
-                    ants_per_sample=cfg['ants_per_sample'],
-                    blocks_file=cfg['blocks_file'],
-                    color_file=cfg['color_file'],
-                    background_value=cfg['background_value'],
-                    background_distance=cfg['background_distance'],
-                    average_with_blocks=cfg['average_with_blocks'],
-                    samples_delimiter=cfg.get('samples_delimiter'),
-                    blocks_delimiter=cfg.get('blocks_delimiter'),
-                    fill_unvisited_domainwise=cfg.get('fill_unvisited_domainwise', False),
-                    avoid_visited_threshold_enabled=cfg.get('avoid_visited_threshold_enabled', False),
-                    avoid_visited_threshold=cfg.get('avoid_visited_threshold', 100),
-                    samples_header_line=cfg.get('samples_header_line', 1),
-                    sample_x_col=cfg.get('sample_x_col'),
-                    sample_y_col=cfg.get('sample_y_col'),
-                    sample_z_col=cfg.get('sample_z_col'),
-                    sample_value_col=cfg.get('sample_value_col'),
-                    blocks_header_line=cfg.get('blocks_header_line', 1),
-                    block_x_col=cfg.get('block_x_col'),
-                    block_y_col=cfg.get('block_y_col'),
-                    block_z_col=cfg.get('block_z_col'),
-                    block_domain_col=cfg.get('block_domain_col'),
-                    config=cfg
-                )
-    
-    sys.exit(0)
+    app.aboutToQuit.connect(dialog._terminate_viewer_process)
+    atexit.register(dialog._terminate_viewer_process)
+    dialog.show()
+
+    sys.exit(app.exec_())
