@@ -1,5 +1,7 @@
 import colorsys
+import importlib
 import os
+import sys
 import threading
 import time
 import traceback
@@ -7,7 +9,6 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
-import taichi as ti
 
 try:
     from pynput import mouse as pynput_mouse
@@ -16,14 +17,69 @@ except Exception:
 
 
 TI_INITIALIZED = False
+TI_MODULE = None
 VOLUME_RENDERER_MODULE = None
 VOLUME_RENDERER_CANVAS_MODULE = None
+ti = None
+
+
+def get_taichi_module():
+    global TI_MODULE, ti
+    if TI_MODULE is not None:
+        ti = TI_MODULE
+        return TI_MODULE
+
+    existing_module = sys.modules.get('taichi')
+    if existing_module is not None and hasattr(existing_module, 'init'):
+        TI_MODULE = existing_module
+        ti = TI_MODULE
+        return TI_MODULE
+
+    runtime_dir = os.path.normcase(os.path.abspath(os.path.dirname(__file__)))
+    viewer_dir = os.path.normcase(os.path.abspath(os.path.dirname(runtime_dir)))
+    original_sys_path = list(sys.path)
+
+    try:
+        sys.modules.pop('taichi', None)
+        sys.path = [
+            entry for entry in original_sys_path
+            if os.path.normcase(os.path.abspath(entry or os.curdir)) not in {runtime_dir, viewer_dir}
+        ]
+        module = importlib.import_module('taichi')
+    except ModuleNotFoundError as exc:
+        python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        version_hint = ''
+        if sys.version_info >= (3, 14):
+            version_hint = (
+                f" The active interpreter is Python {python_version}; Taichi wheels may not be available for that "
+                "version yet, so use Python 3.13 or earlier for the Taichi viewer."
+            )
+        raise ImportError(
+            "The external 'taichi' package is not installed in the active Python environment. "
+            "This viewer also has a local 'taichi' folder, so a plain 'import taichi' resolves to the local "
+            "namespace package instead of the third-party library. Install the 'taichi' package in the "
+            f"active environment before launching the Taichi viewer.{version_hint}"
+        ) from exc
+    finally:
+        sys.path = original_sys_path
+
+    if not hasattr(module, 'init'):
+        raise ImportError(
+            "Resolved module 'taichi' does not expose 'init'. The active environment is still loading the wrong "
+            "module instead of the third-party Taichi package."
+        )
+
+    sys.modules['taichi'] = module
+    TI_MODULE = module
+    ti = TI_MODULE
+    return TI_MODULE
 
 
 def ensure_taichi_initialized():
     global TI_INITIALIZED
     if TI_INITIALIZED:
         return
+    ti = get_taichi_module()
     try:
         ti.init(arch=ti.gpu)
     except Exception:
@@ -35,6 +91,8 @@ def import_volume_renderer():
     global VOLUME_RENDERER_MODULE, VOLUME_RENDERER_CANVAS_MODULE
     if VOLUME_RENDERER_MODULE is not None and VOLUME_RENDERER_CANVAS_MODULE is not None:
         return VOLUME_RENDERER_MODULE, VOLUME_RENDERER_CANVAS_MODULE
+
+    get_taichi_module()
 
     import taichi_volume_renderer as volume_renderer
     from taichi_volume_renderer import canvas as volume_canvas

@@ -307,15 +307,19 @@ def read_csv_with_progress(path, progress_label, **read_csv_kwargs):
         df._approx_bytes_read = reader._displayed_bytes
     return df
 
-def iterate_csv_with_progress(path, progress_label, **read_csv_kwargs):
+def iterate_csv_with_progress(path, progress_label, progress_callback=None, **read_csv_kwargs):
     read_csv_kwargs = prepare_csv_read_kwargs(path, **read_csv_kwargs)
     read_csv_kwargs.pop('memory_map', None)
 
     def _generator():
         with ProgressTextReader(path, progress_label) as reader:
             for chunk in pd.read_csv(reader.handle, **read_csv_kwargs):
+                if progress_callback:
+                    progress_callback(reader._raw.tell(), reader.total_bytes, progress_label)
                 yield chunk
             reader._sync_progress(force_postfix=True)
+            if progress_callback:
+                progress_callback(reader._displayed_bytes, reader.total_bytes, progress_label)
             print(f"{progress_label}: read {reader._displayed_bytes:,} bytes from {os.path.basename(path)}")
 
     return _generator()
@@ -386,6 +390,49 @@ def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_
         df = read_autodetect_csv(samples_file, forced_delimiter=samples_delimiter, progress_label=progress_label)
         parsed_cols = None
     return df, parsed_cols, None
+
+def build_domain_catalog_cache_signature(blocks_file, delimiter, header_line, domain_col):
+    stats = os.stat(blocks_file)
+    return {
+        'path': os.path.abspath(blocks_file),
+        'size': int(stats.st_size),
+        'mtime_ns': int(getattr(stats, 'st_mtime_ns', int(stats.st_mtime * 1_000_000_000))),
+        'delimiter': delimiter,
+        'header_line': int(header_line or 1),
+        'domain_col': str(domain_col or ''),
+    }
+
+def load_block_domain_catalog(blocks_file, delimiter, header_line, domain_col,
+                              chunksize=250_000, progress_callback=None):
+    headers = parse_header_line(blocks_file, delimiter, header_line)
+    final_names = build_unique_column_names(headers)
+    if domain_col not in final_names:
+        raise ValueError(f'Domain column "{domain_col}" not found in blocks file.')
+
+    domains = set()
+    read_kwargs = dict(
+        delimiter=delimiter,
+        header=None,
+        names=final_names,
+        skiprows=header_line,
+        comment='#',
+        usecols=[domain_col],
+        chunksize=chunksize,
+    )
+
+    for chunk in iterate_csv_with_progress(
+        blocks_file,
+        'Reading domain column',
+        progress_callback=progress_callback,
+        **read_kwargs,
+    ):
+        if domain_col not in chunk.columns or len(chunk) == 0:
+            continue
+        values = chunk[domain_col].dropna().astype(str).str.strip()
+        values = values[(values != '') & (values.str.lower() != 'nan')]
+        domains.update(values.tolist())
+
+    return sorted(domains)
 
 def quantize_grid_indices(coords, reference_origin, block_size):
     scaled = (coords - reference_origin) / block_size
@@ -947,6 +994,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                   config=None,
                   sample_domains=None):
     pv = _require_pyvista()
+    original_points_array = np.array(points, copy=True)
+    original_values_array = np.array(values, copy=True)
+    original_domains_array = np.array(sample_domains, copy=True) if sample_domains is not None else None
     # Domain interpolation in String Theory must ignore blocks_file as input.
     st_target = None
     if config and config.get('algorithm') in ('string_theory', 'net_connector'):
@@ -1185,6 +1235,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         points_array = np.array(points)
         values_array = np.array(values)
         block_indices = np.floor((points_array - all_min_bounds) / unified_dims + 1e-6).astype(int)
+        assigned_mask = np.array([tuple(idx) in allowed_grid for idx in block_indices], dtype=bool)
         
         # Create lookup for allowed blocks
         sample_blocks_dict = {}
@@ -1193,7 +1244,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         # Group by block index
         for i in tqdm(range(len(points_array)), desc="Assigning points to blocks"):
             block_idx = tuple(block_indices[i])
-            if block_idx in allowed_grid:
+            if assigned_mask[i]:
                 if block_idx not in sample_blocks_dict:
                     sample_blocks_dict[block_idx] = []
                     block_values[block_idx] = []
@@ -1244,6 +1295,13 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         # Store metadata on multiblock with private-style names to avoid PyVista attribute restrictions
         multiblock._block_info = block_info
         multiblock._sample_blocks = {idx: np.mean(vals) for idx, vals in block_values.items()}
+        multiblock._sample_assignment_data = {
+            'points': original_points_array,
+            'values': original_values_array,
+            'domains': original_domains_array,
+            'block_indices': block_indices,
+            'assigned_mask': assigned_mask,
+        }
         load_pbar.update(1)
         load_pbar.set_postfix_str("initializing interpolator")
         
@@ -1499,6 +1557,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         if sample_domains is not None:
             domains_array = np.array(sample_domains)
         block_indices = ((points_array - min_bounds) // np.array(block_size)).astype(int)
+        assigned_mask = np.ones(len(points_array), dtype=bool)
         
         for i in tqdm(range(len(points_array)), desc="Assigning points to blocks"):
             block_idx = tuple(block_indices[i])
@@ -1594,6 +1653,13 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         multiblock = pv.MultiBlock(block_data)
         multiblock._block_info = block_info
         multiblock._sample_blocks = sample_blocks
+        multiblock._sample_assignment_data = {
+            'points': original_points_array,
+            'values': original_values_array,
+            'domains': original_domains_array,
+            'block_indices': block_indices,
+            'assigned_mask': assigned_mask,
+        }
 
         if is_st_domain_interpolation or is_ant_domain_interpolation:
             # Preserve sample block domains for export.
@@ -2053,13 +2119,27 @@ def update_interpolation(plotter):
     else:
         print("No blocks to update")
 
-def export_blocks_to_csv(blocks, filepath):
-    # Ensure the output directory exists
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+def resolve_block_evaluated_samples_export_path(enabled, configured_path=None, interpolation_file=None, samples_file=None):
+    if not enabled:
+        return None
 
-    print(f"Exporting blocks to {filepath}...")
-    
-    # Prepare data for export
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    if interpolation_file and str(interpolation_file).strip():
+        reference_path = str(interpolation_file).strip()
+    elif samples_file and str(samples_file).strip():
+        reference_path = str(samples_file).strip()
+    else:
+        reference_path = 'interpolation.csv'
+
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'interpolation'
+    return os.path.join(output_dir, f"{base_name}_block_evaluated_samples.csv")
+
+
+def _collect_export_block_data(blocks):
     data = []
     min_bounds = blocks._block_info['min_bounds']
     block_size = blocks._block_info['block_size']
@@ -2074,6 +2154,7 @@ def export_blocks_to_csv(blocks, filepath):
             
             # We export the LAST interpolator, which contains the cumulative state
             last_interp = interpolator_list[-1]
+            first_interp = interpolator_list[0]
             
             # Identify original samples to distinguish them from Pass 1 outputs
             original_sample_positions = set()
@@ -2091,29 +2172,132 @@ def export_blocks_to_csv(blocks, filepath):
             _add_interpolator_blocks_to_data(last_interp, min_bounds, block_size, data, rotation_matrix, rotation_center, 
                                            original_samples=original_sample_positions,
                                            pass_count=len(interpolator_list),
-                                           forced_domain=domain)
+                                           forced_domain=domain,
+                                           first_pass_algorithm_name=first_interp.get_algorithm_name(),
+                                           final_algorithm_name=last_interp.get_algorithm_name())
     else:
         # Single interpolator
         interpolator = blocks._ant_colony
         # Pass domain_mapping from block_info to restore original domains
         domain_mapping = blocks._block_info.get('domain_mapping')
-        _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data, rotation_matrix, rotation_center, domain_mapping=domain_mapping)
+        algo_name = interpolator.get_algorithm_name()
+        _add_interpolator_blocks_to_data(
+            interpolator,
+            min_bounds,
+            block_size,
+            data,
+            rotation_matrix,
+            rotation_center,
+            domain_mapping=domain_mapping,
+            first_pass_algorithm_name=algo_name,
+            final_algorithm_name=algo_name,
+        )
+
+    return data
+
+
+def export_blocks_to_csv(blocks, filepath):
+    output_dir = os.path.dirname(filepath) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Exporting blocks to {filepath}...")
+    data = _collect_export_block_data(blocks)
     
     # Export to CSV
-    df = pd.DataFrame(data)
+    df = pd.DataFrame([{k: v for k, v in row.items() if k != '_Grid_Index'} for row in data])
     df.to_csv(filepath, index=False)
     print(f"Exported {len(data)} blocks to {filepath}")
 
-def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data, rotation_matrix=None, rotation_center=None, domain_mapping=None, original_samples=None, pass_count=1, forced_domain=None):
+
+def export_block_evaluated_samples_to_csv(blocks, filepath):
+    output_dir = os.path.dirname(filepath) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+
+    sample_assignment_data = getattr(blocks, '_sample_assignment_data', None)
+    if not sample_assignment_data:
+        raise ValueError("No sample assignment data available for evaluated sample export.")
+
+    print(f"Exporting block-evaluated samples to {filepath}...")
+
+    block_rows = _collect_export_block_data(blocks)
+    final_block_lookup = {tuple(row['_Grid_Index']): row for row in block_rows}
+
+    sample_points = np.asarray(sample_assignment_data.get('points', []))
+    sample_values = np.asarray(sample_assignment_data.get('values', []))
+    sample_domains = sample_assignment_data.get('domains')
+    block_indices = np.asarray(sample_assignment_data.get('block_indices', []))
+    assigned_mask = np.asarray(sample_assignment_data.get('assigned_mask', []), dtype=bool)
+
+    if len(sample_points) != len(block_indices) or len(sample_points) != len(assigned_mask):
+        raise ValueError("Sample assignment metadata is inconsistent; evaluated sample export aborted.")
+
+    data = []
+    matched_count = 0
+    for i in range(len(sample_points)):
+        sample_point = sample_points[i]
+        sample_value = sample_values[i] if i < len(sample_values) else None
+        sample_domain = None
+        if sample_domains is not None and i < len(sample_domains):
+            sample_domain = sample_domains[i]
+
+        block_idx = tuple(int(v) for v in block_indices[i])
+        final_block = final_block_lookup.get(block_idx) if assigned_mask[i] else None
+
+        status = 'outside_allowed_grid'
+        if assigned_mask[i]:
+            status = 'matched' if final_block is not None else 'missing_final_block'
+        if status == 'matched':
+            matched_count += 1
+
+        block_value = final_block.get('Value') if final_block is not None else None
+        value_difference = None
+        if block_value is not None and pd.notna(block_value) and sample_value is not None and pd.notna(sample_value):
+            value_difference = float(block_value) - float(sample_value)
+
+        data.append({
+            'Sample_x': sample_point[0],
+            'Sample_y': sample_point[1],
+            'Sample_z': sample_point[2],
+            'Sample_Value': sample_value,
+            'Sample_Domain': sample_domain,
+            'Block_ix': block_idx[0],
+            'Block_iy': block_idx[1],
+            'Block_iz': block_idx[2],
+            'Block_x': final_block.get('x') if final_block is not None else None,
+            'Block_y': final_block.get('y') if final_block is not None else None,
+            'Block_z': final_block.get('z') if final_block is not None else None,
+            'Block_Value': block_value,
+            'Block_Domain': final_block.get('Domain') if final_block is not None else None,
+            'Block_Source': final_block.get('Source') if final_block is not None else None,
+            'Block_Algorithm': final_block.get('Algorithm') if final_block is not None else None,
+            'Block_ID': final_block.get('Block_ID') if final_block is not None else None,
+            'Value_Difference': value_difference,
+            'Assignment_Status': status,
+        })
+
+    df = pd.DataFrame(data)
+    df.to_csv(filepath, index=False)
+    print(f"Exported {len(data)} evaluated samples to {filepath} ({matched_count} matched to final blocks)")
+
+def _normalize_export_algorithm_name(algo_name):
+    name = str(algo_name or '').strip().lower()
+    if 'ant colony' in name:
+        return 'Anterpolator', 'ant_colony'
+    if 'string theory' in name:
+        return 'String Theory', 'string_theory'
+    if 'molecular clock' in name or 'phylogeographic' in name or 'biochemical clock' in name:
+        return 'Molecular Clock', 'molecular_clock'
+    return 'Unknown', 'unknown'
+
+
+def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data, rotation_matrix=None, rotation_center=None, domain_mapping=None, original_samples=None, pass_count=1, forced_domain=None, first_pass_algorithm_name=None, final_algorithm_name=None):
     """Process blocks from an interpolator and add to data list"""
-    # Determine algorithm type
-    algo_name = interpolator.get_algorithm_name()
-    if "Ant Colony" in algo_name:
-        algo_type = "ant_colony"
-    elif "Biochemical Clock" in algo_name or "Phylogeographic" in algo_name:
-        algo_type = "bio_clock"
-    else:
-        algo_type = "unknown"
+    final_algorithm_label, final_algo_type = _normalize_export_algorithm_name(
+        final_algorithm_name or interpolator.get_algorithm_name()
+    )
+    first_pass_algorithm_label, first_pass_algo_type = _normalize_export_algorithm_name(
+        first_pass_algorithm_name or final_algorithm_name or interpolator.get_algorithm_name()
+    )
     
     for pos, block in tqdm(interpolator.blocks.items(), desc="Processing blocks"):
         # Calculate block centroid - grid indices are calculated relative to centroids in min_bounds,
@@ -2134,21 +2318,31 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
         if is_sample:
             if original_samples is None or pos in original_samples:
                 source = "Original Sample"
+                algorithm_label = "Sample"
+                algo_type = "sample"
             else:
                 # It's a sample in this pass, but not in original -> Must be from previous pass
                 source = "First Pass"
+                algorithm_label = first_pass_algorithm_label
+                algo_type = first_pass_algo_type
         else:
             # It's an interpolated block in this pass
             if pass_count == 1:
                 source = "First Pass"
+                algorithm_label = final_algorithm_label
+                algo_type = final_algo_type
             else:
                 source = "Second Pass"
+                algorithm_label = final_algorithm_label
+                algo_type = final_algo_type
 
         # Initialize common fields with None/NaN for all possible columns
         row = {
+            '_Grid_Index': tuple(int(v) for v in pos),
             'x': centroid[0],
             'y': centroid[1],
             'z': centroid[2],
+            'Algorithm': algorithm_label,
             'Algo_Type': algo_type,
             'Source': source,
             'Value': None,
@@ -2235,6 +2429,7 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
 def silent_interpolation(plotter, iterations, interpolation_file):
     blocks = plotter._blocks_data
     dims = tuple(blocks._block_info['dims'])
+    block_evaluated_samples_file = getattr(plotter, '_block_evaluated_samples_file', None)
     
     # Check if we have multiple interpolators (sequential domain processing)
     if hasattr(blocks, '_interpolators'):
@@ -2428,6 +2623,8 @@ def silent_interpolation(plotter, iterations, interpolation_file):
     
     # Export results (handles both single and multiple interpolators)
     export_blocks_to_csv(blocks, interpolation_file)
+    if block_evaluated_samples_file:
+        export_block_evaluated_samples_to_csv(blocks, block_evaluated_samples_file)
 
 def load_lfc_colormap(lfc_file):
     """Load a Leapfrog .lfc file returning (ListedColormap, boundaries, labels).
@@ -2905,6 +3102,12 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
         plotter._visible_positions = None
         plotter._blocks_actor = None
         plotter._blocks_display_prepared = False
+        plotter._block_evaluated_samples_file = resolve_block_evaluated_samples_export_path(
+            config.get('export_block_evaluated_samples', False) if config else False,
+            config.get('block_evaluated_samples_file') if config else None,
+            interpolation_file=config.get('interpolation_file') if config else None,
+            samples_file=samples_file,
+        )
 
         # Add point cloud with scalar bar settings
         cloud = pv.PolyData(points)
@@ -3072,7 +3275,7 @@ if __name__ == "__main__":
 
     class DomainAlgorithmDialog(QtWidgets.QDialog):
         """Dialog for configuring algorithm per domain"""
-        def __init__(self, blocks_file, blocks_delimiter, blocks_header_line, block_domain_col, parent=None):
+        def __init__(self, domains, parent=None):
             super().__init__(parent)
             self.setWindowTitle("Domain Algorithm Mapping")
             self.resize(800, 500)
@@ -3099,8 +3302,7 @@ if __name__ == "__main__":
             self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
             layout.addWidget(self.table)
             
-            # Load domains from blocks file
-            self.load_domains(blocks_file, blocks_delimiter, blocks_header_line, block_domain_col)
+            self.populate_domains(domains)
             
             # Buttons
             btn_layout = QtWidgets.QHBoxLayout()
@@ -3117,67 +3319,30 @@ if __name__ == "__main__":
             btn_layout.addWidget(self.cancel_btn)
             layout.addLayout(btn_layout)
         
-        def load_domains(self, blocks_file, delimiter, header_line, domain_col):
-            """Load unique domains from blocks file"""
-            domains = set()
-            
-            if not blocks_file or not os.path.isfile(blocks_file):
-                QtWidgets.QMessageBox.warning(self, 'Warning', 
-                    'Blocks file not found. Please select a valid blocks file first.')
-                return
-            
-            if not domain_col or domain_col == '(None)':
-                QtWidgets.QMessageBox.warning(self, 'Warning',
-                    'No domain column selected. Please select a domain column in the main dialog first.')
-                return
-            
-            try:
-                # Read domains from file
-                df, _ = read_csv_with_selected_header(blocks_file, delimiter, header_line, expected_min_cols=1)
-                
-                if domain_col not in df.columns:
-                    QtWidgets.QMessageBox.warning(self, 'Warning',
-                        f'Domain column "{domain_col}" not found in blocks file.')
-                    return
-                
-                # Get unique domains
-                domains = set(df[domain_col].dropna().unique())
-                domains = {str(d).strip() for d in domains if str(d).strip() and str(d).strip().lower() != 'nan'}
-                
-                if not domains:
-                    QtWidgets.QMessageBox.warning(self, 'Warning', 'No domains found in blocks file.')
-                    return
-                
-                # Populate table
-                self.table.setRowCount(len(domains))
-                for i, domain in enumerate(sorted(domains)):
-                    # Domain name (read-only)
-                    domain_item = QtWidgets.QTableWidgetItem(domain)
-                    domain_item.setFlags(domain_item.flags() & ~QtCore.Qt.ItemIsEditable)
-                    self.table.setItem(i, 0, domain_item)
-                    
-                    # First Pass Algorithm selector
-                    algo1_combo = QtWidgets.QComboBox()
-                    algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'string_theory', 'skip'])
-                    algo1_combo.setCurrentText('(use default)')
-                    self.table.setCellWidget(i, 1, algo1_combo)
-                    
-                    # Second Pass Algorithm selector
-                    algo2_combo = QtWidgets.QComboBox()
-                    algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'string_theory'])
-                    algo2_combo.setCurrentText('skip')
-                    self.table.setCellWidget(i, 2, algo2_combo)
-                    
-                    # Connect signals
-                    algo1_combo.currentTextChanged.connect(
-                        lambda text, row=i: self.on_first_pass_changed(row, text)
-                    )
-                    algo2_combo.currentTextChanged.connect(
-                        lambda text, row=i: self.on_second_pass_changed(row, text)
-                    )
-                    
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to load domains: {e}')
+        def populate_domains(self, domains):
+            """Populate the table with a preloaded domain catalog."""
+            self.table.setRowCount(len(domains))
+            for i, domain in enumerate(domains):
+                domain_item = QtWidgets.QTableWidgetItem(domain)
+                domain_item.setFlags(domain_item.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.table.setItem(i, 0, domain_item)
+
+                algo1_combo = QtWidgets.QComboBox()
+                algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'string_theory', 'skip'])
+                algo1_combo.setCurrentText('(use default)')
+                self.table.setCellWidget(i, 1, algo1_combo)
+
+                algo2_combo = QtWidgets.QComboBox()
+                algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'string_theory'])
+                algo2_combo.setCurrentText('skip')
+                self.table.setCellWidget(i, 2, algo2_combo)
+
+                algo1_combo.currentTextChanged.connect(
+                    lambda text, row=i: self.on_first_pass_changed(row, text)
+                )
+                algo2_combo.currentTextChanged.connect(
+                    lambda text, row=i: self.on_second_pass_changed(row, text)
+                )
         
         def on_first_pass_changed(self, row, text):
             """Handle changes to first pass algorithm"""
@@ -3289,6 +3454,7 @@ if __name__ == "__main__":
             super().__init__()
             self.should_visualize = True
             self.viewer_backend = 'taichi'
+            self._domain_catalog_cache = None
             self._viewer_process = None
             self._viewer_config_path = None
             self._viewer_render_mode = None
@@ -3375,6 +3541,44 @@ if __name__ == "__main__":
             add_file_row('Blocks File', self.blocks_edit, 'CSV Files (*.csv)', files_form)
             add_file_row('Color File', self.color_edit, 'LFC Files (*.lfc);;All Files (*.*)', files_form)
             add_file_row('Interpolation File', self.interp_edit, 'CSV Files (*.csv)', files_form)
+
+            self.block_evaluated_samples_enabled = QtWidgets.QCheckBox('Block Evaluated Samples File')
+            self.block_evaluated_samples_edit = QtWidgets.QLineEdit('')
+            self.block_evaluated_samples_browse = QtWidgets.QPushButton('Browse')
+            self.block_evaluated_samples_edit.setEnabled(False)
+            self.block_evaluated_samples_browse.setEnabled(False)
+
+            def suggested_block_evaluated_samples_path():
+                sample_path = self.samples_edit.text().strip()
+                base = os.path.splitext(os.path.basename(sample_path))[0] if sample_path else ''
+                start_dir = os.path.dirname(sample_path) if sample_path and os.path.isfile(sample_path) else '.'
+                filename = f"{base}_block_evaluated_samples.csv" if base else 'block_evaluated_samples.csv'
+                return os.path.join(start_dir, filename)
+
+            def update_block_evaluated_samples_controls(checked):
+                self.block_evaluated_samples_edit.setEnabled(checked)
+                self.block_evaluated_samples_browse.setEnabled(checked)
+                if checked and not self.block_evaluated_samples_edit.text().strip():
+                    self.block_evaluated_samples_edit.setText(suggested_block_evaluated_samples_path())
+
+            def browse_block_evaluated_samples_file():
+                initial_path = self.block_evaluated_samples_edit.text().strip() or suggested_block_evaluated_samples_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Block Evaluated Samples File',
+                    initial_path,
+                    'CSV Files (*.csv)'
+                )
+                if path:
+                    self.block_evaluated_samples_edit.setText(path)
+
+            self.block_evaluated_samples_enabled.toggled.connect(update_block_evaluated_samples_controls)
+            self.block_evaluated_samples_browse.clicked.connect(browse_block_evaluated_samples_file)
+
+            block_eval_layout = QtWidgets.QHBoxLayout()
+            block_eval_layout.addWidget(self.block_evaluated_samples_edit)
+            block_eval_layout.addWidget(self.block_evaluated_samples_browse)
+            files_form.addRow(self.block_evaluated_samples_enabled, block_eval_layout)
 
             # Algorithm selection
             self.algorithm_combo = QtWidgets.QComboBox()
@@ -3511,6 +3715,10 @@ if __name__ == "__main__":
             self.blocks_delim.currentIndexChanged.connect(refresh_block_columns)
             self.blocks_header_line.valueChanged.connect(lambda _: refresh_block_columns())
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_columns())
+            self.blocks_delim.currentIndexChanged.connect(lambda _: self._invalidate_domain_catalog_cache())
+            self.blocks_header_line.valueChanged.connect(lambda _: self._invalidate_domain_catalog_cache())
+            self.blocks_edit.textChanged.connect(lambda _: self._invalidate_domain_catalog_cache())
+            self.block_domain_col.currentTextChanged.connect(lambda _: self._invalidate_domain_catalog_cache())
 
             # Initial refresh (silent if files missing)
             refresh_sample_columns()
@@ -3798,7 +4006,7 @@ if __name__ == "__main__":
             if not self._is_viewer_running():
                 self._cleanup_finished_viewer()
                 return
-            cfg = self.to_dict()
+            cfg = self.to_dict(include_runtime_state=True)
             cfg['viewer_backend'] = _normalize_viewer_backend(cfg.get('viewer_backend'))
             if self._viewer_mode_requires_restart(cfg):
                 self.launch_viewer_process(config_override=cfg, force_restart=True)
@@ -3809,7 +4017,7 @@ if __name__ == "__main__":
             if not self._is_viewer_running():
                 self._cleanup_finished_viewer()
                 return
-            cfg = self.to_dict()
+            cfg = self.to_dict(include_runtime_state=True)
             cfg['viewer_backend'] = _normalize_viewer_backend(cfg.get('viewer_backend'))
             if self._viewer_mode_requires_restart(cfg):
                 self.launch_viewer_process(config_override=cfg, force_restart=True)
@@ -3822,7 +4030,7 @@ if __name__ == "__main__":
         def _write_current_viewer_config(self, reload_mode='refresh', config_override=None):
             if not self._viewer_config_path:
                 return
-            cfg = dict(config_override or self.to_dict())
+            cfg = dict(config_override or self.to_dict(include_runtime_state=True))
             cfg['viewer_backend'] = _normalize_viewer_backend(cfg.get('viewer_backend'))
             cfg['_viewer_reload_mode'] = reload_mode
             self._viewer_render_mode = _normalize_taichi_block_render_mode(cfg.get('taichi_block_render_mode'))
@@ -3830,7 +4038,7 @@ if __name__ == "__main__":
 
         def launch_viewer_process(self, config_override=None, force_restart=False):
             try:
-                cfg = dict(config_override or self.to_dict())
+                cfg = dict(config_override or self.to_dict(include_runtime_state=True))
                 cfg['viewer_backend'] = _normalize_viewer_backend(cfg.get('viewer_backend'))
                 cfg['_viewer_reload_mode'] = 'reload'
                 cfg['taichi_block_render_mode'] = _normalize_taichi_block_render_mode(cfg.get('taichi_block_render_mode'))
@@ -3873,12 +4081,17 @@ if __name__ == "__main__":
             self._terminate_viewer_process()
             super().closeEvent(event)
 
-        def to_dict(self):
-            return {
+        def _invalidate_domain_catalog_cache(self):
+            self._domain_catalog_cache = None
+
+        def to_dict(self, include_runtime_state=False):
+            config = {
                 'samples_file': self.samples_edit.text(),
                 'blocks_file': self.blocks_edit.text(),
                 'color_file': self.color_edit.text(),
                 'interpolation_file': self.interp_edit.text(),
+                'export_block_evaluated_samples': self.block_evaluated_samples_enabled.isChecked(),
+                'block_evaluated_samples_file': self.block_evaluated_samples_edit.text(),
                 'algorithm': self.algorithm_combo.currentText(),
                 'second_pass_algorithm': self.second_pass_combo.currentText(),
                 'samples_delimiter': self.samples_delim.currentText(),
@@ -3939,6 +4152,12 @@ if __name__ == "__main__":
                 'taichi_sample_diameter': self.taichi_sample_diameter.value(),
                 'domain_algorithm_overrides': self.domain_overrides
             }
+            if include_runtime_state and self._domain_catalog_cache:
+                config['_domain_catalog_cache'] = {
+                    'signature': dict(self._domain_catalog_cache.get('signature', {})),
+                    'domains': list(self._domain_catalog_cache.get('domains', [])),
+                }
+            return config
 
         def from_dict(self, config):
             was_running = self._is_viewer_running()
@@ -3948,6 +4167,8 @@ if __name__ == "__main__":
                 if 'blocks_file' in config: self.blocks_edit.setText(config['blocks_file'])
                 if 'color_file' in config: self.color_edit.setText(config['color_file'])
                 if 'interpolation_file' in config: self.interp_edit.setText(config['interpolation_file'])
+                if 'export_block_evaluated_samples' in config: self.block_evaluated_samples_enabled.setChecked(bool(config['export_block_evaluated_samples']))
+                if 'block_evaluated_samples_file' in config: self.block_evaluated_samples_edit.setText(config['block_evaluated_samples_file'])
                 if 'algorithm' in config: self.algorithm_combo.setCurrentText(config['algorithm'])
                 if 'second_pass_algorithm' in config: self.second_pass_combo.setCurrentText(config['second_pass_algorithm'])
                 if 'samples_delimiter' in config: self.samples_delim.setCurrentText(config['samples_delimiter'])
@@ -4063,7 +4284,7 @@ if __name__ == "__main__":
         def open_domain_mapping(self):
             """Open dialog to configure domain-specific algorithms"""
             blocks_file = self.blocks_edit.text().strip()
-            blocks_delimiter = self.blocks_delim.currentText()
+            blocks_delimiter = self.blocks_delim.currentText() or detect_csv_delimiter(blocks_file)
             blocks_header_line = self.blocks_header_line.value()
             block_domain_col = self.block_domain_col.currentText()
             
@@ -4076,11 +4297,65 @@ if __name__ == "__main__":
                 QtWidgets.QMessageBox.warning(self, 'Warning',
                     'Please select a domain column in "Blocks Columns" first.')
                 return
-            
-            dialog = DomainAlgorithmDialog(
-                blocks_file, blocks_delimiter, blocks_header_line, 
-                block_domain_col, self
+
+            signature = build_domain_catalog_cache_signature(
+                blocks_file,
+                blocks_delimiter,
+                blocks_header_line,
+                block_domain_col,
             )
+            cached_catalog = self._domain_catalog_cache or {}
+            domains = None
+            if cached_catalog.get('signature') == signature:
+                domains = list(cached_catalog.get('domains', []))
+
+            if domains is None:
+                progress = QtWidgets.QProgressDialog('Preparing domain catalog...', None, 0, 100, self)
+                progress.setWindowTitle('Loading Domains')
+                progress.setWindowModality(QtCore.Qt.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.setAutoClose(False)
+                progress.setAutoReset(False)
+                progress.setValue(0)
+                progress.show()
+                QtWidgets.QApplication.processEvents()
+
+                def update_progress(bytes_read, total_bytes, label):
+                    total_bytes = max(int(total_bytes), 1)
+                    bytes_read = max(0, min(int(bytes_read), total_bytes))
+                    percent = int((bytes_read / total_bytes) * 100)
+                    progress.setValue(percent)
+                    progress.setLabelText(
+                        f'{label}...\n{bytes_read / 1024**2:.1f} / {total_bytes / 1024**2:.1f} MiB'
+                    )
+                    QtWidgets.QApplication.processEvents()
+
+                try:
+                    domains = load_block_domain_catalog(
+                        blocks_file,
+                        blocks_delimiter,
+                        blocks_header_line,
+                        block_domain_col,
+                        progress_callback=update_progress,
+                    )
+                    self._domain_catalog_cache = {
+                        'signature': signature,
+                        'domains': list(domains),
+                    }
+                except Exception as e:
+                    progress.close()
+                    QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to load domains: {e}')
+                    return
+                finally:
+                    if progress.value() < 100:
+                        progress.setValue(100)
+                    progress.close()
+
+            if not domains:
+                QtWidgets.QMessageBox.warning(self, 'Warning', 'No domains found in blocks file.')
+                return
+            
+            dialog = DomainAlgorithmDialog(domains, self)
             
             # Load existing configuration
             if self.domain_overrides:
@@ -4097,8 +4372,14 @@ if __name__ == "__main__":
         def run_interpolation_only(self):
             """Run interpolation without visualization"""
             try:
-                cfg = self.to_dict()
+                cfg = self.to_dict(include_runtime_state=True)
                 interpolation_file = cfg['interpolation_file']
+                block_evaluated_samples_file = resolve_block_evaluated_samples_export_path(
+                    cfg.get('export_block_evaluated_samples', False),
+                    cfg.get('block_evaluated_samples_file'),
+                    interpolation_file=interpolation_file,
+                    samples_file=cfg.get('samples_file'),
+                )
                 
                 # Run interpolation directly without visualization
                 print("=" * 60)
@@ -4315,10 +4596,17 @@ if __name__ == "__main__":
                 
                 # Export results (handles both single and multiple interpolators)
                 export_blocks_to_csv(blocks, interpolation_file)
+                if block_evaluated_samples_file:
+                    export_block_evaluated_samples_to_csv(blocks, block_evaluated_samples_file)
                 print(f"Interpolation complete! Results saved to:\n  {interpolation_file}")
+                if block_evaluated_samples_file:
+                    print(f"Block-evaluated samples saved to:\n  {block_evaluated_samples_file}")
                 print("=" * 60)
                 
-                QtWidgets.QMessageBox.information(self, "Success", f"Interpolation complete!\nResults saved to:\n{interpolation_file}")
+                success_lines = [f"Interpolation complete!\nResults saved to:\n{interpolation_file}"]
+                if block_evaluated_samples_file:
+                    success_lines.append(f"Block-evaluated samples saved to:\n{block_evaluated_samples_file}")
+                QtWidgets.QMessageBox.information(self, "Success", "\n\n".join(success_lines))
 
             except Exception as e:
                 print(f"Error during interpolation: {e}")
