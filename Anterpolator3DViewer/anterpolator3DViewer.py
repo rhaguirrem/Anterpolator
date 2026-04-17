@@ -24,6 +24,7 @@ pv = None
 taichi_runtime_module = None
 LARGE_BLOCK_FILE_THRESHOLD = 512 * 1024 * 1024
 INITIAL_BLOCK_RENDER_THRESHOLD = 5000
+INVALID_FILENAME_CHARS = str.maketrans({ch: '_' for ch in '<>:"/\\|?*'})
 
 
 def _require_pyvista():
@@ -352,6 +353,7 @@ def read_selected_columns_with_header(path, delimiter, header_line, selected_col
         df = read_csv_with_progress(path, progress_label, **read_kwargs)
     else:
         df = pd.read_csv(path, **prepare_csv_read_kwargs(path, **read_kwargs))
+    df = strip_leading_non_data_rows(df)
     df._detected_delimiter = delimiter
     return df, final_names
 
@@ -458,6 +460,7 @@ def read_csv_with_selected_header(path, delimiter, header_line, expected_min_col
         df = pd.read_csv(path, **prepare_csv_read_kwargs(path, **read_kwargs))
     if df.shape[0] and all(str(df.iloc[0, i]).strip() == final_names[i] for i in range(min(len(final_names), df.shape[1]))):
         df = df.iloc[1:].reset_index(drop=True)
+    df = strip_leading_non_data_rows(df)
     def is_all_empty(series):
         return series.isna().all() or (series.astype(str).str.strip() == '').all()
     empty_cols = [c for c in df.columns if is_all_empty(df[c])]
@@ -530,6 +533,7 @@ def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=
                         break
                 except Exception:
                     pass
+    df = strip_leading_non_data_rows(df)
     def is_all_empty(series):
         return series.isna().all() or (series.astype(str).str.strip() == '').all()
     empty_cols = [c for c in df.columns if is_all_empty(df[c])]
@@ -542,6 +546,43 @@ def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=
 
 def format_point_info(point, value):
     return f"Position: ({point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f})\nValue: {value:.2f}"
+
+def strip_leading_non_data_rows(df):
+    if df.empty:
+        return df
+
+    metadata_prefixes = ('variable descriptions', 'variable types', 'variable defaults')
+
+    def _is_empty_value(value):
+        if pd.isna(value):
+            return True
+        text = str(value).strip()
+        return text == '' or text.lower() == 'nan'
+
+    rows_to_drop = 0
+    for row_index in range(len(df)):
+        row = df.iloc[row_index]
+        values = row.tolist()
+        if all(_is_empty_value(value) for value in values):
+            rows_to_drop += 1
+            continue
+
+        first_text = ''
+        for value in values:
+            if _is_empty_value(value):
+                continue
+            first_text = str(value).strip().lower().rstrip(':')
+            break
+
+        if any(first_text.startswith(prefix) for prefix in metadata_prefixes):
+            rows_to_drop += 1
+            continue
+
+        break
+
+    if rows_to_drop:
+        df = df.iloc[rows_to_drop:].reset_index(drop=True)
+    return df
 
 def _collect_same_level_vectors(points, max_points=4096, max_points_per_level=256, neighbors_per_point=8):
     if len(points) == 0:
@@ -805,8 +846,12 @@ def normalize_block_chunk(chunk, rename_map, domain_copy_source=None):
     for column in ['x', 'y', 'z']:
         if column not in chunk.columns:
             raise ValueError(f"Blocks file missing required coordinate column '{column}' after mapping.")
-        chunk.loc[:, column] = pd.to_numeric(chunk[column], errors='coerce')
-    chunk = chunk.dropna(subset=['x', 'y', 'z'])
+    coords = chunk[['x', 'y', 'z']].apply(pd.to_numeric, errors='coerce')
+    valid_mask = coords.notna().all(axis=1)
+    chunk = chunk.loc[valid_mask].copy()
+    if len(chunk) > 0:
+        chunk.loc[:, ['x', 'y', 'z']] = coords.loc[valid_mask].to_numpy(dtype=float, copy=False)
+    chunk = chunk.astype({'x': float, 'y': float, 'z': float}, copy=False)
     return chunk, rows_before - len(chunk)
 
 def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, points,
@@ -829,7 +874,7 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
             if cfg.get('skip', False)
         }
 
-    print(f"Streaming large blocks file ({os.path.getsize(blocks_file) / 1024**3:.2f} GiB) with chunks of {chunksize:,} rows.")
+    print(f"Streaming blocks file ({os.path.getsize(blocks_file) / 1024**3:.2f} GiB) with chunks of {chunksize:,} rows.")
     if mapping_mode == 'explicit':
         print(f"Applied user block column mapping: {rename_map}")
     else:
@@ -872,17 +917,13 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
     else:
         raise ValueError("Block size must be specified when streaming large blocks files.")
 
-    print("Building bounds and domain mapping...")
-    min_quantized_idx = None
-    max_quantized_idx = None
-    grid_reference = None
-    grouped_domain_counts = {}
-    skipped_count_total = 0
-    resolved_rows = 0
+    print("Building bounds...")
+    all_min_bounds = None
+    all_max_bounds = None
 
     full_read_kwargs = dict(base_read_kwargs)
 
-    for chunk in iterate_csv_with_progress(blocks_file, "Reading grid file (bounds + domain mapping)", **full_read_kwargs):
+    for chunk in iterate_csv_with_progress(blocks_file, "Reading grid file (bounds)", **full_read_kwargs):
         chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
         if len(chunk) == 0:
             continue
@@ -890,20 +931,37 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         coords = chunk[['x', 'y', 'z']].to_numpy(copy=False)
         if is_rotated:
             coords = (coords - rotation_center) @ rotation_matrix.T
-            chunk.loc[:, 'x'] = coords[:, 0]
-            chunk.loc[:, 'y'] = coords[:, 1]
-            chunk.loc[:, 'z'] = coords[:, 2]
 
-        if grid_reference is None:
-            grid_reference = coords[0]
-
-        quantized_indices = quantize_grid_indices(coords, grid_reference, unified_dims)
-        if min_quantized_idx is None:
-            min_quantized_idx = quantized_indices.min(axis=0)
-            max_quantized_idx = quantized_indices.max(axis=0)
+        chunk_min = coords.min(axis=0)
+        chunk_max = coords.max(axis=0)
+        if all_min_bounds is None:
+            all_min_bounds = chunk_min
+            all_max_bounds = chunk_max
         else:
-            min_quantized_idx = np.minimum(min_quantized_idx, quantized_indices.min(axis=0))
-            max_quantized_idx = np.maximum(max_quantized_idx, quantized_indices.max(axis=0))
+            all_min_bounds = np.minimum(all_min_bounds, chunk_min)
+            all_max_bounds = np.maximum(all_max_bounds, chunk_max)
+
+    if all_min_bounds is None or all_max_bounds is None:
+        raise ValueError('Could not determine grid bounds from blocks file.')
+
+    dims_grid = np.ceil((all_max_bounds - all_min_bounds) / unified_dims).astype(int)
+    print('Calculated grid dimensions:', dims_grid)
+
+    print("Building domain mapping...")
+    grouped_domain_counts = {}
+    skipped_count_total = 0
+    resolved_rows = 0
+
+    for chunk in iterate_csv_with_progress(blocks_file, "Reading grid file (domain mapping)", **full_read_kwargs):
+        chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
+        if len(chunk) == 0:
+            continue
+
+        coords = chunk[['x', 'y', 'z']].to_numpy(copy=False)
+        if is_rotated:
+            coords = (coords - rotation_center) @ rotation_matrix.T
+
+        grid_indices = np.floor((coords - all_min_bounds) / unified_dims + 1e-6).astype(int)
 
         if 'Domain' in chunk.columns:
             domains = chunk['Domain'].fillna("Undomained").astype(str).str.strip().replace('', "Undomained")
@@ -913,7 +971,7 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         if skipped_domains:
             keep_mask = ~domains.isin(skipped_domains)
             skipped_count_total += int((~keep_mask).sum())
-            quantized_indices = quantized_indices[keep_mask.to_numpy()]
+            grid_indices = grid_indices[keep_mask.to_numpy()]
             domains = domains[keep_mask].reset_index(drop=True)
 
         if len(domains) == 0:
@@ -922,9 +980,9 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         resolved_rows += len(domains)
         grouped = pd.DataFrame(
             {
-                'ix': quantized_indices[:, 0],
-                'iy': quantized_indices[:, 1],
-                'iz': quantized_indices[:, 2],
+                'ix': grid_indices[:, 0],
+                'iy': grid_indices[:, 1],
+                'iz': grid_indices[:, 2],
                 'Domain': domains.to_numpy(copy=False),
             }
         ).groupby(['ix', 'iy', 'iz', 'Domain'], sort=False).size()
@@ -933,14 +991,6 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
             base_idx = (int(ix), int(iy), int(iz))
             domain_counts = grouped_domain_counts.setdefault(base_idx, Counter())
             domain_counts[str(domain)] += int(count)
-
-    if grid_reference is None or min_quantized_idx is None or max_quantized_idx is None:
-        raise ValueError('Could not determine grid bounds from blocks file.')
-
-    all_min_bounds = grid_reference + min_quantized_idx * unified_dims
-    all_max_bounds = grid_reference + max_quantized_idx * unified_dims
-    dims_grid = (max_quantized_idx - min_quantized_idx).astype(int)
-    print('Calculated grid dimensions:', dims_grid)
 
     if skipped_domains:
         print(f"Skipping domains: {skipped_domains}")
@@ -951,17 +1001,8 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
     if config:
         subblock_domain_policy = str(config.get('subblock_domain_policy', 'majority')).strip().lower() or 'majority'
 
-    shifted_domain_counts = {
-        (
-            int(base_idx[0] - min_quantized_idx[0]),
-            int(base_idx[1] - min_quantized_idx[1]),
-            int(base_idx[2] - min_quantized_idx[2]),
-        ): counts
-        for base_idx, counts in grouped_domain_counts.items()
-    }
-
     domain_mapping, subblock_counts, mixed_domain_blocks = resolve_base_block_domains_from_counts(
-        shifted_domain_counts,
+        grouped_domain_counts,
         policy=subblock_domain_policy,
     )
 
@@ -980,8 +1021,8 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         'rotation_matrix': rotation_matrix,
         'rotation_center': rotation_center,
         'is_rotated': is_rotated,
-        'grid_reference': grid_reference,
-        'min_quantized_idx': min_quantized_idx,
+        'grid_reference': np.array(all_min_bounds, copy=True),
+        'min_quantized_idx': np.zeros(3, dtype=int),
     }
 
 def create_blocks(points, values, block_size=10, verbose=False, range_size=10, max_pheromone=150,
@@ -2137,6 +2178,176 @@ def resolve_block_evaluated_samples_export_path(enabled, configured_path=None, i
     output_dir = os.path.dirname(reference_path) or '.'
     base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'interpolation'
     return os.path.join(output_dir, f"{base_name}_block_evaluated_samples.csv")
+
+
+def _sanitize_filename_fragment(value, fallback='Domain'):
+    text = str(value or '').strip()
+    if not text or text == '(None)':
+        text = fallback
+    return text.translate(INVALID_FILENAME_CHARS)
+
+
+def resolve_domain_samples_export_path(configured_path=None, samples_file=None, domain_col=None):
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    if samples_file and str(samples_file).strip():
+        reference_path = str(samples_file).strip()
+    else:
+        reference_path = 'samples.csv'
+
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'samples'
+    domain_suffix = _sanitize_filename_fragment(domain_col, fallback='Domain')
+    return os.path.join(output_dir, f"{base_name}+{domain_suffix}.csv")
+
+
+def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_header_line=1,
+                                progress_label=None):
+    delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
+    if samples_header_line and samples_header_line != 1:
+        df, _ = read_csv_with_selected_header(
+            samples_file,
+            delimiter,
+            samples_header_line,
+            expected_min_cols=3,
+            progress_label=progress_label,
+        )
+        return df, delimiter
+
+    df = read_autodetect_csv(
+        samples_file,
+        forced_delimiter=delimiter,
+        progress_label=progress_label,
+    )
+    return df, delimiter
+
+
+def resolve_sample_coordinate_columns(header_names, sample_x_col=None, sample_y_col=None, sample_z_col=None):
+    available_cols = [c for c in header_names if str(c).strip() != '']
+    if sample_x_col and sample_y_col and sample_z_col:
+        selected = [sample_x_col, sample_y_col, sample_z_col]
+        missing = [c for c in selected if c not in header_names]
+        if missing:
+            raise ValueError(f"Selected sample coordinate columns not found in file: {missing}")
+        if len(set(selected)) != 3:
+            raise ValueError(
+                "Sample coordinate columns must be three distinct columns. "
+                "If you changed the samples file, reselect X, Y, and Z."
+            )
+        return sample_x_col, sample_y_col, sample_z_col
+
+    if len(available_cols) < 3:
+        raise ValueError(
+            f"Samples file must provide at least 3 non-empty columns for coordinate mapping. Parsed headers: {header_names}"
+        )
+
+    return available_cols[0], available_cols[1], available_cols[2]
+
+
+def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=None,
+                                        samples_delimiter=None, blocks_delimiter=None,
+                                        samples_header_line=1, blocks_header_line=1,
+                                        sample_x_col=None, sample_y_col=None, sample_z_col=None,
+                                        block_x_col=None, block_y_col=None, block_z_col=None,
+                                        block_domain_col=None, block_size=None):
+    if not samples_file or not os.path.isfile(samples_file):
+        raise ValueError('Please select a valid samples file.')
+    if not blocks_file or not os.path.isfile(blocks_file):
+        raise ValueError('Please select a valid blocks file.')
+
+    domain_column_name = str(block_domain_col or '').strip()
+    if not domain_column_name or domain_column_name == '(None)':
+        raise ValueError('Please select a domain column in "Blocks Columns" first.')
+
+    if block_size is None:
+        raise ValueError('Block size must be specified for sample domaining.')
+
+    blocks_delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
+    output_file = resolve_domain_samples_export_path(
+        output_file,
+        samples_file=samples_file,
+        domain_col=domain_column_name,
+    )
+
+    print(f"Loading block domain mapping from {blocks_file}...")
+    block_metadata = load_large_blocks_metadata(
+        blocks_file,
+        blocks_delimiter,
+        blocks_header_line or 1,
+        block_size,
+        None,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=domain_column_name,
+        config=None,
+    )
+
+    print(f"Loading samples from {samples_file}...")
+    df_samples, sample_delimiter = load_full_samples_dataframe(
+        samples_file,
+        samples_delimiter=samples_delimiter,
+        samples_header_line=samples_header_line,
+        progress_label='Reading sample file',
+    )
+
+    sample_x_col, sample_y_col, sample_z_col = resolve_sample_coordinate_columns(
+        list(df_samples.columns),
+        sample_x_col=sample_x_col,
+        sample_y_col=sample_y_col,
+        sample_z_col=sample_z_col,
+    )
+
+    coord_frame = df_samples[[sample_x_col, sample_y_col, sample_z_col]].apply(pd.to_numeric, errors='coerce')
+    valid_mask = coord_frame.notna().all(axis=1)
+    valid_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
+
+    if block_metadata.get('is_rotated') and len(valid_coords) > 0:
+        rotation_center = block_metadata['rotation_center']
+        rotation_matrix = block_metadata['rotation_matrix']
+        valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
+
+    all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
+    unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
+    block_indices = np.floor((valid_coords - all_min_bounds) / unified_dims + 1e-6).astype(int)
+    domain_mapping = block_metadata['domain_mapping']
+
+    assigned_domains = []
+    matched_count = 0
+    for idx in block_indices:
+        block_idx = (int(idx[0]), int(idx[1]), int(idx[2]))
+        domain_value = domain_mapping.get(block_idx, '')
+        if domain_value != '':
+            matched_count += 1
+        assigned_domains.append(domain_value)
+
+    output_dir = os.path.dirname(output_file) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_df = df_samples.copy()
+    domain_series = pd.Series([''] * len(output_df), index=output_df.index, dtype=object)
+    domain_series.loc[valid_mask] = assigned_domains
+    output_df[domain_column_name] = domain_series
+    output_df.to_csv(output_file, index=False, sep=sample_delimiter)
+
+    invalid_coordinate_count = int((~valid_mask).sum())
+    unmatched_count = int(len(output_df) - matched_count)
+    print(f"Exported {len(output_df):,} domained samples to {output_file}")
+    print(
+        f"Matched {matched_count:,} samples to block domains; "
+        f"{unmatched_count:,} unmatched ({invalid_coordinate_count:,} invalid coordinates)."
+    )
+
+    return {
+        'output_file': output_file,
+        'total_samples': int(len(output_df)),
+        'matched_samples': int(matched_count),
+        'unmatched_samples': int(unmatched_count),
+        'invalid_coordinate_samples': int(invalid_coordinate_count),
+        'domain_column': domain_column_name,
+    }
 
 
 def _collect_export_block_data(blocks):
@@ -3481,6 +3692,11 @@ if __name__ == "__main__":
             files_form = QtWidgets.QFormLayout()
             files_tab.setLayout(files_form)
             tabs.addTab(files_tab, "Files & Data")
+
+            operations_tab = QtWidgets.QWidget()
+            operations_form = QtWidgets.QFormLayout()
+            operations_tab.setLayout(operations_form)
+            tabs.addTab(operations_tab, "Operations")
             
             # Tab 2: Ant Colony Parameters
             ant_tab = QtWidgets.QWidget()
@@ -3723,6 +3939,54 @@ if __name__ == "__main__":
             # Initial refresh (silent if files missing)
             refresh_sample_columns()
             refresh_block_columns()
+
+            def suggested_domain_samples_path():
+                sample_path = self.samples_edit.text().strip()
+                base_name = os.path.splitext(os.path.basename(sample_path))[0] if sample_path else ''
+                output_dir = os.path.dirname(sample_path) if sample_path else '.'
+                domain_name = self.block_domain_col.currentText() if hasattr(self, 'block_domain_col') else 'Domain'
+                domain_suffix = _sanitize_filename_fragment(domain_name, fallback='Domain')
+                filename = f"{base_name}+{domain_suffix}.csv" if base_name else f"samples+{domain_suffix}.csv"
+                return os.path.join(output_dir or '.', filename)
+
+            self.domain_samples_output_edit = QtWidgets.QLineEdit('')
+            self.domain_samples_browse = QtWidgets.QPushButton('Browse')
+            self.start_domaining_btn = QtWidgets.QPushButton('Start Domaining')
+            self._domain_samples_auto_path = ''
+
+            def refresh_domain_samples_output_path(force=False):
+                suggested = suggested_domain_samples_path()
+                current = self.domain_samples_output_edit.text().strip()
+                if force or not current or current == self._domain_samples_auto_path:
+                    self.domain_samples_output_edit.setText(suggested)
+                self._domain_samples_auto_path = suggested
+
+            def browse_domain_samples_output():
+                initial_path = self.domain_samples_output_edit.text().strip() or suggested_domain_samples_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Domain Samples Output File',
+                    initial_path,
+                    'CSV Files (*.csv)'
+                )
+                if path:
+                    self.domain_samples_output_edit.setText(path)
+
+            domain_samples_group = QtWidgets.QGroupBox('Domain Samples')
+            domain_samples_form = QtWidgets.QFormLayout()
+            domain_samples_group.setLayout(domain_samples_form)
+            domain_output_layout = QtWidgets.QHBoxLayout()
+            domain_output_layout.addWidget(self.domain_samples_output_edit)
+            domain_output_layout.addWidget(self.domain_samples_browse)
+            domain_samples_form.addRow('Output File', domain_output_layout)
+            domain_samples_form.addRow('', self.start_domaining_btn)
+            operations_form.addRow(domain_samples_group)
+
+            self.domain_samples_browse.clicked.connect(browse_domain_samples_output)
+            self.start_domaining_btn.clicked.connect(self.run_domain_samples_only)
+            self.samples_edit.textChanged.connect(lambda _: refresh_domain_samples_output_path())
+            self.block_domain_col.currentTextChanged.connect(lambda _: refresh_domain_samples_output_path())
+            refresh_domain_samples_output_path(force=True)
 
             # === ANT COLONY TAB ===
             def dbl_spin(default, minv, maxv, step=0.1):
@@ -4092,6 +4356,7 @@ if __name__ == "__main__":
                 'interpolation_file': self.interp_edit.text(),
                 'export_block_evaluated_samples': self.block_evaluated_samples_enabled.isChecked(),
                 'block_evaluated_samples_file': self.block_evaluated_samples_edit.text(),
+                'domain_samples_file': self.domain_samples_output_edit.text(),
                 'algorithm': self.algorithm_combo.currentText(),
                 'second_pass_algorithm': self.second_pass_combo.currentText(),
                 'samples_delimiter': self.samples_delim.currentText(),
@@ -4184,6 +4449,7 @@ if __name__ == "__main__":
                 if 'block_y_col' in config: self.block_y_col.setCurrentText(config['block_y_col'])
                 if 'block_z_col' in config: self.block_z_col.setCurrentText(config['block_z_col'])
                 if 'block_domain_col' in config: self.block_domain_col.setCurrentText(config['block_domain_col'])
+                if 'domain_samples_file' in config: self.domain_samples_output_edit.setText(config['domain_samples_file'])
             
                 if 'block_size' in config:
                     bs = config['block_size']
@@ -4368,6 +4634,64 @@ if __name__ == "__main__":
                     self.domain_mapping_btn.setText(f'Configure Domain Algorithms... ({count} configured)')
                 else:
                     self.domain_mapping_btn.setText('Configure Domain Algorithms...')
+
+        def run_domain_samples_only(self):
+            """Assign block domains directly to the samples file and export the result."""
+            cursor_set = False
+            try:
+                cfg = self.to_dict()
+                output_file = resolve_domain_samples_export_path(
+                    cfg.get('domain_samples_file'),
+                    samples_file=cfg.get('samples_file'),
+                    domain_col=cfg.get('block_domain_col'),
+                )
+                self.domain_samples_output_edit.setText(output_file)
+
+                print("=" * 60)
+                print("Assigning sample domains from blocks...")
+                print("=" * 60)
+
+                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+                cursor_set = True
+                result = export_domained_samples_from_blocks(
+                    cfg.get('samples_file'),
+                    cfg.get('blocks_file'),
+                    output_file=output_file,
+                    samples_delimiter=cfg.get('samples_delimiter'),
+                    blocks_delimiter=cfg.get('blocks_delimiter'),
+                    samples_header_line=cfg.get('samples_header_line', 1),
+                    blocks_header_line=cfg.get('blocks_header_line', 1),
+                    sample_x_col=cfg.get('sample_x_col'),
+                    sample_y_col=cfg.get('sample_y_col'),
+                    sample_z_col=cfg.get('sample_z_col'),
+                    block_x_col=cfg.get('block_x_col'),
+                    block_y_col=cfg.get('block_y_col'),
+                    block_z_col=cfg.get('block_z_col'),
+                    block_domain_col=cfg.get('block_domain_col'),
+                    block_size=cfg.get('block_size'),
+                )
+                QtWidgets.QApplication.restoreOverrideCursor()
+                cursor_set = False
+
+                print("=" * 60)
+                QtWidgets.QMessageBox.information(
+                    self,
+                    'Success',
+                    (
+                        f"Domaining complete!\nResults saved to:\n{result['output_file']}\n\n"
+                        f"Domain column: {result['domain_column']}\n"
+                        f"Matched samples: {result['matched_samples']:,}\n"
+                        f"Unmatched samples: {result['unmatched_samples']:,}\n"
+                        f"Invalid coordinates: {result['invalid_coordinate_samples']:,}"
+                    ),
+                )
+            except Exception as e:
+                print(f"Error during sample domaining: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during sample domaining:\n{str(e)}')
+            finally:
+                if cursor_set:
+                    QtWidgets.QApplication.restoreOverrideCursor()
         
         def run_interpolation_only(self):
             """Run interpolation without visualization"""
