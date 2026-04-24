@@ -10,6 +10,7 @@ import time
 import tempfile
 import subprocess
 import traceback
+import warnings
 from tqdm import tqdm
 import sys
 import os
@@ -69,6 +70,29 @@ def _write_json_atomic(path, data):
         json.dump(data, handle, indent=4)
         temp_path = handle.name
     os.replace(temp_path, path)
+
+
+class BackgroundOperationWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int, int, str)
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str, str)
+
+    def __init__(self, operation, kwargs):
+        super().__init__()
+        self._operation = operation
+        self._kwargs = dict(kwargs)
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            result = self._operation(progress_callback=self._emit_progress, **self._kwargs)
+        except Exception as exc:
+            self.failed.emit(str(exc), traceback.format_exc())
+            return
+        self.finished.emit(result)
+
+    def _emit_progress(self, value, maximum=100, message=''):
+        self.progress.emit(int(value or 0), max(int(maximum or 0), 1), str(message or 'Working...'))
 
 # --- Interpolator Factory ---
 def create_interpolator(config, domain=None, current_algorithm=None):
@@ -210,10 +234,36 @@ def prepare_csv_read_kwargs(source, **read_csv_kwargs):
         prepared.setdefault('memory_map', True)
     return prepared
 
+
+def _emit_progress(progress_callback, value, maximum=100, message=''):
+    if progress_callback is None:
+        return
+    max_value = max(int(maximum or 0), 1)
+    bounded_value = max(0, min(int(value or 0), max_value))
+    progress_callback(bounded_value, max_value, str(message or ''))
+
+
+def _make_scaled_progress_callback(progress_callback, start, end, default_message=''):
+    start_value = int(start)
+    end_value = int(end)
+    span = max(end_value - start_value, 0)
+
+    def _callback(current, total, message=''):
+        total_value = max(int(total or 0), 1)
+        current_value = max(0, min(int(current or 0), total_value))
+        if span == 0:
+            mapped_value = start_value
+        else:
+            mapped_value = start_value + int(round((current_value / total_value) * span))
+        _emit_progress(progress_callback, mapped_value, 100, message or default_message)
+
+    return _callback
+
 class ProgressTextReader:
-    def __init__(self, path, label):
+    def __init__(self, path, label, progress_callback=None):
         self.path = path
         self.label = label
+        self.progress_callback = progress_callback
         self.total_bytes = max(os.path.getsize(path), 1)
         self._raw = open(path, 'rb')
         self._text = io.TextIOWrapper(self._raw, encoding='utf-8', errors='ignore', newline='')
@@ -244,6 +294,11 @@ class ProgressTextReader:
                 self._displayed_bytes = current_bytes
             if force_postfix or byte_delta >= self._refresh_bytes:
                 self._update_postfix(force=force_postfix)
+            if self.progress_callback and (byte_delta > 0 or force_postfix):
+                try:
+                    self.progress_callback(self._displayed_bytes, self.total_bytes, self.label)
+                except Exception:
+                    pass
 
     def _monitor_progress(self):
         while not self._stop_event.wait(self._monitor_interval):
@@ -298,11 +353,13 @@ class ProgressTextReader:
             self._pbar.close()
             self._text.close()
 
-def read_csv_with_progress(path, progress_label, **read_csv_kwargs):
+def read_csv_with_progress(path, progress_label, progress_callback=None, **read_csv_kwargs):
     read_csv_kwargs = prepare_csv_read_kwargs(path, **read_csv_kwargs)
     read_csv_kwargs.pop('memory_map', None)
-    with ProgressTextReader(path, progress_label) as reader:
-        df = pd.read_csv(reader.handle, **read_csv_kwargs)
+    with ProgressTextReader(path, progress_label, progress_callback=progress_callback) as reader:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', pd.errors.DtypeWarning)
+            df = pd.read_csv(reader.handle, **read_csv_kwargs)
         reader._sync_progress(force_postfix=True)
         print(f"{progress_label}: read {reader._displayed_bytes:,} bytes from {os.path.basename(path)}")
         df._approx_bytes_read = reader._displayed_bytes
@@ -313,14 +370,12 @@ def iterate_csv_with_progress(path, progress_label, progress_callback=None, **re
     read_csv_kwargs.pop('memory_map', None)
 
     def _generator():
-        with ProgressTextReader(path, progress_label) as reader:
-            for chunk in pd.read_csv(reader.handle, **read_csv_kwargs):
-                if progress_callback:
-                    progress_callback(reader._raw.tell(), reader.total_bytes, progress_label)
-                yield chunk
+        with ProgressTextReader(path, progress_label, progress_callback=progress_callback) as reader:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', pd.errors.DtypeWarning)
+                for chunk in pd.read_csv(reader.handle, **read_csv_kwargs):
+                    yield chunk
             reader._sync_progress(force_postfix=True)
-            if progress_callback:
-                progress_callback(reader._displayed_bytes, reader.total_bytes, progress_label)
             print(f"{progress_label}: read {reader._displayed_bytes:,} bytes from {os.path.basename(path)}")
 
     return _generator()
@@ -393,6 +448,231 @@ def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_
         parsed_cols = None
     return df, parsed_cols, None
 
+
+def normalize_selected_sample_domain_column(df, sample_domain_col=None):
+    selected_domain_col = str(sample_domain_col or '').strip()
+    if selected_domain_col and selected_domain_col != '(None)':
+        if selected_domain_col not in df.columns:
+            raise ValueError(f"Selected sample domain column not found in samples file: {selected_domain_col}")
+        if selected_domain_col != 'Domain':
+            df = df.copy()
+            df['Domain'] = df[selected_domain_col]
+        return df
+
+    domain_like = None
+    for column_name in df.columns:
+        if str(column_name).strip().lower() == 'domain':
+            domain_like = column_name
+            break
+    if domain_like and domain_like != 'Domain':
+        df = df.rename(columns={domain_like: 'Domain'})
+    return df
+
+
+def infer_sample_domains_from_blocks(sample_coords, blocks_file, block_size,
+                                     blocks_delimiter=None, blocks_header_line=1,
+                                     block_x_col=None, block_y_col=None, block_z_col=None,
+                                     block_domain_col=None, progress_callback=None):
+    coords = np.asarray(sample_coords, dtype=float)
+    if len(coords) == 0:
+        return np.empty(0, dtype=object)
+    if not blocks_file or not os.path.isfile(blocks_file):
+        raise ValueError('A valid blocks file is required to infer blank sample domains from blocks.')
+    if block_size is None:
+        raise ValueError('Block size must be specified to infer blank sample domains from blocks.')
+
+    domain_column_name = str(block_domain_col or '').strip()
+    if not domain_column_name or domain_column_name == '(None)':
+        raise ValueError('A blocks domain column must be selected to infer blank sample domains from blocks.')
+
+    delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
+    block_metadata = load_large_blocks_metadata(
+        blocks_file,
+        delimiter,
+        blocks_header_line or 1,
+        block_size,
+        None,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=domain_column_name,
+        config=None,
+        progress_callback=progress_callback,
+    )
+
+    coords_for_mapping = coords
+    if block_metadata.get('is_rotated') and len(coords_for_mapping) > 0:
+        rotation_center = block_metadata['rotation_center']
+        rotation_matrix = block_metadata['rotation_matrix']
+        coords_for_mapping = (coords_for_mapping - rotation_center) @ rotation_matrix.T
+
+    all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
+    unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
+    sample_block_indices = np.floor((coords_for_mapping - all_min_bounds) / unified_dims + 1e-6).astype(int)
+    domain_mapping = block_metadata['domain_mapping']
+
+    return np.array(
+        [domain_mapping.get((int(idx[0]), int(idx[1]), int(idx[2])), '') for idx in sample_block_indices],
+        dtype=object,
+    )
+
+
+def apply_blank_sample_domain_behavior(df, blank_domain_behavior='skip', domain_col='Domain',
+                                       x_col='x', y_col='y', z_col='z',
+                                       blocks_file=None, blocks_delimiter=None, blocks_header_line=1,
+                                       block_x_col=None, block_y_col=None, block_z_col=None,
+                                       block_domain_col=None, block_size=None, progress_callback=None):
+    if domain_col not in df.columns:
+        return df, {'blank_domains': 0, 'inferred_domains': 0, 'remaining_blank_domains': 0}
+
+    updated_df = df.copy()
+    stripped_domains = updated_df[domain_col].fillna('').astype(str).str.strip()
+    blank_mask = updated_df[domain_col].isna() | (stripped_domains == '') | (stripped_domains.str.lower() == 'nan')
+    blank_count = int(blank_mask.sum())
+    updated_df[domain_col] = stripped_domains
+    if blank_count == 0:
+        return updated_df, {'blank_domains': 0, 'inferred_domains': 0, 'remaining_blank_domains': 0}
+
+    inferred_count = 0
+    behavior = str(blank_domain_behavior or 'skip').strip().lower()
+    if behavior == 'infer_from_blocks':
+        requirements_ready = bool(
+            blocks_file and str(blocks_file).strip() and block_size is not None
+            and str(block_domain_col or '').strip() and str(block_domain_col or '').strip() != '(None)'
+        )
+        if not requirements_ready:
+            print(
+                'Blank sample domain behavior is set to infer from blocks, but block metadata settings are incomplete. '
+                'Blank-domain samples will be skipped.'
+            )
+        else:
+            coord_frame = updated_df.loc[blank_mask, [x_col, y_col, z_col]].apply(pd.to_numeric, errors='coerce')
+            valid_coord_mask = coord_frame.notna().all(axis=1)
+            inferable_index = coord_frame.index[valid_coord_mask]
+            skipped_invalid = int((~valid_coord_mask).sum())
+            if skipped_invalid:
+                print(
+                    f'Skipping {skipped_invalid:,} blank-domain samples with invalid coordinates during domain inference.'
+                )
+            if len(inferable_index) > 0:
+                print(f'Attempting to infer domains for {len(inferable_index):,} blank-domain samples from blocks...')
+                inferred_domains = infer_sample_domains_from_blocks(
+                    coord_frame.loc[inferable_index].to_numpy(copy=False),
+                    blocks_file,
+                    block_size,
+                    blocks_delimiter=blocks_delimiter,
+                    blocks_header_line=blocks_header_line,
+                    block_x_col=block_x_col,
+                    block_y_col=block_y_col,
+                    block_z_col=block_z_col,
+                    block_domain_col=block_domain_col,
+                    progress_callback=progress_callback,
+                )
+                inferred_series = pd.Series(inferred_domains, index=inferable_index, dtype=object).fillna('').astype(str).str.strip()
+                inferred_mask = (inferred_series != '') & (inferred_series.str.lower() != 'nan')
+                if inferred_mask.any():
+                    updated_df.loc[inferred_series.index[inferred_mask], domain_col] = inferred_series.loc[inferred_mask]
+                    inferred_count = int(inferred_mask.sum())
+                    print(f'Inferred domains for {inferred_count:,} blank-domain samples from blocks.')
+                unresolved_count = int((~inferred_mask).sum())
+                if unresolved_count:
+                    print(f'Could not infer domains for {unresolved_count:,} blank-domain samples; they will be skipped.')
+
+    final_domains = updated_df[domain_col].fillna('').astype(str).str.strip()
+    updated_df[domain_col] = final_domains
+    remaining_blank_mask = (final_domains == '') | (final_domains.str.lower() == 'nan')
+    return updated_df, {
+        'blank_domains': int(blank_count),
+        'inferred_domains': int(inferred_count),
+        'remaining_blank_domains': int(remaining_blank_mask.sum()),
+    }
+
+
+def ensure_sample_domains_for_domain_operations(df, sample_domain_col=None, blank_domain_behavior='skip',
+                                                x_col='x', y_col='y', z_col='z',
+                                                blocks_file=None, blocks_delimiter=None, blocks_header_line=1,
+                                                block_x_col=None, block_y_col=None, block_z_col=None,
+                                                block_domain_col=None, block_size=None, progress_callback=None):
+    updated_df = normalize_selected_sample_domain_column(df, sample_domain_col=sample_domain_col)
+    if 'Domain' not in updated_df.columns:
+        print('No sample domain column available. Inferring domains for all samples from blocks...')
+        updated_df = updated_df.copy()
+        updated_df['Domain'] = ''
+        coord_frame = updated_df[[x_col, y_col, z_col]].apply(pd.to_numeric, errors='coerce')
+        valid_coord_mask = coord_frame.notna().all(axis=1)
+        inferable_index = coord_frame.index[valid_coord_mask]
+        skipped_invalid = int((~valid_coord_mask).sum())
+        if skipped_invalid:
+            print(f'Skipping {skipped_invalid:,} samples with invalid coordinates during full domain inference.')
+        if len(inferable_index) > 0:
+            inferred_domains = infer_sample_domains_from_blocks(
+                coord_frame.loc[inferable_index].to_numpy(copy=False),
+                blocks_file,
+                block_size,
+                blocks_delimiter=blocks_delimiter,
+                blocks_header_line=blocks_header_line,
+                block_x_col=block_x_col,
+                block_y_col=block_y_col,
+                block_z_col=block_z_col,
+                block_domain_col=block_domain_col,
+                progress_callback=progress_callback,
+            )
+            inferred_series = pd.Series(inferred_domains, index=inferable_index, dtype=object).fillna('').astype(str).str.strip()
+            updated_df.loc[inferred_series.index, 'Domain'] = inferred_series
+            inferred_count = int(((inferred_series != '') & (inferred_series.str.lower() != 'nan')).sum())
+            print(f'Inferred domains for {inferred_count:,} samples from blocks.')
+
+    return apply_blank_sample_domain_behavior(
+        updated_df,
+        blank_domain_behavior=blank_domain_behavior,
+        domain_col='Domain',
+        x_col=x_col,
+        y_col=y_col,
+        z_col=z_col,
+        blocks_file=blocks_file,
+        blocks_delimiter=blocks_delimiter,
+        blocks_header_line=blocks_header_line,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=block_domain_col,
+        block_size=block_size,
+        progress_callback=progress_callback,
+    )
+
+
+def should_resolve_sample_domains_for_interpolation(wants_domain_any, blocks_file=None, block_domain_col=None):
+    return bool(
+        wants_domain_any
+        or (
+            blocks_file
+            and str(block_domain_col or '').strip()
+            and str(block_domain_col or '').strip() != '(None)'
+        )
+    )
+
+
+def compute_domain_sensitive_assignment_mask(block_indices, allowed_grid, domain_mapping=None, sample_domains=None):
+    indices_array = np.asarray(block_indices, dtype=int)
+    allowed_mask = np.array([tuple(idx) in allowed_grid for idx in indices_array], dtype=bool)
+    if sample_domains is None or domain_mapping is None:
+        return allowed_mask
+
+    domains_array = np.asarray(sample_domains, dtype=object)
+    if len(domains_array) != len(indices_array):
+        raise ValueError('Sample domains length must match block indices length for domain-sensitive assignment.')
+
+    domain_match_mask = np.zeros(len(indices_array), dtype=bool)
+    for index, idx in enumerate(indices_array):
+        if not allowed_mask[index]:
+            continue
+        sample_domain = str(domains_array[index]).strip() if domains_array[index] is not None else ''
+        if not sample_domain or sample_domain.lower() == 'nan':
+            continue
+        block_domain = str(domain_mapping.get(tuple(idx), '')).strip()
+        domain_match_mask[index] = sample_domain == block_domain
+    return allowed_mask & domain_match_mask
+
 def build_domain_catalog_cache_signature(blocks_file, delimiter, header_line, domain_col):
     stats = os.stat(blocks_file)
     return {
@@ -441,7 +721,8 @@ def quantize_grid_indices(coords, reference_origin, block_size):
     rounded = np.rint(scaled)
     return rounded.astype(np.int64)
 
-def read_csv_with_selected_header(path, delimiter, header_line, expected_min_cols=1, progress_label=None):
+def read_csv_with_selected_header(path, delimiter, header_line, expected_min_cols=1,
+                                  progress_label=None, progress_callback=None):
     """Read CSV using a specific header line (1-based). Returns DataFrame.
     Uses manual header parsing to build names and then pandas read_csv with skiprows.
     """
@@ -455,7 +736,7 @@ def read_csv_with_selected_header(path, delimiter, header_line, expected_min_col
         comment='#'
     )
     if progress_label:
-        df = read_csv_with_progress(path, progress_label, **read_kwargs)
+        df = read_csv_with_progress(path, progress_label, progress_callback=progress_callback, **read_kwargs)
     else:
         df = pd.read_csv(path, **prepare_csv_read_kwargs(path, **read_kwargs))
     if df.shape[0] and all(str(df.iloc[0, i]).strip() == final_names[i] for i in range(min(len(final_names), df.shape[1]))):
@@ -493,7 +774,8 @@ def detect_csv_delimiter(path):
     delim = max(counts, key=counts.get)
     return delim if counts[delim] > 0 else ','
 
-def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=None):
+def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=None,
+                        progress_callback=None):
     """Read a CSV file detecting delimiter (comma, semicolon, tab, pipe) unless forced.
     Drops empty columns. Returns DataFrame."""
     if not os.path.isfile(path):
@@ -503,7 +785,7 @@ def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=
     def base_read(delimiter):
         read_kwargs = dict(delimiter=delimiter, comment='#')
         if progress_label:
-            return read_csv_with_progress(path, progress_label, **read_kwargs)
+            return read_csv_with_progress(path, progress_label, progress_callback=progress_callback, **read_kwargs)
         return pd.read_csv(path, **prepare_csv_read_kwargs(path, **read_kwargs))
 
     try:
@@ -856,7 +1138,7 @@ def normalize_block_chunk(chunk, rename_map, domain_copy_source=None):
 
 def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, points,
                                block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
-                               config=None):
+                               config=None, progress_callback=None):
     headers = parse_header_line(blocks_file, delimiter, header_line)
     final_names = build_unique_column_names(headers)
     selected_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
@@ -894,7 +1176,13 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
     rotation_sample_target = 10_000
     rotation_samples = []
     print("Reading grid file (rotation sample)")
-    for chunk in iterate_csv_with_progress(blocks_file, "Reading grid file (rotation sample)", **base_read_kwargs):
+    rotation_progress = _make_scaled_progress_callback(progress_callback, 0, 20, 'Reading grid file (rotation sample)')
+    for chunk in iterate_csv_with_progress(
+        blocks_file,
+        "Reading grid file (rotation sample)",
+        progress_callback=rotation_progress,
+        **base_read_kwargs,
+    ):
         chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
         if len(chunk) == 0:
             continue
@@ -906,6 +1194,7 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         raise ValueError("Blocks file had no valid coordinate rows to sample for rotation detection.")
 
     sample_points = np.concatenate(rotation_samples, axis=0)
+    _emit_progress(progress_callback, 22, 100, 'Detecting grid rotation...')
     rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(sample_points, block_size_hint=block_size)
 
     if block_size is not None:
@@ -923,7 +1212,13 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
 
     full_read_kwargs = dict(base_read_kwargs)
 
-    for chunk in iterate_csv_with_progress(blocks_file, "Reading grid file (bounds)", **full_read_kwargs):
+    bounds_progress = _make_scaled_progress_callback(progress_callback, 25, 60, 'Reading grid file (bounds)')
+    for chunk in iterate_csv_with_progress(
+        blocks_file,
+        "Reading grid file (bounds)",
+        progress_callback=bounds_progress,
+        **full_read_kwargs,
+    ):
         chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
         if len(chunk) == 0:
             continue
@@ -944,6 +1239,7 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
     if all_min_bounds is None or all_max_bounds is None:
         raise ValueError('Could not determine grid bounds from blocks file.')
 
+    _emit_progress(progress_callback, 62, 100, 'Calculating grid dimensions...')
     dims_grid = np.ceil((all_max_bounds - all_min_bounds) / unified_dims).astype(int)
     print('Calculated grid dimensions:', dims_grid)
 
@@ -952,7 +1248,13 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
     skipped_count_total = 0
     resolved_rows = 0
 
-    for chunk in iterate_csv_with_progress(blocks_file, "Reading grid file (domain mapping)", **full_read_kwargs):
+    mapping_progress = _make_scaled_progress_callback(progress_callback, 65, 100, 'Reading grid file (domain mapping)')
+    for chunk in iterate_csv_with_progress(
+        blocks_file,
+        "Reading grid file (domain mapping)",
+        progress_callback=mapping_progress,
+        **full_read_kwargs,
+    ):
         chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
         if len(chunk) == 0:
             continue
@@ -1276,7 +1578,16 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         points_array = np.array(points)
         values_array = np.array(values)
         block_indices = np.floor((points_array - all_min_bounds) / unified_dims + 1e-6).astype(int)
-        assigned_mask = np.array([tuple(idx) in allowed_grid for idx in block_indices], dtype=bool)
+        allowed_mask = np.array([tuple(idx) in allowed_grid for idx in block_indices], dtype=bool)
+        assigned_mask = compute_domain_sensitive_assignment_mask(
+            block_indices,
+            allowed_grid,
+            domain_mapping=domain_mapping,
+            sample_domains=sample_domains,
+        )
+        domain_mismatch_count = int(np.count_nonzero(allowed_mask & ~assigned_mask))
+        if domain_mismatch_count:
+            print(f"Rejected {domain_mismatch_count:,} samples whose domain does not match their target block domain.")
         
         # Create lookup for allowed blocks
         sample_blocks_dict = {}
@@ -2203,8 +2514,24 @@ def resolve_domain_samples_export_path(configured_path=None, samples_file=None, 
     return os.path.join(output_dir, f"{base_name}+{domain_suffix}.csv")
 
 
+def resolve_block_domain_metrics_export_path(configured_path=None, blocks_file=None, domain_col=None):
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    if blocks_file and str(blocks_file).strip():
+        reference_path = str(blocks_file).strip()
+    else:
+        reference_path = 'blocks.csv'
+
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'blocks'
+    domain_suffix = _sanitize_filename_fragment(domain_col, fallback='Domain')
+    return os.path.join(output_dir, f"{base_name}+{domain_suffix}_sample_metrics.csv")
+
+
 def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_header_line=1,
-                                progress_label=None):
+                                progress_label=None, progress_callback=None):
     delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
     if samples_header_line and samples_header_line != 1:
         df, _ = read_csv_with_selected_header(
@@ -2213,6 +2540,7 @@ def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_he
             samples_header_line,
             expected_min_cols=3,
             progress_label=progress_label,
+            progress_callback=progress_callback,
         )
         return df, delimiter
 
@@ -2220,6 +2548,30 @@ def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_he
         samples_file,
         forced_delimiter=delimiter,
         progress_label=progress_label,
+        progress_callback=progress_callback,
+    )
+    return df, delimiter
+
+
+def load_full_blocks_dataframe(blocks_file, blocks_delimiter=None, blocks_header_line=1,
+                               progress_label=None, progress_callback=None):
+    delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
+    if blocks_header_line and blocks_header_line != 1:
+        df, _ = read_csv_with_selected_header(
+            blocks_file,
+            delimiter,
+            blocks_header_line,
+            expected_min_cols=3,
+            progress_label=progress_label,
+            progress_callback=progress_callback,
+        )
+        return df, delimiter
+
+    df = read_autodetect_csv(
+        blocks_file,
+        forced_delimiter=delimiter,
+        progress_label=progress_label,
+        progress_callback=progress_callback,
     )
     return df, delimiter
 
@@ -2246,12 +2598,495 @@ def resolve_sample_coordinate_columns(header_names, sample_x_col=None, sample_y_
     return available_cols[0], available_cols[1], available_cols[2]
 
 
+def resolve_block_coordinate_columns(header_names, block_x_col=None, block_y_col=None, block_z_col=None):
+    available_cols = [c for c in header_names if str(c).strip() != '']
+    if block_x_col and block_y_col and block_z_col:
+        selected = [block_x_col, block_y_col, block_z_col]
+        missing = [c for c in selected if c not in header_names]
+        if missing:
+            raise ValueError(f"Selected block coordinate columns not found in file: {missing}")
+        if len(set(selected)) != 3:
+            raise ValueError(
+                "Block coordinate columns must be three distinct columns. "
+                "If you changed the blocks file, reselect X, Y, and Z."
+            )
+        return block_x_col, block_y_col, block_z_col
+
+    if len(available_cols) < 3:
+        raise ValueError(
+            f"Blocks file must provide at least 3 non-empty columns for coordinate mapping. Parsed headers: {header_names}"
+        )
+
+    return available_cols[0], available_cols[1], available_cols[2]
+
+
+def summarize_sample_filter_spec(filter_spec):
+    field = str(filter_spec.get('field', '')).strip()
+    filter_type = str(filter_spec.get('type', '')).strip().lower()
+    if filter_type == 'categorical':
+        values = [str(value) for value in filter_spec.get('values', [])]
+        preview = ', '.join(values[:5])
+        if len(values) > 5:
+            preview += ', ...'
+        return f"{field} in [{preview}]"
+    if filter_type == 'numeric':
+        min_value = filter_spec.get('min', None)
+        max_value = filter_spec.get('max', None)
+        if min_value is None and max_value is None:
+            return f"{field}: all numeric values"
+        if min_value is None:
+            return f"{field} <= {max_value}"
+        if max_value is None:
+            return f"{field} >= {min_value}"
+        return f"{field} in [{min_value}, {max_value}]"
+    return field or 'Invalid filter'
+
+
+def apply_sample_filters(df_samples, sample_filters=None):
+    if not sample_filters:
+        return df_samples.copy(), []
+
+    filtered_df = df_samples.copy()
+    applied_filters = []
+
+    for raw_filter in sample_filters:
+        filter_spec = dict(raw_filter or {})
+        field = str(filter_spec.get('field', '')).strip()
+        filter_type = str(filter_spec.get('type', '')).strip().lower()
+
+        if not field:
+            raise ValueError('Each sample filter must define a field name.')
+        if field not in filtered_df.columns:
+            raise ValueError(f'Sample filter field not found in samples file: {field}')
+
+        series = filtered_df[field]
+        if filter_type == 'categorical':
+            raw_values = filter_spec.get('values', [])
+            allowed_values = [str(value) for value in raw_values]
+            if not allowed_values:
+                raise ValueError(f'Categorical filter for {field} must include at least one value.')
+            mask = series.fillna('').astype(str).isin(allowed_values)
+        elif filter_type == 'numeric':
+            numeric_series = pd.to_numeric(series, errors='coerce')
+            min_value = filter_spec.get('min', None)
+            max_value = filter_spec.get('max', None)
+            if min_value in ('', None):
+                min_value = None
+            else:
+                min_value = float(min_value)
+            if max_value in ('', None):
+                max_value = None
+            else:
+                max_value = float(max_value)
+            if min_value is not None and max_value is not None and min_value > max_value:
+                raise ValueError(f'Numeric filter for {field} has min greater than max.')
+
+            mask = numeric_series.notna()
+            if min_value is not None:
+                mask &= numeric_series >= min_value
+            if max_value is not None:
+                mask &= numeric_series <= max_value
+            filter_spec['min'] = min_value
+            filter_spec['max'] = max_value
+        else:
+            raise ValueError(f'Unsupported sample filter type for {field}: {filter_type}')
+
+        filtered_df = filtered_df.loc[mask].copy()
+        applied_filters.append({
+            'field': field,
+            'type': filter_type,
+            'summary': summarize_sample_filter_spec(filter_spec),
+        })
+
+    return filtered_df, applied_filters
+
+
+def _compute_point_to_set_distance_stats(query_points, reference_points, query_chunk_size=1024,
+                                         reference_chunk_size=4096, progress_callback=None,
+                                         progress_label='Computing distance statistics',
+                                         return_nearest_index=False):
+    query_points = np.asarray(query_points, dtype=float)
+    reference_points = np.asarray(reference_points, dtype=float)
+
+    if len(query_points) == 0:
+        nearest_empty = np.empty(0, dtype=float)
+        average_empty = np.empty(0, dtype=float)
+        if return_nearest_index:
+            return nearest_empty, average_empty, np.empty(0, dtype=int)
+        return nearest_empty, average_empty
+    if len(reference_points) == 0:
+        nan_values = np.full(len(query_points), np.nan, dtype=float)
+        if return_nearest_index:
+            return nan_values.copy(), nan_values, np.full(len(query_points), -1, dtype=int)
+        return nan_values.copy(), nan_values
+
+    nearest = np.empty(len(query_points), dtype=float)
+    average = np.empty(len(query_points), dtype=float)
+    nearest_indices = np.full(len(query_points), -1, dtype=int) if return_nearest_index else None
+
+    for query_start in range(0, len(query_points), query_chunk_size):
+        query_end = min(query_start + query_chunk_size, len(query_points))
+        query_chunk = query_points[query_start:query_end]
+        chunk_nearest = np.full(len(query_chunk), np.inf, dtype=float)
+        chunk_distance_sum = np.zeros(len(query_chunk), dtype=float)
+        chunk_count = 0
+        chunk_nearest_indices = np.full(len(query_chunk), -1, dtype=int) if return_nearest_index else None
+
+        for reference_start in range(0, len(reference_points), reference_chunk_size):
+            reference_end = min(reference_start + reference_chunk_size, len(reference_points))
+            reference_chunk = reference_points[reference_start:reference_end]
+            deltas = query_chunk[:, None, :] - reference_chunk[None, :, :]
+            distances = np.sqrt(np.sum(deltas * deltas, axis=2))
+            chunk_min_indices = distances.argmin(axis=1)
+            chunk_min_values = distances[np.arange(len(query_chunk)), chunk_min_indices]
+            update_mask = chunk_min_values < chunk_nearest
+            chunk_nearest = np.minimum(chunk_nearest, chunk_min_values)
+            if return_nearest_index and np.any(update_mask):
+                chunk_nearest_indices[update_mask] = reference_start + chunk_min_indices[update_mask]
+            chunk_distance_sum += distances.sum(axis=1)
+            chunk_count += distances.shape[1]
+
+        nearest[query_start:query_end] = chunk_nearest
+        average[query_start:query_end] = chunk_distance_sum / max(chunk_count, 1)
+        if return_nearest_index:
+            nearest_indices[query_start:query_end] = chunk_nearest_indices
+        if progress_callback:
+            progress_callback(query_end, len(query_points), progress_label)
+
+    if return_nearest_index:
+        return nearest, average, nearest_indices
+    return nearest, average
+
+
+def build_concatenated_sample_ids(sample_df, id_columns):
+    selected_columns = []
+    for column_name in id_columns or []:
+        normalized = str(column_name or '').strip()
+        if not normalized or normalized == '(None)' or normalized in selected_columns:
+            continue
+        if normalized not in sample_df.columns:
+            raise ValueError(f'Selected closest-sample ID column not found in samples file: {normalized}')
+        selected_columns.append(normalized)
+
+    if not selected_columns:
+        return None, []
+
+    def stringify(value):
+        if pd.isna(value):
+            return ''
+        return str(value).strip()
+
+    concatenated = sample_df[selected_columns].apply(
+        lambda row: ' | '.join(part for part in (stringify(value) for value in row) if part),
+        axis=1,
+    )
+    return concatenated.to_numpy(dtype=object, copy=False), selected_columns
+
+
+def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=None,
+                                       samples_delimiter=None, blocks_delimiter=None,
+                                       samples_header_line=1, blocks_header_line=1,
+                                       sample_x_col=None, sample_y_col=None, sample_z_col=None,
+                                       sample_domain_col=None,
+                                       closest_sample_id_cols=None,
+                                       block_x_col=None, block_y_col=None, block_z_col=None,
+                                       block_domain_col=None, block_size=None,
+                                       sample_filters=None, progress_callback=None,
+                                       blank_sample_domain_behavior='skip'):
+    if not samples_file or not os.path.isfile(samples_file):
+        raise ValueError('Please select a valid samples file.')
+    if not blocks_file or not os.path.isfile(blocks_file):
+        raise ValueError('Please select a valid blocks file.')
+
+    domain_column_name = str(block_domain_col or '').strip()
+    if not domain_column_name or domain_column_name == '(None)':
+        raise ValueError('Please select a domain column in "Blocks Columns" first.')
+    sample_domain_column_name = str(sample_domain_col or '').strip()
+    use_explicit_sample_domains = bool(sample_domain_column_name and sample_domain_column_name != '(None)')
+
+    blocks_delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
+    output_file = resolve_block_domain_metrics_export_path(
+        output_file,
+        blocks_file=blocks_file,
+        domain_col=domain_column_name,
+    )
+    _emit_progress(progress_callback, 0, 100, 'Preparing block-domain sample metrics export...')
+    block_metadata = None
+    if not use_explicit_sample_domains:
+        if block_size is None:
+            raise ValueError('Block size must be specified for block domain metrics when no sample domain column is configured.')
+
+        print(
+            f"Using inferred sample-domain matching: samples will be mapped into block domains using block size {block_size}."
+        )
+        print(f"Loading block domain mapping from {blocks_file}...")
+        block_metadata = load_large_blocks_metadata(
+            blocks_file,
+            blocks_delimiter,
+            blocks_header_line or 1,
+            block_size,
+            None,
+            block_x_col=block_x_col,
+            block_y_col=block_y_col,
+            block_z_col=block_z_col,
+            block_domain_col=domain_column_name,
+            config=None,
+            progress_callback=_make_scaled_progress_callback(progress_callback, 0, 30, 'Loading block domain mapping...'),
+        )
+    else:
+        print(
+            f"Using explicit domain matching: sample column '{sample_domain_column_name}' -> block column '{domain_column_name}'. "
+            f"Skipping block-size domain inference."
+        )
+
+    print(f"Loading samples from {samples_file}...")
+    df_samples, _ = load_full_samples_dataframe(
+        samples_file,
+        samples_delimiter=samples_delimiter,
+        samples_header_line=samples_header_line,
+        progress_label='Reading sample file',
+        progress_callback=_make_scaled_progress_callback(
+            progress_callback,
+            10 if use_explicit_sample_domains else 30,
+            40 if use_explicit_sample_domains else 55,
+            'Reading sample file...',
+        ),
+    )
+
+    _emit_progress(progress_callback, 41 if use_explicit_sample_domains else 56, 100, 'Applying sample filters...')
+    filtered_samples_df, applied_filters = apply_sample_filters(df_samples, sample_filters=sample_filters)
+
+    sample_x_col, sample_y_col, sample_z_col = resolve_sample_coordinate_columns(
+        list(filtered_samples_df.columns),
+        sample_x_col=sample_x_col,
+        sample_y_col=sample_y_col,
+        sample_z_col=sample_z_col,
+    )
+
+    sample_coord_frame = filtered_samples_df[[sample_x_col, sample_y_col, sample_z_col]].apply(pd.to_numeric, errors='coerce')
+    valid_sample_mask = sample_coord_frame.notna().all(axis=1)
+    valid_sample_coords = sample_coord_frame.loc[valid_sample_mask].to_numpy(copy=False)
+    candidate_sample_coords = valid_sample_coords
+    candidate_sample_ids, selected_id_columns = build_concatenated_sample_ids(filtered_samples_df, closest_sample_id_cols)
+    if candidate_sample_ids is not None:
+        candidate_sample_ids = np.asarray(candidate_sample_ids, dtype=object)[valid_sample_mask.to_numpy()]
+
+    if use_explicit_sample_domains:
+        if sample_domain_column_name not in filtered_samples_df.columns:
+            raise ValueError(f'Selected sample domain column not found in samples file: {sample_domain_column_name}')
+
+        filtered_samples_df, _ = apply_blank_sample_domain_behavior(
+            filtered_samples_df,
+            blank_domain_behavior=blank_sample_domain_behavior,
+            domain_col=sample_domain_column_name,
+            x_col=sample_x_col,
+            y_col=sample_y_col,
+            z_col=sample_z_col,
+            blocks_file=blocks_file,
+            blocks_delimiter=blocks_delimiter,
+            blocks_header_line=blocks_header_line,
+            block_x_col=block_x_col,
+            block_y_col=block_y_col,
+            block_z_col=block_z_col,
+            block_domain_col=domain_column_name,
+            block_size=block_size,
+        )
+        sample_coord_frame = filtered_samples_df[[sample_x_col, sample_y_col, sample_z_col]].apply(pd.to_numeric, errors='coerce')
+        valid_sample_mask = sample_coord_frame.notna().all(axis=1)
+        valid_sample_coords = sample_coord_frame.loc[valid_sample_mask].to_numpy(copy=False)
+        candidate_sample_coords = valid_sample_coords
+
+        _emit_progress(progress_callback, 44, 100, 'Grouping filtered samples by explicit domain...')
+        explicit_domain_values = filtered_samples_df.loc[valid_sample_mask, sample_domain_column_name].fillna('').astype(str).str.strip()
+        explicit_domain_values = explicit_domain_values.replace('nan', '')
+        candidate_sample_domains = explicit_domain_values.to_numpy(dtype=object, copy=False)
+    else:
+        sample_coords_for_mapping = valid_sample_coords
+
+        if block_metadata.get('is_rotated') and len(sample_coords_for_mapping) > 0:
+            rotation_center = block_metadata['rotation_center']
+            rotation_matrix = block_metadata['rotation_matrix']
+            sample_coords_for_mapping = (sample_coords_for_mapping - rotation_center) @ rotation_matrix.T
+
+        all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
+        unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
+        sample_block_indices = np.floor((sample_coords_for_mapping - all_min_bounds) / unified_dims + 1e-6).astype(int)
+        domain_mapping = block_metadata['domain_mapping']
+
+        _emit_progress(progress_callback, 58, 100, 'Mapping filtered samples to domains...')
+        candidate_sample_domains = np.array(
+            [domain_mapping.get((int(idx[0]), int(idx[1]), int(idx[2])), '') for idx in sample_block_indices],
+            dtype=object,
+        )
+
+    print(f"Loading blocks from {blocks_file}...")
+    df_blocks, output_delimiter = load_full_blocks_dataframe(
+        blocks_file,
+        blocks_delimiter=blocks_delimiter,
+        blocks_header_line=blocks_header_line,
+        progress_label='Reading blocks file',
+        progress_callback=_make_scaled_progress_callback(
+            progress_callback,
+            45 if use_explicit_sample_domains else 60,
+            75 if use_explicit_sample_domains else 85,
+            'Reading blocks file...',
+        ),
+    )
+
+    block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
+        list(df_blocks.columns),
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+    )
+    if domain_column_name not in df_blocks.columns:
+        raise ValueError(f'Selected domain column not found in blocks file: {domain_column_name}')
+
+    block_coord_frame = df_blocks[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
+    valid_block_mask = block_coord_frame.notna().all(axis=1)
+    block_domain_series = df_blocks[domain_column_name].fillna('').astype(str).str.strip()
+    block_domains = {value for value in block_domain_series.unique() if value}
+    print(
+        f"Finished reading blocks file. Computing domain distance statistics for {len(block_domains):,} domains and {int(valid_block_mask.sum()):,} valid blocks..."
+    )
+
+    candidate_domain_mask = np.array(
+        [str(domain).strip() in block_domains for domain in candidate_sample_domains],
+        dtype=bool,
+    ) if len(candidate_sample_domains) else np.empty(0, dtype=bool)
+    matched_sample_coords = candidate_sample_coords[candidate_domain_mask]
+    matched_sample_domains = np.asarray(candidate_sample_domains, dtype=object)[candidate_domain_mask]
+    matched_sample_ids = None if candidate_sample_ids is None else np.asarray(candidate_sample_ids, dtype=object)[candidate_domain_mask]
+
+    samples_by_domain = {}
+    for domain in np.unique(matched_sample_domains):
+        domain_mask = matched_sample_domains == domain
+        samples_by_domain[str(domain)] = {
+            'coords': matched_sample_coords[domain_mask],
+            'ids': None if matched_sample_ids is None else matched_sample_ids[domain_mask],
+        }
+
+    nn_column = f'{domain_column_name}_NN_Distance'
+    avg_column = f'{domain_column_name}_Avg_Distance'
+    closest_id_column = f'{domain_column_name}_Closest_Sample_ID' if selected_id_columns else None
+
+    output_df = df_blocks.copy()
+    output_df[nn_column] = np.nan
+    output_df[avg_column] = np.nan
+    if closest_id_column:
+        output_df[closest_id_column] = ''
+
+    processed_block_count = 0
+    populated_block_count = 0
+    domains_to_process = [value for value in sorted(block_domain_series.unique()) if value]
+    total_domain_blocks = int(sum(int((valid_block_mask & (block_domain_series == domain)).sum()) for domain in domains_to_process))
+    completed_domain_blocks = 0
+    compute_started_at = time.perf_counter()
+    next_terminal_report_at = compute_started_at
+    _emit_progress(progress_callback, 80 if use_explicit_sample_domains else 85, 100, 'Computing domain distance statistics...')
+
+    for domain in domains_to_process:
+        domain_block_mask = valid_block_mask & (block_domain_series == domain)
+        domain_block_indices = output_df.index[domain_block_mask]
+        if len(domain_block_indices) == 0:
+            continue
+
+        processed_block_count += len(domain_block_indices)
+        domain_samples = samples_by_domain.get(domain)
+        if domain_samples is None or len(domain_samples['coords']) == 0:
+            completed_domain_blocks += len(domain_block_indices)
+            if total_domain_blocks > 0:
+                progress_base = 80 if use_explicit_sample_domains else 85
+                progress_span = 18 if use_explicit_sample_domains else 13
+                progress_value = progress_base + int(round((completed_domain_blocks / total_domain_blocks) * progress_span))
+                _emit_progress(progress_callback, progress_value, 100, f'Computing domain distance statistics... ({domain})')
+            now = time.perf_counter()
+            if now >= next_terminal_report_at:
+                elapsed_seconds = max(int(now - compute_started_at), 0)
+                percent = int(round((completed_domain_blocks / max(total_domain_blocks, 1)) * 100)) if total_domain_blocks > 0 else 100
+                print(
+                    f"Metrics compute progress: {completed_domain_blocks:,}/{total_domain_blocks:,} blocks ({percent}%) processed; "
+                    f"current domain={domain}; no matching samples; elapsed~{elapsed_seconds}s"
+                )
+                next_terminal_report_at = now + 5.0
+            continue
+
+        query_points = block_coord_frame.loc[domain_block_indices].to_numpy(copy=False)
+        distance_stats = _compute_point_to_set_distance_stats(
+            query_points,
+            domain_samples['coords'],
+            progress_callback=(
+                None if total_domain_blocks <= 0 else
+                lambda current, total, label, completed=completed_domain_blocks: _emit_progress(
+                    progress_callback,
+                    (80 if use_explicit_sample_domains else 85) + int(round(((completed + current) / total_domain_blocks) * (18 if use_explicit_sample_domains else 13))),
+                    100,
+                    f'{label}... ({domain})',
+                )
+            ),
+            return_nearest_index=bool(closest_id_column),
+        )
+        if closest_id_column:
+            nearest_distances, average_distances, nearest_sample_indices = distance_stats
+        else:
+            nearest_distances, average_distances = distance_stats
+        output_df.loc[domain_block_indices, nn_column] = nearest_distances
+        output_df.loc[domain_block_indices, avg_column] = average_distances
+        if closest_id_column:
+            domain_ids = domain_samples['ids']
+            closest_ids = [domain_ids[index] if index >= 0 else '' for index in nearest_sample_indices]
+            output_df.loc[domain_block_indices, closest_id_column] = closest_ids
+        populated_block_count += len(domain_block_indices)
+        completed_domain_blocks += len(domain_block_indices)
+        now = time.perf_counter()
+        if now >= next_terminal_report_at:
+            elapsed_seconds = max(int(now - compute_started_at), 0)
+            percent = int(round((completed_domain_blocks / max(total_domain_blocks, 1)) * 100)) if total_domain_blocks > 0 else 100
+            print(
+                f"Metrics compute progress: {completed_domain_blocks:,}/{total_domain_blocks:,} blocks ({percent}%) processed; "
+                f"current domain={domain}; elapsed~{elapsed_seconds}s"
+            )
+            next_terminal_report_at = now + 5.0
+
+    elapsed_seconds = max(int(time.perf_counter() - compute_started_at), 0)
+    print(
+        f"Metrics compute complete: {completed_domain_blocks:,}/{total_domain_blocks:,} blocks processed; "
+        f"blocks with matching domain samples={populated_block_count:,}; elapsed~{elapsed_seconds}s"
+    )
+
+    output_dir = os.path.dirname(output_file) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+    _emit_progress(progress_callback, 99, 100, 'Writing metrics export...')
+    output_df.to_csv(output_file, index=False, sep=output_delimiter)
+    _emit_progress(progress_callback, 100, 100, 'Block-domain sample metrics export complete.')
+
+    return {
+        'output_file': output_file,
+        'domain_column': domain_column_name,
+        'nearest_distance_column': nn_column,
+        'average_distance_column': avg_column,
+        'closest_sample_id_column': closest_id_column,
+        'closest_sample_id_source_columns': list(selected_id_columns),
+        'input_samples': int(len(df_samples)),
+        'filtered_samples': int(len(filtered_samples_df)),
+        'filters_applied': applied_filters,
+        'valid_coordinate_samples': int(valid_sample_mask.sum()),
+        'matched_samples': int(len(matched_sample_domains)),
+        'unmatched_samples': int(valid_sample_mask.sum() - len(matched_sample_domains)),
+        'invalid_coordinate_samples': int((~valid_sample_mask).sum()),
+        'processed_blocks': int(processed_block_count),
+        'blocks_with_samples_in_domain': int(populated_block_count),
+        'invalid_coordinate_blocks': int((~valid_block_mask).sum()),
+    }
+
+
 def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=None,
                                         samples_delimiter=None, blocks_delimiter=None,
                                         samples_header_line=1, blocks_header_line=1,
                                         sample_x_col=None, sample_y_col=None, sample_z_col=None,
                                         block_x_col=None, block_y_col=None, block_z_col=None,
-                                        block_domain_col=None, block_size=None):
+                                        block_domain_col=None, block_size=None,
+                                        progress_callback=None):
     if not samples_file or not os.path.isfile(samples_file):
         raise ValueError('Please select a valid samples file.')
     if not blocks_file or not os.path.isfile(blocks_file):
@@ -2270,6 +3105,7 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
         samples_file=samples_file,
         domain_col=domain_column_name,
     )
+    _emit_progress(progress_callback, 0, 100, 'Preparing sample domaining export...')
 
     print(f"Loading block domain mapping from {blocks_file}...")
     block_metadata = load_large_blocks_metadata(
@@ -2283,6 +3119,7 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
         block_z_col=block_z_col,
         block_domain_col=domain_column_name,
         config=None,
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 45, 'Loading block domain mapping...'),
     )
 
     print(f"Loading samples from {samples_file}...")
@@ -2291,6 +3128,7 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
         samples_delimiter=samples_delimiter,
         samples_header_line=samples_header_line,
         progress_label='Reading sample file',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 45, 80, 'Reading sample file...'),
     )
 
     sample_x_col, sample_y_col, sample_z_col = resolve_sample_coordinate_columns(
@@ -2316,12 +3154,34 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
 
     assigned_domains = []
     matched_count = 0
-    for idx in block_indices:
+    total_indices = len(block_indices)
+    assign_started_at = time.perf_counter()
+    next_terminal_report_at = assign_started_at
+    _emit_progress(progress_callback, 80, 100, 'Assigning samples to block domains...')
+    for index, idx in enumerate(block_indices, start=1):
         block_idx = (int(idx[0]), int(idx[1]), int(idx[2]))
         domain_value = domain_mapping.get(block_idx, '')
         if domain_value != '':
             matched_count += 1
         assigned_domains.append(domain_value)
+        if progress_callback and (index == total_indices or index % 50_000 == 0):
+            progress_value = 80 + int(round((index / max(total_indices, 1)) * 15))
+            _emit_progress(progress_callback, progress_value, 100, 'Assigning samples to block domains...')
+        now = time.perf_counter()
+        if now >= next_terminal_report_at:
+            elapsed_seconds = max(int(now - assign_started_at), 0)
+            percent = int(round((index / max(total_indices, 1)) * 100)) if total_indices > 0 else 100
+            print(
+                f"Sample domaining progress: {index:,}/{total_indices:,} valid samples ({percent}%) assigned; "
+                f"matched={matched_count:,}; elapsed~{elapsed_seconds}s"
+            )
+            next_terminal_report_at = now + 5.0
+
+    elapsed_seconds = max(int(time.perf_counter() - assign_started_at), 0)
+    print(
+        f"Sample domaining complete: {total_indices:,} valid samples processed; "
+        f"matched={matched_count:,}; elapsed~{elapsed_seconds}s"
+    )
 
     output_dir = os.path.dirname(output_file) or '.'
     os.makedirs(output_dir, exist_ok=True)
@@ -2330,7 +3190,9 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
     domain_series = pd.Series([''] * len(output_df), index=output_df.index, dtype=object)
     domain_series.loc[valid_mask] = assigned_domains
     output_df[domain_column_name] = domain_series
+    _emit_progress(progress_callback, 98, 100, 'Writing domained samples export...')
     output_df.to_csv(output_file, index=False, sep=sample_delimiter)
+    _emit_progress(progress_callback, 100, 100, 'Sample domaining export complete.')
 
     invalid_coordinate_count = int((~valid_mask).sum())
     unmatched_count = int(len(output_df) - matched_count)
@@ -2953,6 +3815,11 @@ def build_taichi_viewer_state_from_config(config):
         and str(config.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
     )
     wants_domain_any = wants_st_domain or wants_ant_domain
+    needs_sample_domains = should_resolve_sample_domains_for_interpolation(
+        wants_domain_any,
+        blocks_file=config.get('blocks_file'),
+        block_domain_col=config.get('block_domain_col'),
+    )
 
     df, parsed_cols, explicit_sample_map = load_samples_dataframe(
         samples_file,
@@ -2969,7 +3836,7 @@ def build_taichi_viewer_state_from_config(config):
     elif hasattr(df, '_detected_delimiter'):
         print(f"Samples file delimiter used: '{df._detected_delimiter}'")
 
-    if wants_domain_any and explicit_sample_map:
+    if needs_sample_domains and explicit_sample_map:
         if config.get('samples_header_line', 1) and config.get('samples_header_line', 1) != 1 and config.get('samples_delimiter'):
             df, parsed_cols = read_csv_with_selected_header(
                 samples_file,
@@ -2988,6 +3855,9 @@ def build_taichi_viewer_state_from_config(config):
             print(f"Samples file delimiter used: '{df._detected_delimiter}'")
         explicit_sample_map = None
 
+    if needs_sample_domains:
+        df = normalize_selected_sample_domain_column(df, sample_domain_col=config.get('sample_domain_col'))
+
     if explicit_sample_map:
         print(f"Applied user sample column mapping: {explicit_sample_map}")
     elif config.get('sample_x_col') and config.get('sample_y_col') and config.get('sample_z_col') and config.get('sample_value_col'):
@@ -3002,17 +3872,23 @@ def build_taichi_viewer_state_from_config(config):
     df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
     nan_before = int(df['Value'].isna().sum())
 
-    domain_like = None
-    for column_name in df.columns:
-        if str(column_name).strip().lower() == 'domain':
-            domain_like = column_name
-            break
-    if domain_like and domain_like != 'Domain':
-        df = df.rename(columns={domain_like: 'Domain'})
-
-    if wants_domain_any:
-        if 'Domain' not in df.columns:
-            raise ValueError("Domain interpolation selected but samples file has no 'Domain' column.")
+    if needs_sample_domains:
+        df, domain_resolution = ensure_sample_domains_for_domain_operations(
+            df,
+            sample_domain_col=config.get('sample_domain_col'),
+            blank_domain_behavior=config.get('blank_sample_domain_behavior', 'skip'),
+            x_col='x',
+            y_col='y',
+            z_col='z',
+            blocks_file=config.get('blocks_file'),
+            blocks_delimiter=config.get('blocks_delimiter'),
+            blocks_header_line=config.get('blocks_header_line', 1),
+            block_x_col=config.get('block_x_col'),
+            block_y_col=config.get('block_y_col'),
+            block_z_col=config.get('block_z_col'),
+            block_domain_col=config.get('block_domain_col'),
+            block_size=config.get('block_size'),
+        )
         df['Domain'] = df['Domain'].astype(str).str.strip()
         blank_domain = df['Domain'].isna() | (df['Domain'].str.strip() == '') | (df['Domain'].str.lower() == 'nan')
         blank_count = int(blank_domain.sum())
@@ -3138,6 +4014,11 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             and str(config.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
         )
         wants_domain_any = wants_st_domain or wants_ant_domain
+        needs_sample_domains = should_resolve_sample_domains_for_interpolation(
+            wants_domain_any,
+            blocks_file=blocks_file,
+            block_domain_col=block_domain_col,
+        )
 
         df, parsed_cols, explicit_sample_map = load_samples_dataframe(
             samples_file,
@@ -3173,6 +4054,9 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
                 print(f"Samples file delimiter used: '{df._detected_delimiter}'")
             explicit_sample_map = None
 
+        if wants_domain_any:
+            df = normalize_selected_sample_domain_column(df, sample_domain_col=config.get('sample_domain_col') if config else None)
+
         if explicit_sample_map:
             print(f"Applied user sample column mapping: {explicit_sample_map}")
         elif sample_x_col and sample_y_col and sample_z_col and sample_value_col:
@@ -3204,17 +4088,23 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
                 raise ValueError(f"Required column '{col}' not found after mapping.")
 
         # Optional Domain column (string). Used by String Theory domain interpolation.
-        domain_like = None
-        for c in df.columns:
-            if str(c).strip().lower() == 'domain':
-                domain_like = c
-                break
-        if domain_like and domain_like != 'Domain':
-            df = df.rename(columns={domain_like: 'Domain'})
-
-        if wants_domain_any:
-            if 'Domain' not in df.columns:
-                raise ValueError("Domain interpolation selected but samples file has no 'Domain' column.")
+        if needs_sample_domains:
+            df, domain_resolution = ensure_sample_domains_for_domain_operations(
+                df,
+                sample_domain_col=config.get('sample_domain_col') if config else None,
+                blank_domain_behavior=config.get('blank_sample_domain_behavior', 'skip') if config else 'skip',
+                x_col='x',
+                y_col='y',
+                z_col='z',
+                blocks_file=blocks_file,
+                blocks_delimiter=blocks_delimiter,
+                blocks_header_line=blocks_header_line,
+                block_x_col=block_x_col,
+                block_y_col=block_y_col,
+                block_z_col=block_z_col,
+                block_domain_col=block_domain_col,
+                block_size=block_size,
+            )
             df['Domain'] = df['Domain'].astype(str).str.strip()
             blank_domain = df['Domain'].isna() | (df['Domain'].str.strip() == '') | (df['Domain'].str.lower() == 'nan')
             blank_count = int(blank_domain.sum())
@@ -3659,6 +4549,242 @@ if __name__ == "__main__":
         
         def reject(self):
             super().reject()
+
+    class SampleFilterEditDialog(QtWidgets.QDialog):
+        def __init__(self, df_samples, filter_spec=None, parent=None):
+            super().__init__(parent)
+            self.df_samples = df_samples
+            self.setWindowTitle('Sample Filter')
+            self.resize(520, 420)
+
+            layout = QtWidgets.QVBoxLayout()
+            self.setLayout(layout)
+
+            form = QtWidgets.QFormLayout()
+            layout.addLayout(form)
+
+            self.field_combo = QtWidgets.QComboBox()
+            self.field_combo.addItems([str(col) for col in df_samples.columns])
+            form.addRow('Field', self.field_combo)
+
+            self.type_combo = QtWidgets.QComboBox()
+            self.type_combo.addItems(['categorical', 'numeric'])
+            form.addRow('Type', self.type_combo)
+
+            self.criteria_stack = QtWidgets.QStackedWidget()
+
+            categorical_page = QtWidgets.QWidget()
+            categorical_layout = QtWidgets.QVBoxLayout()
+            categorical_page.setLayout(categorical_layout)
+            categorical_layout.addWidget(QtWidgets.QLabel('Select one or more values:'))
+            self.value_list = QtWidgets.QListWidget()
+            self.value_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+            categorical_layout.addWidget(self.value_list)
+            self.value_hint = QtWidgets.QLabel('')
+            self.value_hint.setWordWrap(True)
+            categorical_layout.addWidget(self.value_hint)
+            self.criteria_stack.addWidget(categorical_page)
+
+            numeric_page = QtWidgets.QWidget()
+            numeric_form = QtWidgets.QFormLayout()
+            numeric_page.setLayout(numeric_form)
+            self.min_value_edit = QtWidgets.QLineEdit('')
+            self.max_value_edit = QtWidgets.QLineEdit('')
+            self.numeric_hint = QtWidgets.QLabel('')
+            self.numeric_hint.setWordWrap(True)
+            numeric_form.addRow('Minimum', self.min_value_edit)
+            numeric_form.addRow('Maximum', self.max_value_edit)
+            numeric_form.addRow('', self.numeric_hint)
+            self.criteria_stack.addWidget(numeric_page)
+
+            form.addRow('Criteria', self.criteria_stack)
+
+            button_row = QtWidgets.QHBoxLayout()
+            button_row.addStretch(1)
+            ok_btn = QtWidgets.QPushButton('OK')
+            cancel_btn = QtWidgets.QPushButton('Cancel')
+            ok_btn.clicked.connect(self.accept)
+            cancel_btn.clicked.connect(self.reject)
+            button_row.addWidget(ok_btn)
+            button_row.addWidget(cancel_btn)
+            layout.addLayout(button_row)
+
+            self.field_combo.currentTextChanged.connect(self._refresh_criteria_ui)
+            self.type_combo.currentTextChanged.connect(self._refresh_criteria_ui)
+
+            if filter_spec:
+                field = str(filter_spec.get('field', '')).strip()
+                if field:
+                    self.field_combo.setCurrentText(field)
+                filter_type = str(filter_spec.get('type', 'categorical')).strip().lower() or 'categorical'
+                self.type_combo.setCurrentText(filter_type)
+
+            self._refresh_criteria_ui()
+
+            if filter_spec:
+                if self.type_combo.currentText() == 'categorical':
+                    selected_values = {str(value) for value in filter_spec.get('values', [])}
+                    for idx in range(self.value_list.count()):
+                        item = self.value_list.item(idx)
+                        item.setSelected(item.text() in selected_values)
+                else:
+                    min_value = filter_spec.get('min', '')
+                    max_value = filter_spec.get('max', '')
+                    self.min_value_edit.setText('' if min_value is None else str(min_value))
+                    self.max_value_edit.setText('' if max_value is None else str(max_value))
+
+        def _refresh_criteria_ui(self):
+            field = self.field_combo.currentText()
+            filter_type = self.type_combo.currentText()
+            series = self.df_samples[field] if field in self.df_samples.columns else pd.Series(dtype=object)
+
+            if filter_type == 'categorical':
+                self.criteria_stack.setCurrentIndex(0)
+                unique_values = sorted({str(value) for value in series.dropna().astype(str)})
+                truncated = False
+                if len(unique_values) > 1000:
+                    unique_values = unique_values[:1000]
+                    truncated = True
+                self.value_list.clear()
+                self.value_list.addItems(unique_values)
+                self.value_hint.setText(
+                    f'Loaded {len(unique_values):,} distinct values.' +
+                    (' Showing the first 1,000 values.' if truncated else '')
+                )
+            else:
+                self.criteria_stack.setCurrentIndex(1)
+                numeric_values = pd.to_numeric(series, errors='coerce').dropna()
+                if len(numeric_values) == 0:
+                    self.numeric_hint.setText('No numeric values detected in this field.')
+                else:
+                    self.numeric_hint.setText(
+                        f'Available numeric range: {numeric_values.min():g} to {numeric_values.max():g}'
+                    )
+
+        def get_filter_spec(self):
+            field = self.field_combo.currentText().strip()
+            filter_type = self.type_combo.currentText().strip().lower()
+            if not field:
+                raise ValueError('Please select a field.')
+
+            if filter_type == 'categorical':
+                selected_values = [item.text() for item in self.value_list.selectedItems()]
+                if not selected_values:
+                    raise ValueError('Select at least one value for a categorical filter.')
+                return {
+                    'field': field,
+                    'type': 'categorical',
+                    'values': selected_values,
+                }
+
+            min_text = self.min_value_edit.text().strip()
+            max_text = self.max_value_edit.text().strip()
+            min_value = None if min_text == '' else float(min_text)
+            max_value = None if max_text == '' else float(max_text)
+            if min_value is not None and max_value is not None and min_value > max_value:
+                raise ValueError('Minimum value cannot be greater than maximum value.')
+            if min_value is None and max_value is None:
+                raise ValueError('Enter at least one numeric bound.')
+            return {
+                'field': field,
+                'type': 'numeric',
+                'min': min_value,
+                'max': max_value,
+            }
+
+        def accept(self):
+            try:
+                self.get_filter_spec()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, 'Invalid Filter', str(exc))
+                return
+            super().accept()
+
+    class SampleFiltersDialog(QtWidgets.QDialog):
+        def __init__(self, df_samples, filters=None, parent=None):
+            super().__init__(parent)
+            self.df_samples = df_samples
+            self.filters = [dict(entry) for entry in (filters or [])]
+            self.setWindowTitle('Sample Filters')
+            self.resize(760, 420)
+
+            layout = QtWidgets.QVBoxLayout()
+            self.setLayout(layout)
+
+            info = QtWidgets.QLabel(
+                'Add one or more sample filters. Categorical filters keep selected values. '
+                'Numeric filters keep values inside the requested range.'
+            )
+            info.setWordWrap(True)
+            layout.addWidget(info)
+
+            self.table = QtWidgets.QTableWidget()
+            self.table.setColumnCount(3)
+            self.table.setHorizontalHeaderLabels(['Field', 'Type', 'Criteria'])
+            self.table.horizontalHeader().setStretchLastSection(True)
+            self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+            self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+            layout.addWidget(self.table)
+
+            button_row = QtWidgets.QHBoxLayout()
+            self.add_btn = QtWidgets.QPushButton('Add Filter')
+            self.edit_btn = QtWidgets.QPushButton('Edit Filter')
+            self.remove_btn = QtWidgets.QPushButton('Remove Filter')
+            self.add_btn.clicked.connect(self.add_filter)
+            self.edit_btn.clicked.connect(self.edit_selected_filter)
+            self.remove_btn.clicked.connect(self.remove_selected_filter)
+            button_row.addWidget(self.add_btn)
+            button_row.addWidget(self.edit_btn)
+            button_row.addWidget(self.remove_btn)
+            button_row.addStretch(1)
+            layout.addLayout(button_row)
+
+            dialog_buttons = QtWidgets.QHBoxLayout()
+            dialog_buttons.addStretch(1)
+            ok_btn = QtWidgets.QPushButton('OK')
+            cancel_btn = QtWidgets.QPushButton('Cancel')
+            ok_btn.clicked.connect(self.accept)
+            cancel_btn.clicked.connect(self.reject)
+            dialog_buttons.addWidget(ok_btn)
+            dialog_buttons.addWidget(cancel_btn)
+            layout.addLayout(dialog_buttons)
+
+            self._refresh_table()
+
+        def _refresh_table(self):
+            self.table.setRowCount(len(self.filters))
+            for row, filter_spec in enumerate(self.filters):
+                self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(filter_spec.get('field', ''))))
+                self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(filter_spec.get('type', ''))))
+                self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(summarize_sample_filter_spec(filter_spec)))
+            self.table.resizeRowsToContents()
+
+        def add_filter(self):
+            dialog = SampleFilterEditDialog(self.df_samples, parent=self)
+            if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                self.filters.append(dialog.get_filter_spec())
+                self._refresh_table()
+
+        def edit_selected_filter(self):
+            row = self.table.currentRow()
+            if row < 0 or row >= len(self.filters):
+                QtWidgets.QMessageBox.information(self, 'Edit Filter', 'Select a filter to edit.')
+                return
+            dialog = SampleFilterEditDialog(self.df_samples, filter_spec=self.filters[row], parent=self)
+            if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                self.filters[row] = dialog.get_filter_spec()
+                self._refresh_table()
+
+        def remove_selected_filter(self):
+            row = self.table.currentRow()
+            if row < 0 or row >= len(self.filters):
+                QtWidgets.QMessageBox.information(self, 'Remove Filter', 'Select a filter to remove.')
+                return
+            del self.filters[row]
+            self._refresh_table()
+
+        def get_filters(self):
+            return [dict(entry) for entry in self.filters]
         
     class ConfigDialog(QtWidgets.QDialog):
         def __init__(self):
@@ -3669,6 +4795,9 @@ if __name__ == "__main__":
             self._viewer_process = None
             self._viewer_config_path = None
             self._viewer_render_mode = None
+            self._active_operation_thread = None
+            self._active_operation_worker = None
+            self._active_operation_progress = None
             self._suspend_auto_viewer_refresh = False
             self._viewer_process_timer = QtCore.QTimer(self)
             self._viewer_process_timer.setInterval(2000)
@@ -3677,7 +4806,7 @@ if __name__ == "__main__":
             self.taichi_block_render_mode_default = 'mesh'
             self.taichi_transparent_blocks_default = False
             self.setWindowTitle("Anterpolator 3D Viewer Configuration")
-            self.resize(700, 600)
+            self.resize(1120, 680)
             
             # Main layout with tabs
             main_layout = QtWidgets.QVBoxLayout()
@@ -3844,19 +4973,36 @@ if __name__ == "__main__":
             files_form.addRow('Samples Header Line', self.samples_header_line)
             files_form.addRow('Blocks Header Line', self.blocks_header_line)
 
+            def configure_column_combo(combo_box, minimum_width=170, popup_width=320):
+                combo_box.setEditable(False)
+                combo_box.setMinimumWidth(minimum_width)
+                combo_box.setMinimumContentsLength(16)
+                combo_box.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+                combo_box.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+                combo_box.view().setMinimumWidth(popup_width)
+
             # Column mapping combo boxes for samples
-            self.sample_x_col = QtWidgets.QComboBox(); self.sample_y_col = QtWidgets.QComboBox(); self.sample_z_col = QtWidgets.QComboBox(); self.sample_value_col = QtWidgets.QComboBox()
-            for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col]:
-                cb.setEditable(False)
-            sample_map_layout = QtWidgets.QHBoxLayout(); sample_map_layout.addWidget(self.sample_x_col); sample_map_layout.addWidget(self.sample_y_col); sample_map_layout.addWidget(self.sample_z_col); sample_map_layout.addWidget(self.sample_value_col)
-            files_form.addRow('Samples Columns (X Y Z Value)', sample_map_layout)
+            self.sample_x_col = QtWidgets.QComboBox(); self.sample_y_col = QtWidgets.QComboBox(); self.sample_z_col = QtWidgets.QComboBox(); self.sample_value_col = QtWidgets.QComboBox(); self.sample_domain_col = QtWidgets.QComboBox()
+            self.block_domain_metrics_id_cols = [QtWidgets.QComboBox(), QtWidgets.QComboBox(), QtWidgets.QComboBox()]
+            for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col]:
+                configure_column_combo(cb)
+            for cb in self.block_domain_metrics_id_cols:
+                configure_column_combo(cb)
+                cb.addItem('(None)')
+            self.sample_domain_col.addItem('(None)')
+            sample_map_layout = QtWidgets.QHBoxLayout(); sample_map_layout.addWidget(self.sample_x_col); sample_map_layout.addWidget(self.sample_y_col); sample_map_layout.addWidget(self.sample_z_col); sample_map_layout.addWidget(self.sample_value_col); sample_map_layout.addWidget(self.sample_domain_col)
+            for index in range(5):
+                sample_map_layout.setStretch(index, 1)
+            files_form.addRow('Samples Columns (X Y Z Value Domain)', sample_map_layout)
 
             # Column mapping combo boxes for blocks
             self.block_x_col = QtWidgets.QComboBox(); self.block_y_col = QtWidgets.QComboBox(); self.block_z_col = QtWidgets.QComboBox(); self.block_domain_col = QtWidgets.QComboBox()
             for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col]:
-                cb.setEditable(False)
+                configure_column_combo(cb)
             self.block_domain_col.addItem('(None)')
             block_map_layout = QtWidgets.QHBoxLayout(); block_map_layout.addWidget(self.block_x_col); block_map_layout.addWidget(self.block_y_col); block_map_layout.addWidget(self.block_z_col); block_map_layout.addWidget(self.block_domain_col)
+            for index in range(4):
+                block_map_layout.setStretch(index, 1)
             files_form.addRow('Blocks Columns (X Y Z Domain)', block_map_layout)
 
             # Block Size
@@ -3870,13 +5016,20 @@ if __name__ == "__main__":
                 path = self.samples_edit.text().strip()
                 delim = self.samples_delim.currentText()
                 header_line = self.samples_header_line.value()
+                current_domain = self.sample_domain_col.currentText()
+                current_metrics_id_cols = [cb.currentText() for cb in self.block_domain_metrics_id_cols]
                 for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col]:
                     cb.clear()
+                self.sample_domain_col.clear(); self.sample_domain_col.addItem('(None)')
+                for cb in self.block_domain_metrics_id_cols:
+                    cb.clear(); cb.addItem('(None)')
                 if not os.path.isfile(path):
                     return
                 try:
                     cols = parse_header_line(path, delim, header_line)
-                    for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col]:
+                    for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col]:
+                        cb.addItems(cols)
+                    for cb in self.block_domain_metrics_id_cols:
                         cb.addItems(cols)
                     # Attempt auto-suggest
                     def suggest(cb, keywords):
@@ -3888,6 +5041,16 @@ if __name__ == "__main__":
                     suggest(self.sample_y_col, ['y','northing'])
                     suggest(self.sample_z_col, ['z','elevation','rl'])
                     suggest(self.sample_value_col, ['value','grade'])
+                    suggest(self.sample_domain_col, ['domain','dom','dg'])
+                    if current_domain and current_domain != '(None)':
+                        idx = self.sample_domain_col.findText(current_domain)
+                        if idx >= 0:
+                            self.sample_domain_col.setCurrentIndex(idx)
+                    for cb, current_value in zip(self.block_domain_metrics_id_cols, current_metrics_id_cols):
+                        if current_value and current_value != '(None)':
+                            idx = cb.findText(current_value)
+                            if idx >= 0:
+                                cb.setCurrentIndex(idx)
                 except Exception:
                     pass
 
@@ -3949,10 +5112,25 @@ if __name__ == "__main__":
                 filename = f"{base_name}+{domain_suffix}.csv" if base_name else f"samples+{domain_suffix}.csv"
                 return os.path.join(output_dir or '.', filename)
 
+            def suggested_block_domain_metrics_path():
+                return resolve_block_domain_metrics_export_path(
+                    None,
+                    blocks_file=self.blocks_edit.text().strip(),
+                    domain_col=self.block_domain_col.currentText(),
+                )
+
             self.domain_samples_output_edit = QtWidgets.QLineEdit('')
             self.domain_samples_browse = QtWidgets.QPushButton('Browse')
             self.start_domaining_btn = QtWidgets.QPushButton('Start Domaining')
+            self.block_domain_metrics_output_edit = QtWidgets.QLineEdit('')
+            self.block_domain_metrics_browse = QtWidgets.QPushButton('Browse')
+            self.configure_block_domain_metrics_filters_btn = QtWidgets.QPushButton('Configure Filters...')
+            self.start_block_domain_metrics_btn = QtWidgets.QPushButton('Export Metrics')
+            self.block_domain_sample_filters = []
+            self.block_domain_metrics_filters_summary = QtWidgets.QLabel('No sample filters configured. All samples will be used.')
+            self.block_domain_metrics_filters_summary.setWordWrap(True)
             self._domain_samples_auto_path = ''
+            self._block_domain_metrics_auto_path = ''
 
             def refresh_domain_samples_output_path(force=False):
                 suggested = suggested_domain_samples_path()
@@ -3960,6 +5138,13 @@ if __name__ == "__main__":
                 if force or not current or current == self._domain_samples_auto_path:
                     self.domain_samples_output_edit.setText(suggested)
                 self._domain_samples_auto_path = suggested
+
+            def refresh_block_domain_metrics_output_path(force=False):
+                suggested = suggested_block_domain_metrics_path()
+                current = self.block_domain_metrics_output_edit.text().strip()
+                if force or not current or current == self._block_domain_metrics_auto_path:
+                    self.block_domain_metrics_output_edit.setText(suggested)
+                self._block_domain_metrics_auto_path = suggested
 
             def browse_domain_samples_output():
                 initial_path = self.domain_samples_output_edit.text().strip() or suggested_domain_samples_path()
@@ -3972,6 +5157,17 @@ if __name__ == "__main__":
                 if path:
                     self.domain_samples_output_edit.setText(path)
 
+            def browse_block_domain_metrics_output():
+                initial_path = self.block_domain_metrics_output_edit.text().strip() or suggested_block_domain_metrics_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Block Domain Metrics Output File',
+                    initial_path,
+                    'CSV Files (*.csv)'
+                )
+                if path:
+                    self.block_domain_metrics_output_edit.setText(path)
+
             domain_samples_group = QtWidgets.QGroupBox('Domain Samples')
             domain_samples_form = QtWidgets.QFormLayout()
             domain_samples_group.setLayout(domain_samples_form)
@@ -3982,11 +5178,35 @@ if __name__ == "__main__":
             domain_samples_form.addRow('', self.start_domaining_btn)
             operations_form.addRow(domain_samples_group)
 
+            block_metrics_group = QtWidgets.QGroupBox('Block Domain Sample Metrics')
+            block_metrics_form = QtWidgets.QFormLayout()
+            block_metrics_group.setLayout(block_metrics_form)
+            block_metrics_output_layout = QtWidgets.QHBoxLayout()
+            block_metrics_output_layout.addWidget(self.block_domain_metrics_output_edit)
+            block_metrics_output_layout.addWidget(self.block_domain_metrics_browse)
+            block_metrics_form.addRow('Output File', block_metrics_output_layout)
+            block_metrics_id_layout = QtWidgets.QHBoxLayout()
+            for index, cb in enumerate(self.block_domain_metrics_id_cols):
+                block_metrics_id_layout.addWidget(cb)
+                block_metrics_id_layout.setStretch(index, 1)
+            block_metrics_form.addRow('Closest Sample ID Columns', block_metrics_id_layout)
+            block_metrics_form.addRow('Sample Filters', self.configure_block_domain_metrics_filters_btn)
+            block_metrics_form.addRow('', self.block_domain_metrics_filters_summary)
+            block_metrics_form.addRow('', self.start_block_domain_metrics_btn)
+            operations_form.addRow(block_metrics_group)
+
             self.domain_samples_browse.clicked.connect(browse_domain_samples_output)
             self.start_domaining_btn.clicked.connect(self.run_domain_samples_only)
+            self.block_domain_metrics_browse.clicked.connect(browse_block_domain_metrics_output)
+            self.configure_block_domain_metrics_filters_btn.clicked.connect(self.configure_block_domain_metrics_filters)
+            self.start_block_domain_metrics_btn.clicked.connect(self.run_block_domain_sample_metrics_only)
             self.samples_edit.textChanged.connect(lambda _: refresh_domain_samples_output_path())
+            self.blocks_edit.textChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
             self.block_domain_col.currentTextChanged.connect(lambda _: refresh_domain_samples_output_path())
+            self.block_domain_col.currentTextChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
             refresh_domain_samples_output_path(force=True)
+            refresh_block_domain_metrics_output_path(force=True)
+            self._update_block_domain_metrics_filters_summary()
 
             # === ANT COLONY TAB ===
             def dbl_spin(default, minv, maxv, step=0.1):
@@ -4174,6 +5394,9 @@ if __name__ == "__main__":
             self.verbose = QtWidgets.QCheckBox(); self.verbose.setChecked(False)
             self.fill_unvisited_domainwise = QtWidgets.QCheckBox(); self.fill_unvisited_domainwise.setChecked(False)
             self.process_domains_sequentially = QtWidgets.QCheckBox(); self.process_domains_sequentially.setChecked(True)
+            self.blank_sample_domain_behavior = QtWidgets.QComboBox(); self.blank_sample_domain_behavior.addItems(['Skip', 'Infer From Blocks'])
+            self.blank_sample_domain_behavior.setCurrentText('Skip')
+            self.blank_sample_domain_behavior.setToolTip('How to handle blank sample domains during domain-based interpolation or metrics.\nSkip: exclude blank-domain rows.\nInfer From Blocks: infer missing sample domains from the blocks model when possible.')
 
             # === DISPLAY TAB ===
             self.taichi_sample_diameter = dbl_spin(1.0, 0.001, 1e6, 0.1)
@@ -4183,6 +5406,7 @@ if __name__ == "__main__":
             advanced_form.addRow('Average With Blocks', self.average_with_blocks)
             advanced_form.addRow('Fill Unvisited (Domain-wise)', self.fill_unvisited_domainwise)
             advanced_form.addRow('Process Domains Sequentially', self.process_domains_sequentially)
+            advanced_form.addRow('Blank Sample Domains', self.blank_sample_domain_behavior)
             advanced_form.addRow('Verbose', self.verbose)
 
             # Domain Algorithm Mapping
@@ -4357,6 +5581,9 @@ if __name__ == "__main__":
                 'export_block_evaluated_samples': self.block_evaluated_samples_enabled.isChecked(),
                 'block_evaluated_samples_file': self.block_evaluated_samples_edit.text(),
                 'domain_samples_file': self.domain_samples_output_edit.text(),
+                'block_domain_metrics_file': self.block_domain_metrics_output_edit.text(),
+                'block_domain_metrics_closest_sample_id_cols': [cb.currentText() for cb in self.block_domain_metrics_id_cols],
+                'block_domain_sample_filters': [dict(entry) for entry in self.block_domain_sample_filters],
                 'algorithm': self.algorithm_combo.currentText(),
                 'second_pass_algorithm': self.second_pass_combo.currentText(),
                 'samples_delimiter': self.samples_delim.currentText(),
@@ -4367,6 +5594,7 @@ if __name__ == "__main__":
                 'sample_y_col': self.sample_y_col.currentText(),
                 'sample_z_col': self.sample_z_col.currentText(),
                 'sample_value_col': self.sample_value_col.currentText(),
+                'sample_domain_col': self.sample_domain_col.currentText(),
                 'block_x_col': self.block_x_col.currentText(),
                 'block_y_col': self.block_y_col.currentText(),
                 'block_z_col': self.block_z_col.currentText(),
@@ -4410,6 +5638,7 @@ if __name__ == "__main__":
                 'average_with_blocks': self.average_with_blocks.isChecked(),
                 'fill_unvisited_domainwise': self.fill_unvisited_domainwise.isChecked(),
                 'process_domains_sequentially': self.process_domains_sequentially.isChecked(),
+                'blank_sample_domain_behavior': 'infer_from_blocks' if self.blank_sample_domain_behavior.currentText() == 'Infer From Blocks' else 'skip',
                 'verbose': self.verbose.isChecked(),
                 'viewer_backend': self.viewer_backend,
                 'taichi_block_render_mode': 'mesh',
@@ -4428,12 +5657,15 @@ if __name__ == "__main__":
             was_running = self._is_viewer_running()
             self._suspend_auto_viewer_refresh = True
             try:
+                self.block_domain_sample_filters = []
+                self._update_block_domain_metrics_filters_summary()
                 if 'samples_file' in config: self.samples_edit.setText(config['samples_file'])
                 if 'blocks_file' in config: self.blocks_edit.setText(config['blocks_file'])
                 if 'color_file' in config: self.color_edit.setText(config['color_file'])
                 if 'interpolation_file' in config: self.interp_edit.setText(config['interpolation_file'])
                 if 'export_block_evaluated_samples' in config: self.block_evaluated_samples_enabled.setChecked(bool(config['export_block_evaluated_samples']))
                 if 'block_evaluated_samples_file' in config: self.block_evaluated_samples_edit.setText(config['block_evaluated_samples_file'])
+                self.block_domain_metrics_output_edit.setText('')
                 if 'algorithm' in config: self.algorithm_combo.setCurrentText(config['algorithm'])
                 if 'second_pass_algorithm' in config: self.second_pass_combo.setCurrentText(config['second_pass_algorithm'])
                 if 'samples_delimiter' in config: self.samples_delim.setCurrentText(config['samples_delimiter'])
@@ -4445,11 +5677,19 @@ if __name__ == "__main__":
                 if 'sample_y_col' in config: self.sample_y_col.setCurrentText(config['sample_y_col'])
                 if 'sample_z_col' in config: self.sample_z_col.setCurrentText(config['sample_z_col'])
                 if 'sample_value_col' in config: self.sample_value_col.setCurrentText(config['sample_value_col'])
+                if 'sample_domain_col' in config: self.sample_domain_col.setCurrentText(config['sample_domain_col'])
                 if 'block_x_col' in config: self.block_x_col.setCurrentText(config['block_x_col'])
                 if 'block_y_col' in config: self.block_y_col.setCurrentText(config['block_y_col'])
                 if 'block_z_col' in config: self.block_z_col.setCurrentText(config['block_z_col'])
                 if 'block_domain_col' in config: self.block_domain_col.setCurrentText(config['block_domain_col'])
                 if 'domain_samples_file' in config: self.domain_samples_output_edit.setText(config['domain_samples_file'])
+                if 'block_domain_metrics_file' in config: self.block_domain_metrics_output_edit.setText(config['block_domain_metrics_file'])
+                if 'block_domain_metrics_closest_sample_id_cols' in config:
+                    for cb, column_name in zip(self.block_domain_metrics_id_cols, config['block_domain_metrics_closest_sample_id_cols']):
+                        cb.setCurrentText(column_name)
+                if 'block_domain_sample_filters' in config:
+                    self.block_domain_sample_filters = [dict(entry) for entry in config['block_domain_sample_filters']]
+                    self._update_block_domain_metrics_filters_summary()
             
                 if 'block_size' in config:
                     bs = config['block_size']
@@ -4519,6 +5759,9 @@ if __name__ == "__main__":
                 if 'average_with_blocks' in config: self.average_with_blocks.setChecked(config['average_with_blocks'])
                 if 'fill_unvisited_domainwise' in config: self.fill_unvisited_domainwise.setChecked(config['fill_unvisited_domainwise'])
                 if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
+                if 'blank_sample_domain_behavior' in config:
+                    behavior = str(config['blank_sample_domain_behavior']).strip().lower()
+                    self.blank_sample_domain_behavior.setCurrentText('Infer From Blocks' if behavior == 'infer_from_blocks' else 'Skip')
                 if 'verbose' in config: self.verbose.setChecked(config['verbose'])
                 if 'viewer_backend' in config: self.viewer_backend = _normalize_viewer_backend(config['viewer_backend'])
                 if 'taichi_sample_diameter' in config: self.taichi_sample_diameter.setValue(config['taichi_sample_diameter'])
@@ -4635,9 +5878,117 @@ if __name__ == "__main__":
                 else:
                     self.domain_mapping_btn.setText('Configure Domain Algorithms...')
 
+        def _load_samples_dataframe_for_operations(self):
+            cfg = self.to_dict()
+            samples_file = cfg.get('samples_file')
+            if not samples_file or not os.path.isfile(samples_file):
+                raise ValueError('Please select a valid samples file first.')
+            df_samples, _ = load_full_samples_dataframe(
+                samples_file,
+                samples_delimiter=cfg.get('samples_delimiter'),
+                samples_header_line=cfg.get('samples_header_line', 1),
+                progress_label='Reading sample file',
+            )
+            return df_samples
+
+        def _set_operation_buttons_enabled(self, enabled):
+            self.start_domaining_btn.setEnabled(enabled)
+            self.start_block_domain_metrics_btn.setEnabled(enabled)
+
+        def _run_operation_with_progress(self, title, initial_message, operation, kwargs,
+                                         success_handler, error_context):
+            active_thread = getattr(self, '_active_operation_thread', None)
+            if active_thread is not None and active_thread.isRunning():
+                QtWidgets.QMessageBox.warning(self, 'Operation Running', 'Another long-running operation is already in progress.')
+                return
+
+            progress = QtWidgets.QProgressDialog(initial_message, None, 0, 100, self)
+            progress.setWindowTitle(title)
+            progress.setWindowModality(QtCore.Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.setCancelButton(None)
+            progress.setValue(0)
+            progress.show()
+
+            thread = QtCore.QThread(self)
+            worker = BackgroundOperationWorker(operation, kwargs)
+            worker.moveToThread(thread)
+
+            self._active_operation_thread = thread
+            self._active_operation_worker = worker
+            self._active_operation_progress = progress
+            self._set_operation_buttons_enabled(False)
+
+            def handle_progress(value, maximum, message):
+                progress.setMaximum(max(int(maximum or 0), 1))
+                progress.setValue(max(0, min(int(value or 0), progress.maximum())))
+                if message:
+                    progress.setLabelText(message)
+
+            def cleanup():
+                if self._active_operation_progress is progress:
+                    progress.close()
+                    self._active_operation_progress = None
+                self._set_operation_buttons_enabled(True)
+                if self._active_operation_worker is worker:
+                    self._active_operation_worker = None
+                if self._active_operation_thread is thread:
+                    self._active_operation_thread = None
+                thread.quit()
+                thread.wait(2000)
+                worker.deleteLater()
+                thread.deleteLater()
+
+            def handle_finished(result):
+                cleanup()
+                success_handler(result)
+
+            def handle_failed(error_text, stack_text):
+                print(f"{error_context}: {error_text}")
+                print(stack_text)
+                cleanup()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'{error_context}:\n{error_text}')
+
+            worker.progress.connect(handle_progress, QtCore.Qt.QueuedConnection)
+            worker.finished.connect(handle_finished, QtCore.Qt.QueuedConnection)
+            worker.failed.connect(handle_failed, QtCore.Qt.QueuedConnection)
+            thread.started.connect(worker.run)
+            thread.start()
+
+        def _update_block_domain_metrics_filters_summary(self):
+            count = len(self.block_domain_sample_filters)
+            if count == 0:
+                self.block_domain_metrics_filters_summary.setText('No sample filters configured. All samples will be used.')
+                self.configure_block_domain_metrics_filters_btn.setText('Configure Filters...')
+                return
+
+            summaries = [summarize_sample_filter_spec(spec) for spec in self.block_domain_sample_filters]
+            self.block_domain_metrics_filters_summary.setText('\n'.join(summaries[:4]))
+            self.configure_block_domain_metrics_filters_btn.setText(f'Configure Filters... ({count} active)')
+
+        def configure_block_domain_metrics_filters(self):
+            cursor_set = False
+            try:
+                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+                cursor_set = True
+                df_samples = self._load_samples_dataframe_for_operations()
+                QtWidgets.QApplication.restoreOverrideCursor()
+                cursor_set = False
+
+                dialog = SampleFiltersDialog(df_samples, filters=self.block_domain_sample_filters, parent=self)
+                if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                    self.block_domain_sample_filters = dialog.get_filters()
+                    self._update_block_domain_metrics_filters_summary()
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(self, 'Error', f'Could not configure sample filters:\n{exc}')
+            finally:
+                if cursor_set:
+                    QtWidgets.QApplication.restoreOverrideCursor()
+
         def run_domain_samples_only(self):
             """Assign block domains directly to the samples file and export the result."""
-            cursor_set = False
             try:
                 cfg = self.to_dict()
                 output_file = resolve_domain_samples_export_path(
@@ -4651,47 +6002,121 @@ if __name__ == "__main__":
                 print("Assigning sample domains from blocks...")
                 print("=" * 60)
 
-                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-                cursor_set = True
-                result = export_domained_samples_from_blocks(
-                    cfg.get('samples_file'),
-                    cfg.get('blocks_file'),
-                    output_file=output_file,
-                    samples_delimiter=cfg.get('samples_delimiter'),
-                    blocks_delimiter=cfg.get('blocks_delimiter'),
-                    samples_header_line=cfg.get('samples_header_line', 1),
-                    blocks_header_line=cfg.get('blocks_header_line', 1),
-                    sample_x_col=cfg.get('sample_x_col'),
-                    sample_y_col=cfg.get('sample_y_col'),
-                    sample_z_col=cfg.get('sample_z_col'),
-                    block_x_col=cfg.get('block_x_col'),
-                    block_y_col=cfg.get('block_y_col'),
-                    block_z_col=cfg.get('block_z_col'),
-                    block_domain_col=cfg.get('block_domain_col'),
-                    block_size=cfg.get('block_size'),
-                )
-                QtWidgets.QApplication.restoreOverrideCursor()
-                cursor_set = False
+                def handle_success(result):
+                    print("=" * 60)
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"Domaining complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Domain column: {result['domain_column']}\n"
+                            f"Matched samples: {result['matched_samples']:,}\n"
+                            f"Unmatched samples: {result['unmatched_samples']:,}\n"
+                            f"Invalid coordinates: {result['invalid_coordinate_samples']:,}"
+                        ),
+                    )
 
-                print("=" * 60)
-                QtWidgets.QMessageBox.information(
-                    self,
-                    'Success',
-                    (
-                        f"Domaining complete!\nResults saved to:\n{result['output_file']}\n\n"
-                        f"Domain column: {result['domain_column']}\n"
-                        f"Matched samples: {result['matched_samples']:,}\n"
-                        f"Unmatched samples: {result['unmatched_samples']:,}\n"
-                        f"Invalid coordinates: {result['invalid_coordinate_samples']:,}"
-                    ),
+                self._run_operation_with_progress(
+                    'Sample Domaining',
+                    'Preparing sample domaining export...',
+                    export_domained_samples_from_blocks,
+                    {
+                        'samples_file': cfg.get('samples_file'),
+                        'blocks_file': cfg.get('blocks_file'),
+                        'output_file': output_file,
+                        'samples_delimiter': cfg.get('samples_delimiter'),
+                        'blocks_delimiter': cfg.get('blocks_delimiter'),
+                        'samples_header_line': cfg.get('samples_header_line', 1),
+                        'blocks_header_line': cfg.get('blocks_header_line', 1),
+                        'sample_x_col': cfg.get('sample_x_col'),
+                        'sample_y_col': cfg.get('sample_y_col'),
+                        'sample_z_col': cfg.get('sample_z_col'),
+                        'sample_domain_col': cfg.get('sample_domain_col'),
+                        'block_x_col': cfg.get('block_x_col'),
+                        'block_y_col': cfg.get('block_y_col'),
+                        'block_z_col': cfg.get('block_z_col'),
+                        'block_domain_col': cfg.get('block_domain_col'),
+                        'block_size': cfg.get('block_size'),
+                    },
+                    handle_success,
+                    'An error occurred during sample domaining',
                 )
             except Exception as e:
                 print(f"Error during sample domaining: {e}")
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during sample domaining:\n{str(e)}')
-            finally:
-                if cursor_set:
-                    QtWidgets.QApplication.restoreOverrideCursor()
+
+        def run_block_domain_sample_metrics_only(self):
+            """Export block rows with distance statistics to filtered samples inside the same domain."""
+            try:
+                cfg = self.to_dict()
+                output_file = resolve_block_domain_metrics_export_path(
+                    cfg.get('block_domain_metrics_file'),
+                    blocks_file=cfg.get('blocks_file'),
+                    domain_col=cfg.get('block_domain_col'),
+                )
+                self.block_domain_metrics_output_edit.setText(output_file)
+
+                print("=" * 60)
+                print("Calculating block-domain sample metrics...")
+                print("=" * 60)
+
+                def handle_success(result):
+                    filters_text = 'None'
+                    if result['filters_applied']:
+                        filters_text = '\n'.join(entry['summary'] for entry in result['filters_applied'])
+                    closest_id_text = 'None'
+                    if result.get('closest_sample_id_source_columns'):
+                        closest_id_text = ', '.join(result['closest_sample_id_source_columns'])
+
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"Block metrics export complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Domain column: {result['domain_column']}\n"
+                            f"Filtered samples: {result['filtered_samples']:,} of {result['input_samples']:,}\n"
+                            f"Matched samples: {result['matched_samples']:,}\n"
+                            f"Processed blocks: {result['processed_blocks']:,}\n"
+                            f"Blocks with samples in domain: {result['blocks_with_samples_in_domain']:,}\n"
+                            f"Invalid sample coordinates: {result['invalid_coordinate_samples']:,}\n"
+                            f"Closest sample ID columns: {closest_id_text}\n\n"
+                            f"Filters:\n{filters_text}"
+                        ),
+                    )
+
+                self._run_operation_with_progress(
+                    'Block Metrics Export',
+                    'Preparing block-domain sample metrics export...',
+                    export_block_domain_sample_metrics,
+                    {
+                        'samples_file': cfg.get('samples_file'),
+                        'blocks_file': cfg.get('blocks_file'),
+                        'output_file': output_file,
+                        'samples_delimiter': cfg.get('samples_delimiter'),
+                        'blocks_delimiter': cfg.get('blocks_delimiter'),
+                        'samples_header_line': cfg.get('samples_header_line', 1),
+                        'blocks_header_line': cfg.get('blocks_header_line', 1),
+                        'sample_x_col': cfg.get('sample_x_col'),
+                        'sample_y_col': cfg.get('sample_y_col'),
+                        'sample_z_col': cfg.get('sample_z_col'),
+                        'sample_domain_col': cfg.get('sample_domain_col'),
+                        'closest_sample_id_cols': cfg.get('block_domain_metrics_closest_sample_id_cols'),
+                        'block_x_col': cfg.get('block_x_col'),
+                        'block_y_col': cfg.get('block_y_col'),
+                        'block_z_col': cfg.get('block_z_col'),
+                        'block_domain_col': cfg.get('block_domain_col'),
+                        'block_size': cfg.get('block_size'),
+                        'sample_filters': cfg.get('block_domain_sample_filters'),
+                        'blank_sample_domain_behavior': cfg.get('blank_sample_domain_behavior', 'skip'),
+                    },
+                    handle_success,
+                    'An error occurred during block domain metrics export',
+                )
+            except Exception as e:
+                print(f"Error during block domain metrics export: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block domain metrics export:\n{str(e)}')
         
         def run_interpolation_only(self):
             """Run interpolation without visualization"""
@@ -4720,6 +6145,7 @@ if __name__ == "__main__":
                 sample_y_col = cfg.get('sample_y_col')
                 sample_z_col = cfg.get('sample_z_col')
                 sample_value_col = cfg.get('sample_value_col')
+                sample_domain_col = cfg.get('sample_domain_col')
                 wants_domain = bool(
                     cfg.get('algorithm') in ('string_theory', 'net_connector')
                     and str(cfg.get('string_theory_params', {}).get('interpolate_target', 'value')).strip().lower() == 'domain'
@@ -4729,6 +6155,11 @@ if __name__ == "__main__":
                     and str(cfg.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
                 )
                 wants_domain_any = wants_domain or wants_ant_domain
+                needs_sample_domains = should_resolve_sample_domains_for_interpolation(
+                    wants_domain_any,
+                    blocks_file=cfg.get('blocks_file'),
+                    block_domain_col=cfg.get('block_domain_col'),
+                )
 
                 df, _, explicit_sample_map = load_samples_dataframe(
                     samples_file,
@@ -4741,7 +6172,7 @@ if __name__ == "__main__":
                     progress_label='Reading sample file',
                 )
 
-                if wants_domain_any and explicit_sample_map:
+                if needs_sample_domains and explicit_sample_map:
                     if samples_header_line and samples_header_line != 1 and samples_delimiter:
                         df, _ = read_csv_with_selected_header(
                             samples_file,
@@ -4758,6 +6189,9 @@ if __name__ == "__main__":
                         )
                     explicit_sample_map = None
 
+                if needs_sample_domains:
+                    df = normalize_selected_sample_domain_column(df, sample_domain_col=sample_domain_col)
+
                 if explicit_sample_map:
                     pass
                 elif sample_x_col and sample_y_col and sample_z_col and sample_value_col:
@@ -4767,18 +6201,23 @@ if __name__ == "__main__":
                 df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
                 nan_before = int(df['Value'].isna().sum())
 
-                # Optional Domain column (string)
-                domain_like = None
-                for c in df.columns:
-                    if str(c).strip().lower() == 'domain':
-                        domain_like = c
-                        break
-                if domain_like and domain_like != 'Domain':
-                    df = df.rename(columns={domain_like: 'Domain'})
-
-                if wants_domain_any:
-                    if 'Domain' not in df.columns:
-                        raise ValueError("Domain interpolation selected but samples file has no 'Domain' column.")
+                if needs_sample_domains:
+                    df, domain_resolution = ensure_sample_domains_for_domain_operations(
+                        df,
+                        sample_domain_col=sample_domain_col,
+                        blank_domain_behavior=cfg.get('blank_sample_domain_behavior', 'skip'),
+                        x_col='x',
+                        y_col='y',
+                        z_col='z',
+                        blocks_file=cfg.get('blocks_file'),
+                        blocks_delimiter=cfg.get('blocks_delimiter'),
+                        blocks_header_line=cfg.get('blocks_header_line', 1),
+                        block_x_col=cfg.get('block_x_col'),
+                        block_y_col=cfg.get('block_y_col'),
+                        block_z_col=cfg.get('block_z_col'),
+                        block_domain_col=cfg.get('block_domain_col'),
+                        block_size=cfg.get('block_size'),
+                    )
                     df['Domain'] = df['Domain'].astype(str).str.strip()
                     blank_domain = df['Domain'].isna() | (df['Domain'].str.strip() == '') | (df['Domain'].str.lower() == 'nan')
                     blank_count = int(blank_domain.sum())
