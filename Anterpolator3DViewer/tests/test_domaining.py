@@ -12,7 +12,9 @@ if PROJECT_ROOT not in sys.path:
 from anterpolator3DViewer import (
     apply_blank_sample_domain_behavior,
     compute_domain_sensitive_assignment_mask,
+    detect_grid_rotation,
     ensure_sample_domains_for_domain_operations,
+    export_block_volume_weighted_average,
     export_block_domain_sample_metrics,
     export_domained_samples_from_blocks,
     load_large_blocks_metadata,
@@ -260,6 +262,101 @@ def test_export_block_domain_sample_metrics_uses_explicit_sample_domains_without
         assert output_df.loc[0, "dom_NN_Distance"] == 3.0
         assert output_df.loc[1, "dom_NN_Distance"] == 3.0
         assert output_df.loc[2, "dom_NN_Distance"] == 0.0
+
+
+def test_export_block_volume_weighted_average_infers_subblock_volumes_from_centroids():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        output_path = os.path.join(td, "blocks_weighted.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 2.5, "y": 5.0, "z": 5.0, "grade": 2.0},
+                {"x": 7.5, "y": 5.0, "z": 5.0, "grade": 4.0},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "grade": 10.0},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        result = export_block_volume_weighted_average(
+            blocks_path,
+            value_col="grade",
+            output_file=output_path,
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_size=(10, 10, 10),
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["processed_rows"] == 3
+        assert result["exported_rows"] == 1
+        assert result["rows_with_numeric_value"] == 3
+        assert result["total_volume"] == 2000.0
+        assert result["weighted_sum"] == 13000.0
+        assert result["weighted_average"] == 6.5
+        assert output_df.loc[0, "Total_Volume"] == 2000.0
+        assert output_df.loc[0, "Weighted_Sum"] == 13000.0
+        assert output_df.loc[0, "Weighted_Average"] == 6.5
+
+
+def test_export_block_volume_weighted_average_can_compute_domain_sensitive_summaries():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        output_path = os.path.join(td, "blocks_weighted.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 2.5, "y": 5.0, "z": 5.0, "grade": 2.0, "dom": "A"},
+                {"x": 7.5, "y": 5.0, "z": 5.0, "grade": 4.0, "dom": "A"},
+                {"x": 12.5, "y": 5.0, "z": 5.0, "grade": 10.0, "dom": "B"},
+                {"x": 17.5, "y": 5.0, "z": 5.0, "grade": 14.0, "dom": "B"},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        result = export_block_volume_weighted_average(
+            blocks_path,
+            value_col="grade",
+            output_file=output_path,
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_size=(10, 10, 10),
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["domain_column"] == "dom"
+        assert result["exported_rows"] == 2
+        assert result["domain_summaries"]["A"]["total_volume"] == 1000.0
+        assert result["domain_summaries"]["A"]["weighted_average"] == 3.0
+        assert result["domain_summaries"]["B"]["total_volume"] == 1000.0
+        assert result["domain_summaries"]["B"]["weighted_average"] == 12.0
+        assert output_df["dom"].tolist() == ["A", "B"]
+        assert output_df["Weighted_Average"].tolist() == [3.0, 12.0]
+        assert output_df["Total_Volume"].tolist() == [1000.0, 1000.0]
+
+
+def test_detect_grid_rotation_accepts_integer_points():
+    points = [
+        [0, 0, 0],
+        [10, 0, 0],
+        [0, 10, 0],
+        [10, 10, 0],
+        [0, 0, 10],
+        [10, 0, 10],
+        [0, 10, 10],
+        [10, 10, 10],
+        [20, 0, 0],
+        [20, 10, 0],
+    ]
+
+    rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(points, block_size_hint=(10, 10, 10))
+
+    assert rotation_matrix.shape == (3, 3)
+    assert rotation_center.shape == (3,)
+    assert bool(is_rotated) is False
 
 
 def test_normalize_selected_sample_domain_column_preserves_domain_when_value_column_matches():

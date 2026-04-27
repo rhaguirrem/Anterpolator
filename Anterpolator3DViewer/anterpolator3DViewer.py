@@ -870,6 +870,8 @@ def _collect_same_level_vectors(points, max_points=4096, max_points_per_level=25
     if len(points) == 0:
         return np.empty((0, 3), dtype=float)
 
+    points = np.asarray(points, dtype=float)
+
     if len(points) > max_points:
         sample_indices = np.linspace(0, len(points) - 1, num=max_points, dtype=int)
         sampled = points[sample_indices]
@@ -2530,6 +2532,22 @@ def resolve_block_domain_metrics_export_path(configured_path=None, blocks_file=N
     return os.path.join(output_dir, f"{base_name}+{domain_suffix}_sample_metrics.csv")
 
 
+def resolve_block_volume_weighted_average_export_path(configured_path=None, blocks_file=None, value_col=None):
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    if blocks_file and str(blocks_file).strip():
+        reference_path = str(blocks_file).strip()
+    else:
+        reference_path = 'blocks.csv'
+
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'blocks'
+    value_suffix = _sanitize_filename_fragment(value_col, fallback='Value')
+    return os.path.join(output_dir, f"{base_name}+{value_suffix}_volume_weighted.csv")
+
+
 def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_header_line=1,
                                 progress_label=None, progress_callback=None):
     delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
@@ -2756,6 +2774,118 @@ def _compute_point_to_set_distance_stats(query_points, reference_points, query_c
     if return_nearest_index:
         return nearest, average, nearest_indices
     return nearest, average
+
+
+def _cluster_axis_centers(values, tolerance):
+    values = np.asarray(values, dtype=float)
+    if len(values) == 0:
+        return np.empty(0, dtype=float)
+
+    sorted_values = np.sort(values)
+    clustered = [[float(sorted_values[0])]]
+    for value in sorted_values[1:]:
+        current = float(value)
+        if abs(current - clustered[-1][-1]) <= tolerance:
+            clustered[-1].append(current)
+        else:
+            clustered.append([current])
+
+    return np.array([float(np.mean(group)) for group in clustered], dtype=float)
+
+
+def _infer_subblock_axis_widths(local_axis_values, axis_extent, tolerance):
+    axis_extent = float(axis_extent)
+    if axis_extent <= 0:
+        raise ValueError('Block size components must be greater than zero.')
+
+    centers = _cluster_axis_centers(local_axis_values, tolerance)
+    if len(centers) == 0:
+        return np.empty(0, dtype=float)
+    if len(centers) == 1:
+        return np.full(len(local_axis_values), axis_extent, dtype=float)
+
+    boundaries = np.empty(len(centers) + 1, dtype=float)
+    boundaries[0] = 0.0
+    boundaries[-1] = axis_extent
+    boundaries[1:-1] = (centers[:-1] + centers[1:]) / 2.0
+
+    widths = np.diff(boundaries)
+    widths = np.clip(widths, 0.0, axis_extent)
+    nearest_indices = np.abs(np.asarray(local_axis_values, dtype=float)[:, None] - centers[None, :]).argmin(axis=1)
+    return widths[nearest_indices]
+
+
+def infer_block_row_volumes(block_coords, block_size, group_indices=None,
+                            progress_callback=None, progress_label='Inferring block volumes'):
+    coords = np.asarray(block_coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError('Block coordinates must be an Nx3 array.')
+
+    if isinstance(block_size, (list, tuple, np.ndarray)):
+        unified_dims = np.asarray(block_size, dtype=float)
+    else:
+        unified_dims = np.array([block_size, block_size, block_size], dtype=float)
+
+    if unified_dims.shape != (3,):
+        raise ValueError('Block size must contain exactly three values.')
+    if np.any(unified_dims <= 0):
+        raise ValueError('Block size values must be greater than zero.')
+
+    if len(coords) == 0:
+        empty_indices = np.empty((0, 3), dtype=int)
+        return np.empty(0, dtype=float), empty_indices
+
+    all_min_bounds = np.floor(coords.min(axis=0) / unified_dims) * unified_dims
+    if group_indices is None:
+        base_indices = np.floor((coords - all_min_bounds) / unified_dims + 1e-6).astype(int)
+    else:
+        base_indices = np.asarray(group_indices, dtype=int)
+        if base_indices.shape != coords.shape:
+            raise ValueError('Group indices must match the shape of block coordinates.')
+
+    local_coords = coords - (all_min_bounds + base_indices * unified_dims)
+    local_coords = np.clip(local_coords, 0.0, unified_dims)
+    volumes = np.empty(len(coords), dtype=float)
+
+    unique_base_indices, inverse = np.unique(base_indices, axis=0, return_inverse=True)
+    sorted_order = np.argsort(inverse, kind='stable')
+    sorted_inverse = inverse[sorted_order]
+    group_starts = np.flatnonzero(np.r_[True, sorted_inverse[1:] != sorted_inverse[:-1]])
+    group_ends = np.r_[group_starts[1:], len(sorted_order)]
+    total_groups = len(group_starts)
+    started_at = time.perf_counter()
+    next_terminal_report_at = started_at
+
+    for group_number, (group_start, group_end) in enumerate(zip(group_starts, group_ends), start=1):
+        group_indices_slice = sorted_order[group_start:group_end]
+        group_local = local_coords[group_indices_slice]
+        widths = []
+        for axis in range(3):
+            axis_tol = max(abs(float(unified_dims[axis])) * 1e-6, 1e-6)
+            widths.append(
+                _infer_subblock_axis_widths(
+                    group_local[:, axis],
+                    unified_dims[axis],
+                    axis_tol,
+                )
+            )
+        volumes[group_indices_slice] = widths[0] * widths[1] * widths[2]
+
+        if progress_callback and (group_number == total_groups or group_number % 500 == 0):
+            progress_callback(group_number, total_groups, progress_label)
+
+        now = time.perf_counter()
+        if now >= next_terminal_report_at:
+            elapsed_seconds = max(int(now - started_at), 0)
+            percent = int(round((group_number / max(total_groups, 1)) * 100)) if total_groups > 0 else 100
+            current_base_idx = unique_base_indices[sorted_inverse[group_start]].tolist()
+            print(
+                f"Volume inference progress: {group_number:,}/{total_groups:,} base blocks ({percent}%) processed; "
+                f"current base block={current_base_idx}; elapsed~{elapsed_seconds}s"
+            )
+            next_terminal_report_at = now + 5.0
+
+    return volumes, base_indices
 
 
 def build_concatenated_sample_ids(sample_df, id_columns):
@@ -3077,6 +3207,157 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
         'processed_blocks': int(processed_block_count),
         'blocks_with_samples_in_domain': int(populated_block_count),
         'invalid_coordinate_blocks': int((~valid_block_mask).sum()),
+    }
+
+
+def export_block_volume_weighted_average(blocks_file, value_col, output_file=None,
+                                         blocks_delimiter=None, blocks_header_line=1,
+                                         block_x_col=None, block_y_col=None, block_z_col=None,
+                                         block_domain_col=None,
+                                         block_size=None, progress_callback=None):
+    if not blocks_file or not os.path.isfile(blocks_file):
+        raise ValueError('Please select a valid blocks file.')
+
+    value_column_name = str(value_col or '').strip()
+    if not value_column_name or value_column_name == '(None)':
+        raise ValueError('Please select a value column in the blocks file.')
+    if block_size is None:
+        raise ValueError('Block size must be specified to infer sub-block volumes.')
+
+    output_file = resolve_block_volume_weighted_average_export_path(
+        output_file,
+        blocks_file=blocks_file,
+        value_col=value_column_name,
+    )
+    _emit_progress(progress_callback, 0, 100, 'Preparing block volume export...')
+
+    print(f"Loading blocks from {blocks_file}...")
+    df_blocks, output_delimiter = load_full_blocks_dataframe(
+        blocks_file,
+        blocks_delimiter=blocks_delimiter,
+        blocks_header_line=blocks_header_line,
+        progress_label='Reading blocks file',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 45, 'Reading blocks file...'),
+    )
+
+    block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
+        list(df_blocks.columns),
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+    )
+    if value_column_name not in df_blocks.columns:
+        raise ValueError(f'Selected value column not found in blocks file: {value_column_name}')
+
+    domain_column_name = str(block_domain_col or '').strip()
+    use_domain_column = bool(domain_column_name and domain_column_name != '(None)')
+    if use_domain_column and domain_column_name not in df_blocks.columns:
+        raise ValueError(f'Selected domain column not found in blocks file: {domain_column_name}')
+
+    block_coord_frame = df_blocks[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
+    value_series = pd.to_numeric(df_blocks[value_column_name], errors='coerce')
+    valid_coord_mask = block_coord_frame.notna().all(axis=1)
+    valid_coords = block_coord_frame.loc[valid_coord_mask].to_numpy(copy=False)
+    if use_domain_column:
+        domain_series = df_blocks[domain_column_name].fillna('').astype(str).str.strip()
+    else:
+        domain_series = pd.Series([''] * len(df_blocks), index=df_blocks.index, dtype=object)
+
+    if len(valid_coords) > 0:
+        print(f"Starting rotation detection for {len(valid_coords):,} valid block rows...")
+        rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(valid_coords, block_size_hint=block_size)
+        if is_rotated:
+            valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
+
+    _emit_progress(progress_callback, 46, 100, 'Inferring block volumes...')
+    inferred_volumes = np.full(len(df_blocks), np.nan, dtype=float)
+    base_indices_full = np.full((len(df_blocks), 3), -1, dtype=int)
+
+    if len(valid_coords) > 0:
+        print(f"Inferring sub-block volumes for {len(valid_coords):,} valid block rows...")
+        row_volumes, base_indices = infer_block_row_volumes(
+            valid_coords,
+            block_size,
+            progress_callback=_make_scaled_progress_callback(progress_callback, 46, 92, 'Inferring block volumes...'),
+            progress_label='Inferring block volumes...',
+        )
+        inferred_volumes[valid_coord_mask.to_numpy()] = row_volumes
+        base_indices_full[valid_coord_mask.to_numpy()] = base_indices
+
+    _emit_progress(progress_callback, 93, 100, 'Summarizing weighted averages...')
+
+    weighted_components = inferred_volumes * value_series.to_numpy(dtype=float, copy=False)
+    valid_weight_mask = valid_coord_mask.to_numpy() & value_series.notna().to_numpy() & np.isfinite(inferred_volumes)
+    total_volume = float(np.sum(inferred_volumes[valid_weight_mask])) if np.any(valid_weight_mask) else 0.0
+    weighted_sum = float(np.sum(weighted_components[valid_weight_mask])) if np.any(valid_weight_mask) else 0.0
+    weighted_average = float(weighted_sum / total_volume) if total_volume > 0 else np.nan
+
+    domain_summaries = {}
+
+    if use_domain_column:
+        domain_values = domain_series.to_numpy(dtype=object, copy=False)
+        valid_domain_mask = valid_weight_mask & domain_series.ne('').to_numpy()
+        for domain in sorted(domain_series.loc[valid_domain_mask].unique()):
+            domain_mask = valid_domain_mask & (domain_values == domain)
+            domain_volume = float(np.sum(inferred_volumes[domain_mask])) if np.any(domain_mask) else 0.0
+            domain_sum = float(np.sum(weighted_components[domain_mask])) if np.any(domain_mask) else 0.0
+            domain_average = float(domain_sum / domain_volume) if domain_volume > 0 else np.nan
+            domain_summaries[str(domain)] = {
+                'total_volume': domain_volume,
+                'weighted_sum': domain_sum,
+                'weighted_average': domain_average,
+                'rows_with_numeric_value': int(np.count_nonzero(domain_mask)),
+            }
+
+    summary_rows = []
+    if use_domain_column:
+        for domain, summary in sorted(domain_summaries.items()):
+            summary_rows.append(
+                {
+                    domain_column_name: domain,
+                    'Weighted_Average': summary['weighted_average'],
+                    'Weighted_Sum': summary['weighted_sum'],
+                    'Total_Volume': summary['total_volume'],
+                    'Rows_With_Numeric_Value': summary['rows_with_numeric_value'],
+                }
+            )
+    else:
+        summary_rows.append(
+            {
+                'Weighted_Average': weighted_average,
+                'Weighted_Sum': weighted_sum,
+                'Total_Volume': total_volume,
+                'Rows_With_Numeric_Value': int(np.count_nonzero(valid_weight_mask)),
+            }
+        )
+
+    output_df = pd.DataFrame(summary_rows)
+
+    output_dir = os.path.dirname(output_file) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+    _emit_progress(progress_callback, 99, 100, 'Writing block volume export...')
+    output_df.to_csv(output_file, index=False, sep=output_delimiter)
+    _emit_progress(progress_callback, 100, 100, 'Block volume export complete.')
+
+    print(f"Exported {len(output_df):,} summary rows to {output_file}")
+    print(
+        f"Volume-weighted average for '{value_column_name}': {weighted_average} "
+        f"(weighted sum={weighted_sum}, total volume={total_volume})"
+    )
+
+    return {
+        'output_file': output_file,
+        'value_column': value_column_name,
+        'domain_column': domain_column_name if use_domain_column else None,
+        'domain_summaries': domain_summaries,
+        'weighted_average': weighted_average,
+        'weighted_sum': weighted_sum,
+        'total_volume': total_volume,
+        'processed_rows': int(valid_coord_mask.sum()),
+        'rows_with_numeric_value': int(valid_weight_mask.sum()),
+        'exported_rows': int(len(output_df)),
+        'invalid_coordinate_rows': int((~valid_coord_mask).sum()),
+        'invalid_value_rows': int(value_series.isna().sum()),
     }
 
 
@@ -4996,14 +5277,16 @@ if __name__ == "__main__":
             files_form.addRow('Samples Columns (X Y Z Value Domain)', sample_map_layout)
 
             # Column mapping combo boxes for blocks
-            self.block_x_col = QtWidgets.QComboBox(); self.block_y_col = QtWidgets.QComboBox(); self.block_z_col = QtWidgets.QComboBox(); self.block_domain_col = QtWidgets.QComboBox()
-            for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col]:
+            self.block_x_col = QtWidgets.QComboBox(); self.block_y_col = QtWidgets.QComboBox(); self.block_z_col = QtWidgets.QComboBox(); self.block_domain_col = QtWidgets.QComboBox(); self.block_value_metric_col = QtWidgets.QComboBox()
+            for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col, self.block_value_metric_col]:
                 configure_column_combo(cb)
             self.block_domain_col.addItem('(None)')
+            self.block_value_metric_col.addItem('(None)')
             block_map_layout = QtWidgets.QHBoxLayout(); block_map_layout.addWidget(self.block_x_col); block_map_layout.addWidget(self.block_y_col); block_map_layout.addWidget(self.block_z_col); block_map_layout.addWidget(self.block_domain_col)
             for index in range(4):
                 block_map_layout.setStretch(index, 1)
             files_form.addRow('Blocks Columns (X Y Z Domain)', block_map_layout)
+            files_form.addRow('Blocks Metric Column', self.block_value_metric_col)
 
             # Block Size
             self.block_x = QtWidgets.QSpinBox(); self.block_x.setRange(1, 10000); self.block_x.setValue(10)
@@ -5062,12 +5345,14 @@ if __name__ == "__main__":
                     cb.clear()
                 # Domain retains (None) entry
                 current_domain = self.block_domain_col.currentText()
+                current_metric_col = self.block_value_metric_col.currentText()
                 self.block_domain_col.clear(); self.block_domain_col.addItem('(None)')
+                self.block_value_metric_col.clear(); self.block_value_metric_col.addItem('(None)')
                 if not os.path.isfile(path):
                     return
                 try:
                     cols = parse_header_line(path, delim, header_line)
-                    for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col]:
+                    for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col, self.block_value_metric_col]:
                         for c in cols:
                             cb.addItem(c)
                     # Auto-suggest
@@ -5080,10 +5365,15 @@ if __name__ == "__main__":
                     suggest(self.block_y_col, ['y','northing'])
                     suggest(self.block_z_col, ['z','elevation','rl'])
                     suggest(self.block_domain_col, ['domain','dom'])
+                    suggest(self.block_value_metric_col, ['value','grade'])
                     # Restore domain selection if possible
                     if current_domain and current_domain != '(None)':
                         idx = self.block_domain_col.findText(current_domain)
                         if idx >= 0: self.block_domain_col.setCurrentIndex(idx)
+                    if current_metric_col and current_metric_col != '(None)':
+                        idx = self.block_value_metric_col.findText(current_metric_col)
+                        if idx >= 0:
+                            self.block_value_metric_col.setCurrentIndex(idx)
                 except Exception:
                     pass
 
@@ -5119,6 +5409,13 @@ if __name__ == "__main__":
                     domain_col=self.block_domain_col.currentText(),
                 )
 
+            def suggested_block_volume_weighted_path():
+                return resolve_block_volume_weighted_average_export_path(
+                    None,
+                    blocks_file=self.blocks_edit.text().strip(),
+                    value_col=self.block_value_metric_col.currentText(),
+                )
+
             self.domain_samples_output_edit = QtWidgets.QLineEdit('')
             self.domain_samples_browse = QtWidgets.QPushButton('Browse')
             self.start_domaining_btn = QtWidgets.QPushButton('Start Domaining')
@@ -5126,11 +5423,15 @@ if __name__ == "__main__":
             self.block_domain_metrics_browse = QtWidgets.QPushButton('Browse')
             self.configure_block_domain_metrics_filters_btn = QtWidgets.QPushButton('Configure Filters...')
             self.start_block_domain_metrics_btn = QtWidgets.QPushButton('Export Metrics')
+            self.block_volume_weighted_output_edit = QtWidgets.QLineEdit('')
+            self.block_volume_weighted_browse = QtWidgets.QPushButton('Browse')
+            self.start_block_volume_weighted_btn = QtWidgets.QPushButton('Export Volume Weighted Average')
             self.block_domain_sample_filters = []
             self.block_domain_metrics_filters_summary = QtWidgets.QLabel('No sample filters configured. All samples will be used.')
             self.block_domain_metrics_filters_summary.setWordWrap(True)
             self._domain_samples_auto_path = ''
             self._block_domain_metrics_auto_path = ''
+            self._block_volume_weighted_auto_path = ''
 
             def refresh_domain_samples_output_path(force=False):
                 suggested = suggested_domain_samples_path()
@@ -5145,6 +5446,13 @@ if __name__ == "__main__":
                 if force or not current or current == self._block_domain_metrics_auto_path:
                     self.block_domain_metrics_output_edit.setText(suggested)
                 self._block_domain_metrics_auto_path = suggested
+
+            def refresh_block_volume_weighted_output_path(force=False):
+                suggested = suggested_block_volume_weighted_path()
+                current = self.block_volume_weighted_output_edit.text().strip()
+                if force or not current or current == self._block_volume_weighted_auto_path:
+                    self.block_volume_weighted_output_edit.setText(suggested)
+                self._block_volume_weighted_auto_path = suggested
 
             def browse_domain_samples_output():
                 initial_path = self.domain_samples_output_edit.text().strip() or suggested_domain_samples_path()
@@ -5167,6 +5475,17 @@ if __name__ == "__main__":
                 )
                 if path:
                     self.block_domain_metrics_output_edit.setText(path)
+
+            def browse_block_volume_weighted_output():
+                initial_path = self.block_volume_weighted_output_edit.text().strip() or suggested_block_volume_weighted_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Block Volume Weighted Output File',
+                    initial_path,
+                    'CSV Files (*.csv)'
+                )
+                if path:
+                    self.block_volume_weighted_output_edit.setText(path)
 
             domain_samples_group = QtWidgets.QGroupBox('Domain Samples')
             domain_samples_form = QtWidgets.QFormLayout()
@@ -5195,17 +5514,33 @@ if __name__ == "__main__":
             block_metrics_form.addRow('', self.start_block_domain_metrics_btn)
             operations_form.addRow(block_metrics_group)
 
+            block_volume_group = QtWidgets.QGroupBox('Block Volume Weighted Average')
+            block_volume_form = QtWidgets.QFormLayout()
+            block_volume_group.setLayout(block_volume_form)
+            block_volume_output_layout = QtWidgets.QHBoxLayout()
+            block_volume_output_layout.addWidget(self.block_volume_weighted_output_edit)
+            block_volume_output_layout.addWidget(self.block_volume_weighted_browse)
+            block_volume_form.addRow('Output File', block_volume_output_layout)
+            block_volume_form.addRow('Weighted Column', self.block_value_metric_col)
+            block_volume_form.addRow('', self.start_block_volume_weighted_btn)
+            operations_form.addRow(block_volume_group)
+
             self.domain_samples_browse.clicked.connect(browse_domain_samples_output)
             self.start_domaining_btn.clicked.connect(self.run_domain_samples_only)
             self.block_domain_metrics_browse.clicked.connect(browse_block_domain_metrics_output)
             self.configure_block_domain_metrics_filters_btn.clicked.connect(self.configure_block_domain_metrics_filters)
             self.start_block_domain_metrics_btn.clicked.connect(self.run_block_domain_sample_metrics_only)
+            self.block_volume_weighted_browse.clicked.connect(browse_block_volume_weighted_output)
+            self.start_block_volume_weighted_btn.clicked.connect(self.run_block_volume_weighted_average_only)
             self.samples_edit.textChanged.connect(lambda _: refresh_domain_samples_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
+            self.blocks_edit.textChanged.connect(lambda _: refresh_block_volume_weighted_output_path())
             self.block_domain_col.currentTextChanged.connect(lambda _: refresh_domain_samples_output_path())
             self.block_domain_col.currentTextChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
+            self.block_value_metric_col.currentTextChanged.connect(lambda _: refresh_block_volume_weighted_output_path())
             refresh_domain_samples_output_path(force=True)
             refresh_block_domain_metrics_output_path(force=True)
+            refresh_block_volume_weighted_output_path(force=True)
             self._update_block_domain_metrics_filters_summary()
 
             # === ANT COLONY TAB ===
@@ -5582,6 +5917,7 @@ if __name__ == "__main__":
                 'block_evaluated_samples_file': self.block_evaluated_samples_edit.text(),
                 'domain_samples_file': self.domain_samples_output_edit.text(),
                 'block_domain_metrics_file': self.block_domain_metrics_output_edit.text(),
+                'block_volume_weighted_file': self.block_volume_weighted_output_edit.text(),
                 'block_domain_metrics_closest_sample_id_cols': [cb.currentText() for cb in self.block_domain_metrics_id_cols],
                 'block_domain_sample_filters': [dict(entry) for entry in self.block_domain_sample_filters],
                 'algorithm': self.algorithm_combo.currentText(),
@@ -5599,6 +5935,7 @@ if __name__ == "__main__":
                 'block_y_col': self.block_y_col.currentText(),
                 'block_z_col': self.block_z_col.currentText(),
                 'block_domain_col': self.block_domain_col.currentText(),
+                'block_value_metric_col': self.block_value_metric_col.currentText(),
                 'block_size': (self.block_x.value(), self.block_y.value(), self.block_z.value()),
                 'range_size': self.range_size.value(),
                 'max_pheromone': self.max_pheromone.value(),
@@ -5684,9 +6021,11 @@ if __name__ == "__main__":
                 if 'block_domain_col' in config: self.block_domain_col.setCurrentText(config['block_domain_col'])
                 if 'domain_samples_file' in config: self.domain_samples_output_edit.setText(config['domain_samples_file'])
                 if 'block_domain_metrics_file' in config: self.block_domain_metrics_output_edit.setText(config['block_domain_metrics_file'])
+                if 'block_volume_weighted_file' in config: self.block_volume_weighted_output_edit.setText(config['block_volume_weighted_file'])
                 if 'block_domain_metrics_closest_sample_id_cols' in config:
                     for cb, column_name in zip(self.block_domain_metrics_id_cols, config['block_domain_metrics_closest_sample_id_cols']):
                         cb.setCurrentText(column_name)
+                if 'block_value_metric_col' in config: self.block_value_metric_col.setCurrentText(config['block_value_metric_col'])
                 if 'block_domain_sample_filters' in config:
                     self.block_domain_sample_filters = [dict(entry) for entry in config['block_domain_sample_filters']]
                     self._update_block_domain_metrics_filters_summary()
@@ -5894,6 +6233,7 @@ if __name__ == "__main__":
         def _set_operation_buttons_enabled(self, enabled):
             self.start_domaining_btn.setEnabled(enabled)
             self.start_block_domain_metrics_btn.setEnabled(enabled)
+            self.start_block_volume_weighted_btn.setEnabled(enabled)
 
         def _run_operation_with_progress(self, title, initial_message, operation, kwargs,
                                          success_handler, error_context):
@@ -6117,6 +6457,79 @@ if __name__ == "__main__":
                 print(f"Error during block domain metrics export: {e}")
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block domain metrics export:\n{str(e)}')
+
+        def run_block_volume_weighted_average_only(self):
+            """Export inferred per-row block volumes and compute a volume-weighted average for a selected blocks column."""
+            try:
+                cfg = self.to_dict()
+                output_file = resolve_block_volume_weighted_average_export_path(
+                    cfg.get('block_volume_weighted_file'),
+                    blocks_file=cfg.get('blocks_file'),
+                    value_col=cfg.get('block_value_metric_col'),
+                )
+                self.block_volume_weighted_output_edit.setText(output_file)
+
+                print("=" * 60)
+                print("Calculating block volume weighted average...")
+                print("=" * 60)
+
+                def handle_success(result):
+                    weighted_average = result['weighted_average']
+                    weighted_average_text = 'NaN' if pd.isna(weighted_average) else f"{weighted_average:.12g}"
+                    domain_lines = ''
+                    if result.get('domain_column') and result.get('domain_summaries'):
+                        preview = []
+                        for domain, summary in sorted(result['domain_summaries'].items()):
+                            avg_text = 'NaN' if pd.isna(summary['weighted_average']) else f"{summary['weighted_average']:.12g}"
+                            preview.append(
+                                f"{domain}: avg={avg_text}, vol={summary['total_volume']:.12g}, rows={summary['rows_with_numeric_value']:,}"
+                            )
+                        domain_lines = (
+                            f"\nDomain column: {result['domain_column']}\n"
+                            f"Domain summaries:\n" + '\n'.join(preview[:8])
+                        )
+                        if len(preview) > 8:
+                            domain_lines += f"\n... and {len(preview) - 8} more domains"
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"Block volume export complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Weighted column: {result['value_column']}\n"
+                            f"Volume-weighted average: {weighted_average_text}\n"
+                            f"Total volume: {result['total_volume']:.12g}\n"
+                            f"Weighted sum: {result['weighted_sum']:.12g}\n"
+                            f"Processed rows: {result['processed_rows']:,}\n"
+                            f"Rows with numeric value: {result['rows_with_numeric_value']:,}\n"
+                            f"Invalid coordinates: {result['invalid_coordinate_rows']:,}\n"
+                            f"Invalid values: {result['invalid_value_rows']:,}"
+                            f"{domain_lines}"
+                        ),
+                    )
+
+                self._run_operation_with_progress(
+                    'Block Volume Weighted Average',
+                    'Preparing block volume export...',
+                    export_block_volume_weighted_average,
+                    {
+                        'blocks_file': cfg.get('blocks_file'),
+                        'value_col': cfg.get('block_value_metric_col'),
+                        'output_file': output_file,
+                        'blocks_delimiter': cfg.get('blocks_delimiter'),
+                        'blocks_header_line': cfg.get('blocks_header_line', 1),
+                        'block_x_col': cfg.get('block_x_col'),
+                        'block_y_col': cfg.get('block_y_col'),
+                        'block_z_col': cfg.get('block_z_col'),
+                        'block_domain_col': cfg.get('block_domain_col'),
+                        'block_size': cfg.get('block_size'),
+                    },
+                    handle_success,
+                    'An error occurred during block volume export',
+                )
+            except Exception as e:
+                print(f"Error during block volume export: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block volume export:\n{str(e)}')
         
         def run_interpolation_only(self):
             """Run interpolation without visualization"""
