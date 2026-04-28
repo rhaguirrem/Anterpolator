@@ -380,6 +380,58 @@ def iterate_csv_with_progress(path, progress_label, progress_callback=None, **re
 
     return _generator()
 
+
+def _estimate_csv_chunk_progress(path, header_line=1, sample_bytes=8 * 1024 * 1024):
+    total_bytes = max(os.path.getsize(path), 1)
+    skipped_lines = max(int(header_line or 1), 0)
+
+    with open(path, 'rb') as handle:
+        for _ in range(skipped_lines):
+            if handle.readline() == b'':
+                return total_bytes, total_bytes, None
+        data_start_offset = handle.tell()
+        sample = handle.read(sample_bytes)
+
+    row_count = sample.count(b'\n')
+    if row_count <= 0:
+        return total_bytes, data_start_offset, None
+    return total_bytes, data_start_offset, len(sample) / row_count
+
+
+def iterate_csv_path_chunks_with_progress(path, progress_label, progress_callback=None, header_line=1, **read_csv_kwargs):
+    read_csv_kwargs = prepare_csv_read_kwargs(path, **read_csv_kwargs)
+    total_bytes, data_start_offset, bytes_per_row = _estimate_csv_chunk_progress(
+        path,
+        header_line=header_line,
+    )
+
+    def _generator():
+        processed_rows = 0
+        if progress_callback:
+            try:
+                progress_callback(min(data_start_offset, total_bytes), total_bytes, progress_label)
+            except Exception:
+                pass
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', pd.errors.DtypeWarning)
+            for chunk in pd.read_csv(path, **read_csv_kwargs):
+                processed_rows += len(chunk)
+                if progress_callback and bytes_per_row is not None:
+                    estimated_bytes = min(total_bytes, int(data_start_offset + processed_rows * bytes_per_row))
+                    try:
+                        progress_callback(estimated_bytes, total_bytes, progress_label)
+                    except Exception:
+                        pass
+                yield chunk
+        if progress_callback:
+            try:
+                progress_callback(total_bytes, total_bytes, progress_label)
+            except Exception:
+                pass
+        print(f"{progress_label}: processed {processed_rows:,} rows from {os.path.basename(path)}")
+
+    return _generator()
+
 def build_unique_column_names(headers):
     name_counts = {}
     final_names = []
@@ -390,7 +442,8 @@ def build_unique_column_names(headers):
         name_counts[key] = count + 1
     return final_names
 
-def read_selected_columns_with_header(path, delimiter, header_line, selected_columns, progress_label=None):
+def read_selected_columns_with_header(path, delimiter, header_line, selected_columns, progress_label=None,
+                                      progress_callback=None):
     headers = parse_header_line(path, delimiter, header_line)
     final_names = build_unique_column_names(headers)
     missing = [col for col in selected_columns if col not in final_names]
@@ -405,7 +458,7 @@ def read_selected_columns_with_header(path, delimiter, header_line, selected_col
         usecols=selected_columns,
     )
     if progress_label:
-        df = read_csv_with_progress(path, progress_label, **read_kwargs)
+        df = read_csv_with_progress(path, progress_label, progress_callback=progress_callback, **read_kwargs)
     else:
         df = pd.read_csv(path, **prepare_csv_read_kwargs(path, **read_kwargs))
     df = strip_leading_non_data_rows(df)
@@ -414,11 +467,16 @@ def read_selected_columns_with_header(path, delimiter, header_line, selected_col
 
 def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_line=1,
                           sample_x_col=None, sample_y_col=None, sample_z_col=None, sample_value_col=None,
-                          progress_label=None):
+                          sample_domain_col=None, sample_filters=None, progress_label=None):
     explicit_mapping = all([sample_x_col, sample_y_col, sample_z_col, sample_value_col])
     if explicit_mapping:
         delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
         selected_columns = [sample_x_col, sample_y_col, sample_z_col, sample_value_col]
+        selected_domain_col = str(sample_domain_col or '').strip()
+        if selected_domain_col and selected_domain_col != '(None)':
+            selected_columns.append(selected_domain_col)
+        selected_columns.extend(collect_filter_fields(sample_filters))
+        selected_columns = list(dict.fromkeys(selected_columns))
         df, parsed_cols = read_selected_columns_with_header(
             samples_file,
             delimiter,
@@ -426,6 +484,8 @@ def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_
             selected_columns,
             progress_label=progress_label,
         )
+        if sample_filters:
+            df, _ = apply_sample_filters(df, sample_filters=sample_filters)
         rename_map = {
             sample_x_col: 'x',
             sample_y_col: 'y',
@@ -446,6 +506,8 @@ def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_
     else:
         df = read_autodetect_csv(samples_file, forced_delimiter=samples_delimiter, progress_label=progress_label)
         parsed_cols = None
+    if sample_filters:
+        df, _ = apply_sample_filters(df, sample_filters=sample_filters)
     return df, parsed_cols, None
 
 
@@ -472,7 +534,7 @@ def normalize_selected_sample_domain_column(df, sample_domain_col=None):
 def infer_sample_domains_from_blocks(sample_coords, blocks_file, block_size,
                                      blocks_delimiter=None, blocks_header_line=1,
                                      block_x_col=None, block_y_col=None, block_z_col=None,
-                                     block_domain_col=None, progress_callback=None):
+                                     block_domain_col=None, block_filters=None, progress_callback=None):
     coords = np.asarray(sample_coords, dtype=float)
     if len(coords) == 0:
         return np.empty(0, dtype=object)
@@ -496,6 +558,7 @@ def infer_sample_domains_from_blocks(sample_coords, blocks_file, block_size,
         block_y_col=block_y_col,
         block_z_col=block_z_col,
         block_domain_col=domain_column_name,
+        block_filters=block_filters,
         config=None,
         progress_callback=progress_callback,
     )
@@ -521,7 +584,8 @@ def apply_blank_sample_domain_behavior(df, blank_domain_behavior='skip', domain_
                                        x_col='x', y_col='y', z_col='z',
                                        blocks_file=None, blocks_delimiter=None, blocks_header_line=1,
                                        block_x_col=None, block_y_col=None, block_z_col=None,
-                                       block_domain_col=None, block_size=None, progress_callback=None):
+                                       block_domain_col=None, block_size=None, block_filters=None,
+                                       progress_callback=None):
     if domain_col not in df.columns:
         return df, {'blank_domains': 0, 'inferred_domains': 0, 'remaining_blank_domains': 0}
 
@@ -566,6 +630,7 @@ def apply_blank_sample_domain_behavior(df, blank_domain_behavior='skip', domain_
                     block_y_col=block_y_col,
                     block_z_col=block_z_col,
                     block_domain_col=block_domain_col,
+                    block_filters=block_filters,
                     progress_callback=progress_callback,
                 )
                 inferred_series = pd.Series(inferred_domains, index=inferable_index, dtype=object).fillna('').astype(str).str.strip()
@@ -592,7 +657,8 @@ def ensure_sample_domains_for_domain_operations(df, sample_domain_col=None, blan
                                                 x_col='x', y_col='y', z_col='z',
                                                 blocks_file=None, blocks_delimiter=None, blocks_header_line=1,
                                                 block_x_col=None, block_y_col=None, block_z_col=None,
-                                                block_domain_col=None, block_size=None, progress_callback=None):
+                                                block_domain_col=None, block_size=None, block_filters=None,
+                                                progress_callback=None):
     updated_df = normalize_selected_sample_domain_column(df, sample_domain_col=sample_domain_col)
     if 'Domain' not in updated_df.columns:
         print('No sample domain column available. Inferring domains for all samples from blocks...')
@@ -615,6 +681,7 @@ def ensure_sample_domains_for_domain_operations(df, sample_domain_col=None, blan
                 block_y_col=block_y_col,
                 block_z_col=block_z_col,
                 block_domain_col=block_domain_col,
+                block_filters=block_filters,
                 progress_callback=progress_callback,
             )
             inferred_series = pd.Series(inferred_domains, index=inferable_index, dtype=object).fillna('').astype(str).str.strip()
@@ -637,6 +704,7 @@ def ensure_sample_domains_for_domain_operations(df, sample_domain_col=None, blan
         block_z_col=block_z_col,
         block_domain_col=block_domain_col,
         block_size=block_size,
+        block_filters=block_filters,
         progress_callback=progress_callback,
     )
 
@@ -673,7 +741,7 @@ def compute_domain_sensitive_assignment_mask(block_indices, allowed_grid, domain
         domain_match_mask[index] = sample_domain == block_domain
     return allowed_mask & domain_match_mask
 
-def build_domain_catalog_cache_signature(blocks_file, delimiter, header_line, domain_col):
+def build_domain_catalog_cache_signature(blocks_file, delimiter, header_line, domain_col, block_filters=None):
     stats = os.stat(blocks_file)
     return {
         'path': os.path.abspath(blocks_file),
@@ -682,32 +750,72 @@ def build_domain_catalog_cache_signature(blocks_file, delimiter, header_line, do
         'delimiter': delimiter,
         'header_line': int(header_line or 1),
         'domain_col': str(domain_col or ''),
+        'block_filters': json.dumps(block_filters or [], sort_keys=True),
     }
 
 def load_block_domain_catalog(blocks_file, delimiter, header_line, domain_col,
-                              chunksize=250_000, progress_callback=None):
+                              block_filters=None, chunksize=250_000, progress_callback=None):
     headers = parse_header_line(blocks_file, delimiter, header_line)
     final_names = build_unique_column_names(headers)
     if domain_col not in final_names:
         raise ValueError(f'Domain column "{domain_col}" not found in blocks file.')
 
     domains = set()
+    filter_fields = collect_filter_fields(block_filters)
+    selected_columns = list(dict.fromkeys([domain_col] + filter_fields))
+
+    use_direct_read = (not block_filters) or (os.path.getsize(blocks_file) < LARGE_BLOCK_FILE_THRESHOLD)
+
+    if use_direct_read:
+        _emit_progress(progress_callback, 0, 100, 'Reading domain column...')
+        df, _ = read_selected_columns_with_header(
+            blocks_file,
+            delimiter,
+            header_line,
+            selected_columns,
+        )
+        if block_filters:
+            _emit_progress(progress_callback, 80, 100, 'Applying block filters...')
+            df, _ = apply_dataframe_filters(
+                df,
+                filters=block_filters,
+                filter_subject='block',
+                source_label='blocks file',
+                emit_logs=False,
+            )
+        if domain_col not in df.columns or len(df) == 0:
+            _emit_progress(progress_callback, 100, 100, 'Reading domain column complete.')
+            return []
+        values = df[domain_col].dropna().astype(str).str.strip()
+        values = values[(values != '') & (values.str.lower() != 'nan')]
+        _emit_progress(progress_callback, 100, 100, 'Reading domain column complete.')
+        return sorted(set(values.tolist()))
+
     read_kwargs = dict(
         delimiter=delimiter,
         header=None,
         names=final_names,
         skiprows=header_line,
         comment='#',
-        usecols=[domain_col],
+        usecols=selected_columns,
         chunksize=chunksize,
     )
 
-    for chunk in iterate_csv_with_progress(
+    for chunk in iterate_csv_path_chunks_with_progress(
         blocks_file,
         'Reading domain column',
         progress_callback=progress_callback,
+        header_line=header_line,
         **read_kwargs,
     ):
+        if block_filters:
+            chunk, _ = apply_dataframe_filters(
+                chunk,
+                filters=block_filters,
+                filter_subject='block',
+                source_label='blocks file chunk',
+                emit_logs=False,
+            )
         if domain_col not in chunk.columns or len(chunk) == 0:
             continue
         values = chunk[domain_col].dropna().astype(str).str.strip()
@@ -1091,7 +1199,8 @@ def resolve_base_block_domains_from_counts(grouped_domains, policy='majority'):
 
     return domain_mapping, subblock_counts, mixed_domain_blocks
 
-def plan_block_file_columns(header_names, block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None):
+def plan_block_file_columns(header_names, block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
+                            extra_columns=None):
     available_cols = [c for c in header_names if str(c).strip() != '']
     if block_x_col and block_y_col and block_z_col:
         rename_map = {}
@@ -1117,14 +1226,22 @@ def plan_block_file_columns(header_names, block_x_col=None, block_y_col=None, bl
         rename_map = {src: tgt for src, tgt in zip(selected_columns, ['x', 'y', 'z', 'Domain'])}
         domain_copy_source = None
         mapping_mode = 'positional'
+    for column_name in extra_columns or []:
+        if column_name not in header_names:
+            raise ValueError(f"Selected block filter column '{column_name}' not found in blocks file.")
+        if column_name not in selected_columns:
+            selected_columns.append(column_name)
     return selected_columns, rename_map, domain_copy_source, mapping_mode
 
-def normalize_block_chunk(chunk, rename_map, domain_copy_source=None):
+def normalize_block_chunk(chunk, rename_map, domain_copy_source=None, extra_keep_columns=None):
     if domain_copy_source and 'Domain' not in chunk.columns and domain_copy_source in chunk.columns:
         chunk['Domain'] = chunk[domain_copy_source]
     if rename_map:
         chunk = chunk.rename(columns=rename_map)
     keep_columns = [c for c in ['x', 'y', 'z', 'Domain'] if c in chunk.columns]
+    for column_name in extra_keep_columns or []:
+        if column_name in chunk.columns and column_name not in keep_columns:
+            keep_columns.append(column_name)
     chunk = chunk.loc[:, keep_columns].copy()
     rows_before = len(chunk)
     for column in ['x', 'y', 'z']:
@@ -1140,15 +1257,18 @@ def normalize_block_chunk(chunk, rename_map, domain_copy_source=None):
 
 def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, points,
                                block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
-                               config=None, progress_callback=None):
+                               block_filters=None, config=None, progress_callback=None):
     headers = parse_header_line(blocks_file, delimiter, header_line)
     final_names = build_unique_column_names(headers)
+    effective_block_filters = [dict(entry) for entry in (block_filters or get_configured_block_filters(config))]
+    filter_fields = collect_filter_fields(effective_block_filters)
     selected_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
         final_names,
         block_x_col=block_x_col,
         block_y_col=block_y_col,
         block_z_col=block_z_col,
         block_domain_col=block_domain_col,
+        extra_columns=filter_fields,
     )
     chunksize = 250_000
     skipped_domains = set()
@@ -1185,7 +1305,15 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         progress_callback=rotation_progress,
         **base_read_kwargs,
     ):
-        chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
+        if effective_block_filters:
+            chunk, _ = apply_dataframe_filters(
+                chunk,
+                filters=effective_block_filters,
+                filter_subject='block',
+                source_label='blocks file chunk',
+                emit_logs=False,
+            )
+        chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source, extra_keep_columns=filter_fields)
         if len(chunk) == 0:
             continue
         rotation_samples.append(chunk[['x', 'y', 'z']].to_numpy())
@@ -1208,20 +1336,38 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
     else:
         raise ValueError("Block size must be specified when streaming large blocks files.")
 
-    print("Building bounds...")
+    print("Building bounds and domain mapping...")
     all_min_bounds = None
     all_max_bounds = None
+    min_quantized_idx = None
+    max_quantized_idx = None
 
     full_read_kwargs = dict(base_read_kwargs)
 
-    bounds_progress = _make_scaled_progress_callback(progress_callback, 25, 60, 'Reading grid file (bounds)')
+    grouped_domain_counts = {}
+    skipped_count_total = 0
+    resolved_rows = 0
+    total_block_rows = 0
+    filtered_block_rows = 0
+
+    mapping_progress = _make_scaled_progress_callback(progress_callback, 25, 90, 'Reading grid file (bounds + domain mapping)')
     for chunk in iterate_csv_with_progress(
         blocks_file,
-        "Reading grid file (bounds)",
-        progress_callback=bounds_progress,
+        "Reading grid file (bounds + domain mapping)",
+        progress_callback=mapping_progress,
         **full_read_kwargs,
     ):
-        chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
+        total_block_rows += int(len(chunk))
+        if effective_block_filters:
+            chunk, _ = apply_dataframe_filters(
+                chunk,
+                filters=effective_block_filters,
+                filter_subject='block',
+                source_label='blocks file chunk',
+                emit_logs=False,
+            )
+            filtered_block_rows += int(len(chunk))
+        chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source, extra_keep_columns=filter_fields)
         if len(chunk) == 0:
             continue
 
@@ -1238,34 +1384,15 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
             all_min_bounds = np.minimum(all_min_bounds, chunk_min)
             all_max_bounds = np.maximum(all_max_bounds, chunk_max)
 
-    if all_min_bounds is None or all_max_bounds is None:
-        raise ValueError('Could not determine grid bounds from blocks file.')
-
-    _emit_progress(progress_callback, 62, 100, 'Calculating grid dimensions...')
-    dims_grid = np.ceil((all_max_bounds - all_min_bounds) / unified_dims).astype(int)
-    print('Calculated grid dimensions:', dims_grid)
-
-    print("Building domain mapping...")
-    grouped_domain_counts = {}
-    skipped_count_total = 0
-    resolved_rows = 0
-
-    mapping_progress = _make_scaled_progress_callback(progress_callback, 65, 100, 'Reading grid file (domain mapping)')
-    for chunk in iterate_csv_with_progress(
-        blocks_file,
-        "Reading grid file (domain mapping)",
-        progress_callback=mapping_progress,
-        **full_read_kwargs,
-    ):
-        chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source)
-        if len(chunk) == 0:
-            continue
-
-        coords = chunk[['x', 'y', 'z']].to_numpy(copy=False)
-        if is_rotated:
-            coords = (coords - rotation_center) @ rotation_matrix.T
-
-        grid_indices = np.floor((coords - all_min_bounds) / unified_dims + 1e-6).astype(int)
+        absolute_grid_indices = np.floor(coords / unified_dims + 1e-6).astype(int)
+        chunk_min_idx = absolute_grid_indices.min(axis=0)
+        chunk_max_idx = absolute_grid_indices.max(axis=0)
+        if min_quantized_idx is None:
+            min_quantized_idx = chunk_min_idx
+            max_quantized_idx = chunk_max_idx
+        else:
+            min_quantized_idx = np.minimum(min_quantized_idx, chunk_min_idx)
+            max_quantized_idx = np.maximum(max_quantized_idx, chunk_max_idx)
 
         if 'Domain' in chunk.columns:
             domains = chunk['Domain'].fillna("Undomained").astype(str).str.strip().replace('', "Undomained")
@@ -1275,7 +1402,7 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         if skipped_domains:
             keep_mask = ~domains.isin(skipped_domains)
             skipped_count_total += int((~keep_mask).sum())
-            grid_indices = grid_indices[keep_mask.to_numpy()]
+            absolute_grid_indices = absolute_grid_indices[keep_mask.to_numpy()]
             domains = domains[keep_mask].reset_index(drop=True)
 
         if len(domains) == 0:
@@ -1284,9 +1411,9 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         resolved_rows += len(domains)
         grouped = pd.DataFrame(
             {
-                'ix': grid_indices[:, 0],
-                'iy': grid_indices[:, 1],
-                'iz': grid_indices[:, 2],
+                'ix': absolute_grid_indices[:, 0],
+                'iy': absolute_grid_indices[:, 1],
+                'iz': absolute_grid_indices[:, 2],
                 'Domain': domains.to_numpy(copy=False),
             }
         ).groupby(['ix', 'iy', 'iz', 'Domain'], sort=False).size()
@@ -1296,10 +1423,33 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
             domain_counts = grouped_domain_counts.setdefault(base_idx, Counter())
             domain_counts[str(domain)] += int(count)
 
+    if all_min_bounds is None or all_max_bounds is None or min_quantized_idx is None or max_quantized_idx is None:
+        raise ValueError('Could not determine grid bounds from blocks file.')
+
+    _emit_progress(progress_callback, 92, 100, 'Calculating grid dimensions...')
+    dims_grid = (max_quantized_idx - min_quantized_idx + 1).astype(int)
+    all_min_bounds = min_quantized_idx.astype(float) * unified_dims
+    all_max_bounds = all_min_bounds + dims_grid * unified_dims
+    print('Calculated grid dimensions:', dims_grid)
+    print("Finalizing domain mapping...")
+
+    if np.any(min_quantized_idx != 0):
+        shifted_grouped_domain_counts = {}
+        min_quantized_idx_tuple = tuple(int(v) for v in min_quantized_idx)
+        for base_idx, domain_counts in grouped_domain_counts.items():
+            shifted_idx = tuple(int(base_idx[axis] - min_quantized_idx_tuple[axis]) for axis in range(3))
+            shifted_grouped_domain_counts[shifted_idx] = domain_counts
+        grouped_domain_counts = shifted_grouped_domain_counts
+
     if skipped_domains:
         print(f"Skipping domains: {skipped_domains}")
         if skipped_count_total > 0:
             print(f"Skipped {skipped_count_total:,} sub-block rows due to domain overrides.")
+
+    if effective_block_filters:
+        print(
+            f"Block filtering complete: {filtered_block_rows:,} of {total_block_rows:,} rows satisfy all block filters."
+        )
 
     subblock_domain_policy = 'majority'
     if config:
@@ -1326,7 +1476,7 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         'rotation_center': rotation_center,
         'is_rotated': is_rotated,
         'grid_reference': np.array(all_min_bounds, copy=True),
-        'min_quantized_idx': np.zeros(3, dtype=int),
+        'min_quantized_idx': np.array(min_quantized_idx, copy=True),
     }
 
 def create_blocks(points, values, block_size=10, verbose=False, range_size=10, max_pheromone=150,
@@ -1353,6 +1503,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         print("Loading predefined cells from blocks_file...")
         load_pbar = tqdm(total=7, desc="Blocks loading phases", unit="phase")
         load_pbar.set_postfix_str("reading blocks file")
+        block_filters = get_configured_block_filters(config)
         use_streaming_blocks = os.path.getsize(blocks_file) >= LARGE_BLOCK_FILE_THRESHOLD
         if use_streaming_blocks:
             if not blocks_delimiter:
@@ -1378,6 +1529,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             rotation_matrix = metadata['rotation_matrix']
             rotation_center = metadata['rotation_center']
             is_rotated = metadata['is_rotated']
+            if is_rotated:
+                points = (np.asarray(points, dtype=float) - rotation_center) @ rotation_matrix.T
+                print("Applied rotation to sample points.")
             load_pbar.update(4)
         elif blocks_header_line and blocks_header_line != 1 and blocks_delimiter:
             # Use custom header line parsing
@@ -1413,6 +1567,13 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                         print(f"Predefined cells read from blocks_file: {len(df_blocks):,}")
                     except Exception as e:
                         print(f"Alternate delimiter parse failed: {e}")
+            if block_filters:
+                df_blocks, _ = apply_dataframe_filters(
+                    df_blocks,
+                    filters=block_filters,
+                    filter_subject='block',
+                    source_label='blocks file',
+                )
             load_pbar.update(1)
             load_pbar.set_postfix_str("normalizing headers")
             # Robust header normalization for blocks
@@ -1643,7 +1804,15 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'rotation_center': rotation_center if is_rotated else None,
             'domain_mapping': domain_mapping,
             'subblock_counts': subblock_counts,
-            'mixed_domain_blocks': mixed_domain_blocks
+            'mixed_domain_blocks': mixed_domain_blocks,
+            'source_blocks_file': blocks_file,
+            'source_blocks_delimiter': blocks_delimiter,
+            'source_blocks_header_line': blocks_header_line,
+            'source_block_x_col': block_x_col,
+            'source_block_y_col': block_y_col,
+            'source_block_z_col': block_z_col,
+            'source_block_filters': [dict(entry) for entry in (block_filters or [])],
+            'expand_interpolation_exports_to_subblocks': bool((config or {}).get('expand_interpolation_exports_to_subblocks', True)),
         }
         multiblock = pv.MultiBlock(block_data)
         # Store metadata on multiblock with private-style names to avoid PyVista attribute restrictions
@@ -1902,7 +2071,15 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         block_info = {
             'min_bounds': min_bounds,
             'dims': dims,
-            'block_size': block_size
+            'block_size': block_size,
+            'source_blocks_file': None,
+            'source_blocks_delimiter': None,
+            'source_blocks_header_line': 1,
+            'source_block_x_col': None,
+            'source_block_y_col': None,
+            'source_block_z_col': None,
+            'source_block_filters': [],
+            'expand_interpolation_exports_to_subblocks': bool((config or {}).get('expand_interpolation_exports_to_subblocks', True)),
         }
         # Vectorized block assignment
         points_array = np.array(points)
@@ -2549,7 +2726,7 @@ def resolve_block_volume_weighted_average_export_path(configured_path=None, bloc
 
 
 def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_header_line=1,
-                                progress_label=None, progress_callback=None):
+                                sample_filters=None, progress_label=None, progress_callback=None):
     delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
     if samples_header_line and samples_header_line != 1:
         df, _ = read_csv_with_selected_header(
@@ -2560,6 +2737,8 @@ def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_he
             progress_label=progress_label,
             progress_callback=progress_callback,
         )
+        if sample_filters:
+            df, _ = apply_sample_filters(df, sample_filters=sample_filters)
         return df, delimiter
 
     df = read_autodetect_csv(
@@ -2568,11 +2747,13 @@ def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_he
         progress_label=progress_label,
         progress_callback=progress_callback,
     )
+    if sample_filters:
+        df, _ = apply_sample_filters(df, sample_filters=sample_filters)
     return df, delimiter
 
 
 def load_full_blocks_dataframe(blocks_file, blocks_delimiter=None, blocks_header_line=1,
-                               progress_label=None, progress_callback=None):
+                               block_filters=None, progress_label=None, progress_callback=None):
     delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
     if blocks_header_line and blocks_header_line != 1:
         df, _ = read_csv_with_selected_header(
@@ -2583,6 +2764,12 @@ def load_full_blocks_dataframe(blocks_file, blocks_delimiter=None, blocks_header
             progress_label=progress_label,
             progress_callback=progress_callback,
         )
+        if block_filters:
+            print(
+                f"Finished reading {len(df):,} rows from {os.path.basename(blocks_file)}. "
+                "Preparing block filters..."
+            )
+            df, _ = apply_dataframe_filters(df, filters=block_filters, filter_subject='block', source_label='blocks file')
         return df, delimiter
 
     df = read_autodetect_csv(
@@ -2591,7 +2778,91 @@ def load_full_blocks_dataframe(blocks_file, blocks_delimiter=None, blocks_header
         progress_label=progress_label,
         progress_callback=progress_callback,
     )
+    if block_filters:
+        print(
+            f"Finished reading {len(df):,} rows from {os.path.basename(blocks_file)}. "
+            "Preparing block filters..."
+        )
+        df, _ = apply_dataframe_filters(df, filters=block_filters, filter_subject='block', source_label='blocks file')
     return df, delimiter
+
+class FilterDataSource:
+    def __init__(self, source, delimiter=None, header_line=1):
+        self._delimiter = delimiter
+        self._header_line = max(int(header_line or 1), 1)
+        self._series_cache = {}
+        self._categorical_value_cache = {}
+        self._numeric_range_cache = {}
+
+        if isinstance(source, pd.DataFrame):
+            self._dataframe = source
+            self._path = None
+            display_columns = build_unique_column_names([str(column) for column in source.columns])
+            self._columns = display_columns
+            self._column_positions = {column: index for index, column in enumerate(display_columns)}
+        elif isinstance(source, (str, os.PathLike)):
+            self._dataframe = None
+            self._path = os.fspath(source)
+            if not os.path.isfile(self._path):
+                raise ValueError(f'Filter data source file not found: {self._path}')
+            self._delimiter = delimiter or detect_csv_delimiter(self._path)
+            headers = parse_header_line(self._path, self._delimiter, self._header_line)
+            self._columns = build_unique_column_names(headers)
+            self._column_positions = {column: index for index, column in enumerate(self._columns)}
+        else:
+            raise TypeError('FilterDataSource source must be a pandas DataFrame or a CSV file path.')
+
+    @property
+    def columns(self):
+        return list(self._columns)
+
+    def has_field(self, field):
+        return str(field or '').strip() in self._column_positions
+
+    def get_series(self, field):
+        field_name = str(field or '').strip()
+        if not field_name:
+            raise ValueError('Filter field name cannot be empty.')
+        if field_name not in self._column_positions:
+            raise ValueError(f'Filter field not found: {field_name}')
+        if field_name not in self._series_cache:
+            if self._dataframe is not None:
+                column_index = self._column_positions[field_name]
+                self._series_cache[field_name] = self._dataframe.iloc[:, column_index]
+            else:
+                df_column, _ = read_selected_columns_with_header(
+                    self._path,
+                    self._delimiter,
+                    self._header_line,
+                    [field_name],
+                )
+                if field_name not in df_column.columns:
+                    raise ValueError(f'Filter field not found in file after loading: {field_name}')
+                self._series_cache[field_name] = df_column[field_name]
+        return self._series_cache[field_name]
+
+    def get_categorical_values(self, field, max_values=1000):
+        field_name = str(field or '').strip()
+        cache_key = (field_name, int(max_values))
+        if cache_key not in self._categorical_value_cache:
+            series = self.get_series(field_name)
+            unique_values = sorted({str(value) for value in series.dropna().astype(str)})
+            total_unique_values = len(unique_values)
+            truncated = total_unique_values > max_values
+            if truncated:
+                unique_values = unique_values[:max_values]
+            self._categorical_value_cache[cache_key] = (unique_values, total_unique_values, truncated)
+        return self._categorical_value_cache[cache_key]
+
+    def get_numeric_range(self, field):
+        field_name = str(field or '').strip()
+        if field_name not in self._numeric_range_cache:
+            numeric_values = pd.to_numeric(self.get_series(field_name), errors='coerce').dropna()
+            if len(numeric_values) == 0:
+                self._numeric_range_cache[field_name] = None
+            else:
+                self._numeric_range_cache[field_name] = (float(numeric_values.min()), float(numeric_values.max()))
+        return self._numeric_range_cache[field_name]
 
 
 def resolve_sample_coordinate_columns(header_names, sample_x_col=None, sample_y_col=None, sample_z_col=None):
@@ -2660,23 +2931,62 @@ def summarize_sample_filter_spec(filter_spec):
     return field or 'Invalid filter'
 
 
-def apply_sample_filters(df_samples, sample_filters=None):
-    if not sample_filters:
-        return df_samples.copy(), []
+def collect_filter_fields(filters):
+    fields = []
+    for raw_filter in filters or []:
+        field = str((raw_filter or {}).get('field', '')).strip()
+        if field and field not in fields:
+            fields.append(field)
+    return fields
 
-    filtered_df = df_samples.copy()
+
+def get_configured_sample_filters(config):
+    if not config:
+        return []
+    filters = config.get('sample_filters', None)
+    if filters is None:
+        filters = config.get('block_domain_sample_filters', [])
+    return [dict(entry) for entry in (filters or [])]
+
+
+def get_configured_block_filters(config):
+    if not config:
+        return []
+    filters = config.get('block_filters', None)
+    if filters is None:
+        filters = config.get('block_volume_weighted_filters', [])
+    return [dict(entry) for entry in (filters or [])]
+
+
+def apply_dataframe_filters(df_source, filters=None, filter_subject='row', source_label='file',
+                            progress_callback=None, progress_label=None, emit_logs=True):
+    if not filters:
+        return df_source.copy(), []
+
+    filtered_df = df_source.copy()
+    input_row_count = int(len(filtered_df))
     applied_filters = []
+    total_filters = len(filters)
+    progress_text = progress_label or f'Applying {filter_subject} filters...'
 
-    for raw_filter in sample_filters:
+    if emit_logs:
+        print(
+            f"Applying {total_filters:,} {filter_subject} filter(s) to {len(filtered_df):,} rows from {source_label}..."
+        )
+    if progress_callback:
+        progress_callback(0, total_filters, progress_text)
+
+    for filter_number, raw_filter in enumerate(filters, start=1):
         filter_spec = dict(raw_filter or {})
         field = str(filter_spec.get('field', '')).strip()
         filter_type = str(filter_spec.get('type', '')).strip().lower()
 
         if not field:
-            raise ValueError('Each sample filter must define a field name.')
+            raise ValueError(f'Each {filter_subject} filter must define a field name.')
         if field not in filtered_df.columns:
-            raise ValueError(f'Sample filter field not found in samples file: {field}')
+            raise ValueError(f'{filter_subject.capitalize()} filter field not found in {source_label}: {field}')
 
+        rows_before = int(len(filtered_df))
         series = filtered_df[field]
         if filter_type == 'categorical':
             raw_values = filter_spec.get('values', [])
@@ -2707,16 +3017,42 @@ def apply_sample_filters(df_samples, sample_filters=None):
             filter_spec['min'] = min_value
             filter_spec['max'] = max_value
         else:
-            raise ValueError(f'Unsupported sample filter type for {field}: {filter_type}')
+            raise ValueError(f'Unsupported {filter_subject} filter type for {field}: {filter_type}')
 
         filtered_df = filtered_df.loc[mask].copy()
+        summary = summarize_sample_filter_spec(filter_spec)
         applied_filters.append({
             'field': field,
             'type': filter_type,
-            'summary': summarize_sample_filter_spec(filter_spec),
+            'summary': summary,
         })
+        rows_after = int(len(filtered_df))
+        if emit_logs:
+            print(
+                f"Applied {filter_subject} filter {filter_number:,}/{total_filters:,}: {summary}; "
+                f"kept {rows_after:,} of {rows_before:,} rows"
+            )
+        if progress_callback:
+            progress_callback(filter_number, total_filters, progress_text)
+
+    if emit_logs:
+        print(
+            f"{filter_subject.capitalize()} filtering complete: {len(filtered_df):,} of {input_row_count:,} rows "
+            f"satisfy all {filter_subject} filters."
+        )
 
     return filtered_df, applied_filters
+
+
+def apply_sample_filters(df_samples, sample_filters=None, progress_callback=None, progress_label=None):
+    return apply_dataframe_filters(
+        df_samples,
+        filters=sample_filters,
+        filter_subject='sample',
+        source_label='samples file',
+        progress_callback=progress_callback,
+        progress_label=progress_label,
+    )
 
 
 def _compute_point_to_set_distance_stats(query_points, reference_points, query_chunk_size=1024,
@@ -2921,7 +3257,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
                                        closest_sample_id_cols=None,
                                        block_x_col=None, block_y_col=None, block_z_col=None,
                                        block_domain_col=None, block_size=None,
-                                       sample_filters=None, progress_callback=None,
+                                       sample_filters=None, block_filters=None, progress_callback=None,
                                        blank_sample_domain_behavior='skip'):
     if not samples_file or not os.path.isfile(samples_file):
         raise ValueError('Please select a valid samples file.')
@@ -2960,6 +3296,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
             block_y_col=block_y_col,
             block_z_col=block_z_col,
             block_domain_col=domain_column_name,
+            block_filters=block_filters,
             config=None,
             progress_callback=_make_scaled_progress_callback(progress_callback, 0, 30, 'Loading block domain mapping...'),
         )
@@ -2983,8 +3320,20 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
         ),
     )
 
-    _emit_progress(progress_callback, 41 if use_explicit_sample_domains else 56, 100, 'Applying sample filters...')
-    filtered_samples_df, applied_filters = apply_sample_filters(df_samples, sample_filters=sample_filters)
+    sample_filter_progress_start = 41 if use_explicit_sample_domains else 56
+    sample_filter_progress_end = 50 if use_explicit_sample_domains else 65
+    _emit_progress(progress_callback, sample_filter_progress_start, 100, 'Applying sample filters...')
+    filtered_samples_df, applied_filters = apply_sample_filters(
+        df_samples,
+        sample_filters=sample_filters,
+        progress_callback=_make_scaled_progress_callback(
+            progress_callback,
+            sample_filter_progress_start,
+            sample_filter_progress_end,
+            'Applying sample filters...',
+        ),
+        progress_label='Applying sample filters...',
+    )
 
     sample_x_col, sample_y_col, sample_z_col = resolve_sample_coordinate_columns(
         list(filtered_samples_df.columns),
@@ -3054,6 +3403,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
         blocks_file,
         blocks_delimiter=blocks_delimiter,
         blocks_header_line=blocks_header_line,
+        block_filters=block_filters,
         progress_label='Reading blocks file',
         progress_callback=_make_scaled_progress_callback(
             progress_callback,
@@ -3214,6 +3564,7 @@ def export_block_volume_weighted_average(blocks_file, value_col, output_file=Non
                                          blocks_delimiter=None, blocks_header_line=1,
                                          block_x_col=None, block_y_col=None, block_z_col=None,
                                          block_domain_col=None,
+                                         weight_col=None, block_filters=None,
                                          block_size=None, progress_callback=None):
     if not blocks_file or not os.path.isfile(blocks_file):
         raise ValueError('Please select a valid blocks file.')
@@ -3221,7 +3572,11 @@ def export_block_volume_weighted_average(blocks_file, value_col, output_file=Non
     value_column_name = str(value_col or '').strip()
     if not value_column_name or value_column_name == '(None)':
         raise ValueError('Please select a value column in the blocks file.')
-    if block_size is None:
+
+    selected_weight_column = str(weight_col or '').strip()
+    use_volume_weights = selected_weight_column in ('', '(None)', '(Volume)')
+    weight_column_name = None if use_volume_weights else selected_weight_column
+    if use_volume_weights and block_size is None:
         raise ValueError('Block size must be specified to infer sub-block volumes.')
 
     output_file = resolve_block_volume_weighted_average_export_path(
@@ -3240,57 +3595,108 @@ def export_block_volume_weighted_average(blocks_file, value_col, output_file=Non
         progress_callback=_make_scaled_progress_callback(progress_callback, 0, 45, 'Reading blocks file...'),
     )
 
-    block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
-        list(df_blocks.columns),
-        block_x_col=block_x_col,
-        block_y_col=block_y_col,
-        block_z_col=block_z_col,
+    input_block_count = int(len(df_blocks))
+    block_filter_progress_start = 46
+    block_filter_progress_end = 54
+    _emit_progress(progress_callback, block_filter_progress_start, 100, 'Applying block filters...')
+    df_blocks, applied_filters = apply_dataframe_filters(
+        df_blocks,
+        filters=block_filters,
+        filter_subject='block',
+        source_label='blocks file',
+        progress_callback=_make_scaled_progress_callback(
+            progress_callback,
+            block_filter_progress_start,
+            block_filter_progress_end,
+            'Applying block filters...',
+        ),
+        progress_label='Applying block filters...',
     )
+    filtered_block_count = int(len(df_blocks))
+    print(
+        f"Block filtering complete: {filtered_block_count:,} of {input_block_count:,} rows remain after filtering."
+    )
+
     if value_column_name not in df_blocks.columns:
         raise ValueError(f'Selected value column not found in blocks file: {value_column_name}')
+    if weight_column_name and weight_column_name not in df_blocks.columns:
+        raise ValueError(f'Selected weight column not found in blocks file: {weight_column_name}')
 
     domain_column_name = str(block_domain_col or '').strip()
     use_domain_column = bool(domain_column_name and domain_column_name != '(None)')
     if use_domain_column and domain_column_name not in df_blocks.columns:
         raise ValueError(f'Selected domain column not found in blocks file: {domain_column_name}')
 
-    block_coord_frame = df_blocks[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
+    _emit_progress(progress_callback, 55, 100, f"Preparing weighted column '{value_column_name}'...")
+    print(f"Converting weighted column '{value_column_name}' to numeric...")
     value_series = pd.to_numeric(df_blocks[value_column_name], errors='coerce')
-    valid_coord_mask = block_coord_frame.notna().all(axis=1)
-    valid_coords = block_coord_frame.loc[valid_coord_mask].to_numpy(copy=False)
     if use_domain_column:
         domain_series = df_blocks[domain_column_name].fillna('').astype(str).str.strip()
     else:
         domain_series = pd.Series([''] * len(df_blocks), index=df_blocks.index, dtype=object)
 
-    if len(valid_coords) > 0:
-        print(f"Starting rotation detection for {len(valid_coords):,} valid block rows...")
-        rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(valid_coords, block_size_hint=block_size)
-        if is_rotated:
-            valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
-
-    _emit_progress(progress_callback, 46, 100, 'Inferring block volumes...')
-    inferred_volumes = np.full(len(df_blocks), np.nan, dtype=float)
-    base_indices_full = np.full((len(df_blocks), 3), -1, dtype=int)
-
-    if len(valid_coords) > 0:
-        print(f"Inferring sub-block volumes for {len(valid_coords):,} valid block rows...")
-        row_volumes, base_indices = infer_block_row_volumes(
-            valid_coords,
-            block_size,
-            progress_callback=_make_scaled_progress_callback(progress_callback, 46, 92, 'Inferring block volumes...'),
-            progress_label='Inferring block volumes...',
+    if use_volume_weights:
+        _emit_progress(progress_callback, 58, 100, 'Preparing block coordinates...')
+        block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
+            list(df_blocks.columns),
+            block_x_col=block_x_col,
+            block_y_col=block_y_col,
+            block_z_col=block_z_col,
         )
-        inferred_volumes[valid_coord_mask.to_numpy()] = row_volumes
-        base_indices_full[valid_coord_mask.to_numpy()] = base_indices
+        print(
+            f"Converting block coordinates to numeric using columns: {block_x_col}, {block_y_col}, {block_z_col}..."
+        )
+        block_coord_frame = df_blocks[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
+        valid_coord_mask = block_coord_frame.notna().all(axis=1)
+        valid_coords = block_coord_frame.loc[valid_coord_mask].to_numpy(copy=False)
+        print(
+            f"Coordinate preparation complete: {int(valid_coord_mask.sum()):,} valid rows, "
+            f"{int((~valid_coord_mask).sum()):,} invalid rows."
+        )
+
+        if len(valid_coords) > 0:
+            _emit_progress(progress_callback, 60, 100, f'Detecting grid rotation... ({len(valid_coords):,} valid rows)')
+            print(f"Starting rotation detection for {len(valid_coords):,} valid block rows...")
+            rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(valid_coords, block_size_hint=block_size)
+            if is_rotated:
+                valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
+
+        _emit_progress(progress_callback, 62, 100, 'Inferring block volumes...')
+        inferred_volumes = np.full(len(df_blocks), np.nan, dtype=float)
+
+        if len(valid_coords) > 0:
+            print(f"Inferring sub-block volumes for {len(valid_coords):,} valid block rows...")
+            row_volumes, _ = infer_block_row_volumes(
+                valid_coords,
+                block_size,
+                progress_callback=_make_scaled_progress_callback(progress_callback, 62, 92, 'Inferring block volumes...'),
+                progress_label='Inferring block volumes...',
+            )
+            inferred_volumes[valid_coord_mask.to_numpy()] = row_volumes
+
+        weight_values = inferred_volumes
+        valid_weight_mask = (
+            valid_coord_mask.to_numpy()
+            & value_series.notna().to_numpy()
+            & np.isfinite(inferred_volumes)
+        )
+        total_volume = float(np.sum(inferred_volumes[valid_weight_mask])) if np.any(valid_weight_mask) else 0.0
+    else:
+        _emit_progress(progress_callback, 58, 100, f"Preparing custom weight column '{weight_column_name}'...")
+        print(f"Converting custom weight column '{weight_column_name}' to numeric...")
+        weight_series = pd.to_numeric(df_blocks[weight_column_name], errors='coerce')
+        weight_values = weight_series.to_numpy(dtype=float, copy=False)
+        valid_coord_mask = pd.Series([True] * len(df_blocks), index=df_blocks.index)
+        inferred_volumes = np.full(len(df_blocks), np.nan, dtype=float)
+        valid_weight_mask = value_series.notna().to_numpy() & np.isfinite(weight_values)
+        total_volume = float('nan')
 
     _emit_progress(progress_callback, 93, 100, 'Summarizing weighted averages...')
 
-    weighted_components = inferred_volumes * value_series.to_numpy(dtype=float, copy=False)
-    valid_weight_mask = valid_coord_mask.to_numpy() & value_series.notna().to_numpy() & np.isfinite(inferred_volumes)
-    total_volume = float(np.sum(inferred_volumes[valid_weight_mask])) if np.any(valid_weight_mask) else 0.0
+    weighted_components = weight_values * value_series.to_numpy(dtype=float, copy=False)
+    total_weight = float(np.sum(weight_values[valid_weight_mask])) if np.any(valid_weight_mask) else 0.0
     weighted_sum = float(np.sum(weighted_components[valid_weight_mask])) if np.any(valid_weight_mask) else 0.0
-    weighted_average = float(weighted_sum / total_volume) if total_volume > 0 else np.nan
+    weighted_average = float(weighted_sum / total_weight) if total_weight > 0 else np.nan
 
     domain_summaries = {}
 
@@ -3299,11 +3705,13 @@ def export_block_volume_weighted_average(blocks_file, value_col, output_file=Non
         valid_domain_mask = valid_weight_mask & domain_series.ne('').to_numpy()
         for domain in sorted(domain_series.loc[valid_domain_mask].unique()):
             domain_mask = valid_domain_mask & (domain_values == domain)
-            domain_volume = float(np.sum(inferred_volumes[domain_mask])) if np.any(domain_mask) else 0.0
+            domain_weight = float(np.sum(weight_values[domain_mask])) if np.any(domain_mask) else 0.0
             domain_sum = float(np.sum(weighted_components[domain_mask])) if np.any(domain_mask) else 0.0
-            domain_average = float(domain_sum / domain_volume) if domain_volume > 0 else np.nan
+            domain_average = float(domain_sum / domain_weight) if domain_weight > 0 else np.nan
+            domain_volume = float(np.sum(inferred_volumes[domain_mask])) if use_volume_weights and np.any(domain_mask) else float('nan')
             domain_summaries[str(domain)] = {
                 'total_volume': domain_volume,
+                'total_weight': domain_weight,
                 'weighted_sum': domain_sum,
                 'weighted_average': domain_average,
                 'rows_with_numeric_value': int(np.count_nonzero(domain_mask)),
@@ -3315,8 +3723,10 @@ def export_block_volume_weighted_average(blocks_file, value_col, output_file=Non
             summary_rows.append(
                 {
                     domain_column_name: domain,
+                    'Weight_Column': weight_column_name if weight_column_name else 'Volume',
                     'Weighted_Average': summary['weighted_average'],
                     'Weighted_Sum': summary['weighted_sum'],
+                    'Total_Weight': summary['total_weight'],
                     'Total_Volume': summary['total_volume'],
                     'Rows_With_Numeric_Value': summary['rows_with_numeric_value'],
                 }
@@ -3324,8 +3734,10 @@ def export_block_volume_weighted_average(blocks_file, value_col, output_file=Non
     else:
         summary_rows.append(
             {
+                'Weight_Column': weight_column_name if weight_column_name else 'Volume',
                 'Weighted_Average': weighted_average,
                 'Weighted_Sum': weighted_sum,
+                'Total_Weight': total_weight,
                 'Total_Volume': total_volume,
                 'Rows_With_Numeric_Value': int(np.count_nonzero(valid_weight_mask)),
             }
@@ -3341,23 +3753,29 @@ def export_block_volume_weighted_average(blocks_file, value_col, output_file=Non
 
     print(f"Exported {len(output_df):,} summary rows to {output_file}")
     print(
-        f"Volume-weighted average for '{value_column_name}': {weighted_average} "
-        f"(weighted sum={weighted_sum}, total volume={total_volume})"
+        f"Weighted average for '{value_column_name}' using '{weight_column_name or 'Volume'}': {weighted_average} "
+        f"(weighted sum={weighted_sum}, total weight={total_weight})"
     )
 
     return {
         'output_file': output_file,
         'value_column': value_column_name,
+        'weight_column': weight_column_name,
         'domain_column': domain_column_name if use_domain_column else None,
         'domain_summaries': domain_summaries,
+        'filters_applied': applied_filters,
         'weighted_average': weighted_average,
         'weighted_sum': weighted_sum,
+        'total_weight': total_weight,
         'total_volume': total_volume,
-        'processed_rows': int(valid_coord_mask.sum()),
+        'input_blocks': input_block_count,
+        'filtered_blocks': filtered_block_count,
+        'processed_rows': int(len(df_blocks)) if not use_volume_weights else int(valid_coord_mask.sum()),
         'rows_with_numeric_value': int(valid_weight_mask.sum()),
         'exported_rows': int(len(output_df)),
-        'invalid_coordinate_rows': int((~valid_coord_mask).sum()),
+        'invalid_coordinate_rows': 0 if not use_volume_weights else int((~valid_coord_mask).sum()),
         'invalid_value_rows': int(value_series.isna().sum()),
+        'invalid_weight_rows': int(np.count_nonzero(~np.isfinite(weight_values))) if len(df_blocks) > 0 else 0,
     }
 
 
@@ -3365,8 +3783,10 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
                                         samples_delimiter=None, blocks_delimiter=None,
                                         samples_header_line=1, blocks_header_line=1,
                                         sample_x_col=None, sample_y_col=None, sample_z_col=None,
+                                        sample_domain_col=None,
                                         block_x_col=None, block_y_col=None, block_z_col=None,
                                         block_domain_col=None, block_size=None,
+                                        sample_filters=None, block_filters=None,
                                         progress_callback=None):
     if not samples_file or not os.path.isfile(samples_file):
         raise ValueError('Please select a valid samples file.')
@@ -3399,6 +3819,7 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
         block_y_col=block_y_col,
         block_z_col=block_z_col,
         block_domain_col=domain_column_name,
+        block_filters=block_filters,
         config=None,
         progress_callback=_make_scaled_progress_callback(progress_callback, 0, 45, 'Loading block domain mapping...'),
     )
@@ -3408,6 +3829,7 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
         samples_file,
         samples_delimiter=samples_delimiter,
         samples_header_line=samples_header_line,
+        sample_filters=sample_filters,
         progress_label='Reading sample file',
         progress_callback=_make_scaled_progress_callback(progress_callback, 45, 80, 'Reading sample file...'),
     )
@@ -3550,17 +3972,95 @@ def _collect_export_block_data(blocks):
     return data
 
 
+def _build_base_block_export_dataframe(block_rows):
+    return pd.DataFrame([{k: v for k, v in row.items() if k != '_Grid_Index'} for row in block_rows])
+
+
+def _expand_export_block_rows_to_source_rows(block_rows, source_blocks_df, block_x_col, block_y_col, block_z_col,
+                                             min_bounds, block_size, rotation_matrix=None, rotation_center=None):
+    export_df = _build_base_block_export_dataframe(block_rows)
+    export_df['_Grid_Index'] = [tuple(row['_Grid_Index']) for row in block_rows]
+
+    expanded_index_df = pd.DataFrame(index=source_blocks_df.index)
+    expanded_index_df['_Grid_Index'] = None
+
+    coord_frame = source_blocks_df[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
+    valid_mask = coord_frame.notna().all(axis=1)
+    if valid_mask.any():
+        valid_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
+        if rotation_matrix is not None and rotation_center is not None:
+            valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
+        block_indices = np.floor((valid_coords - np.asarray(min_bounds, dtype=float)) / np.asarray(block_size, dtype=float) + 1e-6).astype(int)
+        expanded_index_df.loc[valid_mask, '_Grid_Index'] = [tuple(int(v) for v in idx) for idx in block_indices]
+
+    expanded_df = expanded_index_df.merge(export_df, on='_Grid_Index', how='left')
+
+    # Preserve the original source row coordinates so expanded output matches the input block rows.
+    expanded_df['x'] = source_blocks_df[block_x_col].to_numpy(copy=False)
+    expanded_df['y'] = source_blocks_df[block_y_col].to_numpy(copy=False)
+    expanded_df['z'] = source_blocks_df[block_z_col].to_numpy(copy=False)
+
+    return expanded_df.drop(columns=['_Grid_Index'])
+
+
+def _build_export_blocks_dataframe(blocks, block_rows):
+    base_df = _build_base_block_export_dataframe(block_rows)
+    block_info = getattr(blocks, '_block_info', {}) or {}
+
+    if not block_rows or base_df.empty:
+        return base_df
+
+    if not block_info.get('expand_interpolation_exports_to_subblocks', False):
+        return base_df
+
+    source_blocks_file = str(block_info.get('source_blocks_file') or '').strip()
+    if not source_blocks_file or not os.path.isfile(source_blocks_file):
+        return base_df
+
+    try:
+        source_blocks_df, _ = load_full_blocks_dataframe(
+            source_blocks_file,
+            blocks_delimiter=block_info.get('source_blocks_delimiter'),
+            blocks_header_line=block_info.get('source_blocks_header_line', 1),
+            block_filters=block_info.get('source_block_filters'),
+            progress_label='Reading source blocks for export expansion',
+        )
+        block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
+            list(source_blocks_df.columns),
+            block_x_col=block_info.get('source_block_x_col'),
+            block_y_col=block_info.get('source_block_y_col'),
+            block_z_col=block_info.get('source_block_z_col'),
+        )
+        expanded_df = _expand_export_block_rows_to_source_rows(
+            block_rows,
+            source_blocks_df,
+            block_x_col,
+            block_y_col,
+            block_z_col,
+            block_info['min_bounds'],
+            block_info['block_size'],
+            rotation_matrix=block_info.get('rotation_matrix'),
+            rotation_center=block_info.get('rotation_center'),
+        )
+        print(
+            f"Expanded {len(block_rows):,} base-block export rows to {len(expanded_df):,} source block rows "
+            f"from {os.path.basename(source_blocks_file)}."
+        )
+        return expanded_df
+    except Exception as exc:
+        print(f"Failed to expand export back to source block rows, falling back to base-block export: {exc}")
+        return base_df
+
+
 def export_blocks_to_csv(blocks, filepath):
     output_dir = os.path.dirname(filepath) or '.'
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Exporting blocks to {filepath}...")
     data = _collect_export_block_data(blocks)
-    
-    # Export to CSV
-    df = pd.DataFrame([{k: v for k, v in row.items() if k != '_Grid_Index'} for row in data])
+    df = _build_export_blocks_dataframe(blocks, data)
     df.to_csv(filepath, index=False)
-    print(f"Exported {len(data)} blocks to {filepath}")
+    print(f"Exported {len(df):,} rows to {filepath}")
 
 
 def export_block_evaluated_samples_to_csv(blocks, filepath):
@@ -4096,6 +4596,8 @@ def build_taichi_viewer_state_from_config(config):
         and str(config.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
     )
     wants_domain_any = wants_st_domain or wants_ant_domain
+    sample_filters = get_configured_sample_filters(config)
+    block_filters = get_configured_block_filters(config)
     needs_sample_domains = should_resolve_sample_domains_for_interpolation(
         wants_domain_any,
         blocks_file=config.get('blocks_file'),
@@ -4110,6 +4612,8 @@ def build_taichi_viewer_state_from_config(config):
         sample_y_col=config.get('sample_y_col'),
         sample_z_col=config.get('sample_z_col'),
         sample_value_col=config.get('sample_value_col'),
+        sample_domain_col=config.get('sample_domain_col'),
+        sample_filters=sample_filters,
         progress_label='Reading sample file',
     )
     if parsed_cols is not None:
@@ -4134,6 +4638,8 @@ def build_taichi_viewer_state_from_config(config):
                 progress_label='Reading sample file',
             )
             print(f"Samples file delimiter used: '{df._detected_delimiter}'")
+        if sample_filters:
+            df, _ = apply_sample_filters(df, sample_filters=sample_filters)
         explicit_sample_map = None
 
     if needs_sample_domains:
@@ -4169,6 +4675,7 @@ def build_taichi_viewer_state_from_config(config):
             block_z_col=config.get('block_z_col'),
             block_domain_col=config.get('block_domain_col'),
             block_size=config.get('block_size'),
+            block_filters=block_filters,
         )
         df['Domain'] = df['Domain'].astype(str).str.strip()
         blank_domain = df['Domain'].isna() | (df['Domain'].str.strip() == '') | (df['Domain'].str.lower() == 'nan')
@@ -4295,6 +4802,8 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             and str(config.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
         )
         wants_domain_any = wants_st_domain or wants_ant_domain
+        sample_filters = get_configured_sample_filters(config)
+        block_filters = get_configured_block_filters(config)
         needs_sample_domains = should_resolve_sample_domains_for_interpolation(
             wants_domain_any,
             blocks_file=blocks_file,
@@ -4309,6 +4818,8 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             sample_y_col=sample_y_col,
             sample_z_col=sample_z_col,
             sample_value_col=sample_value_col,
+            sample_domain_col=config.get('sample_domain_col') if config else None,
+            sample_filters=sample_filters,
             progress_label='Reading sample file',
         )
         if parsed_cols is not None:
@@ -4333,6 +4844,8 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
                     progress_label='Reading sample file',
                 )
                 print(f"Samples file delimiter used: '{df._detected_delimiter}'")
+            if sample_filters:
+                df, _ = apply_sample_filters(df, sample_filters=sample_filters)
             explicit_sample_map = None
 
         if wants_domain_any:
@@ -4385,6 +4898,7 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
                 block_z_col=block_z_col,
                 block_domain_col=block_domain_col,
                 block_size=block_size,
+                block_filters=block_filters,
             )
             df['Domain'] = df['Domain'].astype(str).str.strip()
             blank_domain = df['Domain'].isna() | (df['Domain'].str.strip() == '') | (df['Domain'].str.lower() == 'nan')
@@ -4832,10 +5346,11 @@ if __name__ == "__main__":
             super().reject()
 
     class SampleFilterEditDialog(QtWidgets.QDialog):
-        def __init__(self, df_samples, filter_spec=None, parent=None):
+        def __init__(self, filter_source, filter_spec=None, parent=None, subject_label='Sample'):
             super().__init__(parent)
-            self.df_samples = df_samples
-            self.setWindowTitle('Sample Filter')
+            self.filter_source = filter_source if isinstance(filter_source, FilterDataSource) else FilterDataSource(filter_source)
+            self.subject_label = str(subject_label or 'Sample').strip() or 'Sample'
+            self.setWindowTitle(f'{self.subject_label} Filter')
             self.resize(520, 420)
 
             layout = QtWidgets.QVBoxLayout()
@@ -4845,11 +5360,12 @@ if __name__ == "__main__":
             layout.addLayout(form)
 
             self.field_combo = QtWidgets.QComboBox()
-            self.field_combo.addItems([str(col) for col in df_samples.columns])
+            self.field_combo.addItem('(Select Field)')
+            self.field_combo.addItems(self.filter_source.columns)
             form.addRow('Field', self.field_combo)
 
             self.type_combo = QtWidgets.QComboBox()
-            self.type_combo.addItems(['categorical', 'numeric'])
+            self.type_combo.addItems(['(Select Type)', 'categorical', 'numeric'])
             form.addRow('Type', self.type_combo)
 
             self.criteria_stack = QtWidgets.QStackedWidget()
@@ -4879,6 +5395,7 @@ if __name__ == "__main__":
             self.criteria_stack.addWidget(numeric_page)
 
             form.addRow('Criteria', self.criteria_stack)
+            self.criteria_stack.setEnabled(False)
 
             button_row = QtWidgets.QHBoxLayout()
             button_row.addStretch(1)
@@ -4899,6 +5416,9 @@ if __name__ == "__main__":
                     self.field_combo.setCurrentText(field)
                 filter_type = str(filter_spec.get('type', 'categorical')).strip().lower() or 'categorical'
                 self.type_combo.setCurrentText(filter_type)
+            else:
+                self.value_hint.setText('Select a field and choose categorical to load available values.')
+                self.numeric_hint.setText('Select a field and choose numeric to inspect the available range.')
 
             self._refresh_criteria_ui()
 
@@ -4917,36 +5437,44 @@ if __name__ == "__main__":
         def _refresh_criteria_ui(self):
             field = self.field_combo.currentText()
             filter_type = self.type_combo.currentText()
-            series = self.df_samples[field] if field in self.df_samples.columns else pd.Series(dtype=object)
+            has_field = bool(field and field != '(Select Field)' and self.filter_source.has_field(field))
+            has_type = filter_type in ('categorical', 'numeric')
+
+            if not has_field or not has_type:
+                self.criteria_stack.setEnabled(False)
+                self.value_list.clear()
+                self.value_hint.setText('Select a field and choose categorical to load available values.')
+                self.numeric_hint.setText('Select a field and choose numeric to inspect the available range.')
+                self.criteria_stack.setCurrentIndex(0)
+                return
+
+            self.criteria_stack.setEnabled(True)
 
             if filter_type == 'categorical':
                 self.criteria_stack.setCurrentIndex(0)
-                unique_values = sorted({str(value) for value in series.dropna().astype(str)})
-                truncated = False
-                if len(unique_values) > 1000:
-                    unique_values = unique_values[:1000]
-                    truncated = True
+                unique_values, total_unique_values, truncated = self.filter_source.get_categorical_values(field)
                 self.value_list.clear()
                 self.value_list.addItems(unique_values)
                 self.value_hint.setText(
-                    f'Loaded {len(unique_values):,} distinct values.' +
+                    f'Loaded {total_unique_values:,} distinct values.' +
                     (' Showing the first 1,000 values.' if truncated else '')
                 )
             else:
                 self.criteria_stack.setCurrentIndex(1)
-                numeric_values = pd.to_numeric(series, errors='coerce').dropna()
-                if len(numeric_values) == 0:
+                cached_range = self.filter_source.get_numeric_range(field)
+                if cached_range is None:
                     self.numeric_hint.setText('No numeric values detected in this field.')
                 else:
-                    self.numeric_hint.setText(
-                        f'Available numeric range: {numeric_values.min():g} to {numeric_values.max():g}'
-                    )
+                    min_value, max_value = cached_range
+                    self.numeric_hint.setText(f'Available numeric range: {min_value:g} to {max_value:g}')
 
         def get_filter_spec(self):
             field = self.field_combo.currentText().strip()
             filter_type = self.type_combo.currentText().strip().lower()
-            if not field:
+            if not field or field == '(Select Field)':
                 raise ValueError('Please select a field.')
+            if filter_type == '(select type)' or filter_type == '':
+                raise ValueError('Please select a filter type.')
 
             if filter_type == 'categorical':
                 selected_values = [item.text() for item in self.value_list.selectedItems()]
@@ -4982,18 +5510,20 @@ if __name__ == "__main__":
             super().accept()
 
     class SampleFiltersDialog(QtWidgets.QDialog):
-        def __init__(self, df_samples, filters=None, parent=None):
+        def __init__(self, filter_source, filters=None, parent=None, subject_label='Sample'):
             super().__init__(parent)
-            self.df_samples = df_samples
+            self.filter_source = filter_source if isinstance(filter_source, FilterDataSource) else FilterDataSource(filter_source)
             self.filters = [dict(entry) for entry in (filters or [])]
-            self.setWindowTitle('Sample Filters')
+            self.subject_label = str(subject_label or 'Sample').strip() or 'Sample'
+            subject_label_lower = self.subject_label.lower()
+            self.setWindowTitle(f'{self.subject_label} Filters')
             self.resize(760, 420)
 
             layout = QtWidgets.QVBoxLayout()
             self.setLayout(layout)
 
             info = QtWidgets.QLabel(
-                'Add one or more sample filters. Categorical filters keep selected values. '
+                f'Add one or more {subject_label_lower} filters. Categorical filters keep selected values. '
                 'Numeric filters keep values inside the requested range.'
             )
             info.setWordWrap(True)
@@ -5041,7 +5571,7 @@ if __name__ == "__main__":
             self.table.resizeRowsToContents()
 
         def add_filter(self):
-            dialog = SampleFilterEditDialog(self.df_samples, parent=self)
+            dialog = SampleFilterEditDialog(self.filter_source, parent=self, subject_label=self.subject_label)
             if dialog.exec_() == QtWidgets.QDialog.Accepted:
                 self.filters.append(dialog.get_filter_spec())
                 self._refresh_table()
@@ -5051,7 +5581,12 @@ if __name__ == "__main__":
             if row < 0 or row >= len(self.filters):
                 QtWidgets.QMessageBox.information(self, 'Edit Filter', 'Select a filter to edit.')
                 return
-            dialog = SampleFilterEditDialog(self.df_samples, filter_spec=self.filters[row], parent=self)
+            dialog = SampleFilterEditDialog(
+                self.filter_source,
+                filter_spec=self.filters[row],
+                parent=self,
+                subject_label=self.subject_label,
+            )
             if dialog.exec_() == QtWidgets.QDialog.Accepted:
                 self.filters[row] = dialog.get_filter_spec()
                 self._refresh_table()
@@ -5141,10 +5676,20 @@ if __name__ == "__main__":
             self.blocks_edit = QtWidgets.QLineEdit('Data/ANT-Domains.csv')
             self.color_edit = QtWidgets.QLineEdit('Data/Value.lfc')
             self.interp_edit = QtWidgets.QLineEdit('')
+            self.configure_block_domain_metrics_filters_btn = QtWidgets.QPushButton('Configure Sample Filters...')
+            self.configure_block_volume_weighted_filters_btn = QtWidgets.QPushButton('Configure Block Filters...')
+            self.block_domain_sample_filters = []
+            self.block_volume_weighted_filters = []
+            self.block_domain_metrics_filters_summary = QtWidgets.QLabel('No sample filters configured. These filters apply app-wide.')
+            self.block_domain_metrics_filters_summary.setWordWrap(True)
+            self.block_volume_weighted_filters_summary = QtWidgets.QLabel('No block filters configured. These filters apply app-wide.')
+            self.block_volume_weighted_filters_summary.setWordWrap(True)
 
-            def add_file_row(label, line_edit, filter_str, form_layout):
+            def add_file_row(label, line_edit, filter_str, form_layout, extra_button=None):
                 h = QtWidgets.QHBoxLayout()
                 h.addWidget(line_edit)
+                if extra_button is not None:
+                    h.addWidget(extra_button)
                 btn = QtWidgets.QPushButton('Browse')
                 def pick():
                     if 'Interpolation' in label:
@@ -5163,8 +5708,10 @@ if __name__ == "__main__":
                 h.addWidget(btn)
                 form_layout.addRow(label, h)
             
-            add_file_row('Samples File', self.samples_edit, 'CSV Files (*.csv)', files_form)
-            add_file_row('Blocks File', self.blocks_edit, 'CSV Files (*.csv)', files_form)
+            add_file_row('Samples File', self.samples_edit, 'CSV Files (*.csv)', files_form, extra_button=self.configure_block_domain_metrics_filters_btn)
+            files_form.addRow('', self.block_domain_metrics_filters_summary)
+            add_file_row('Blocks File', self.blocks_edit, 'CSV Files (*.csv)', files_form, extra_button=self.configure_block_volume_weighted_filters_btn)
+            files_form.addRow('', self.block_volume_weighted_filters_summary)
             add_file_row('Color File', self.color_edit, 'LFC Files (*.lfc);;All Files (*.*)', files_form)
             add_file_row('Interpolation File', self.interp_edit, 'CSV Files (*.csv)', files_form)
 
@@ -5277,11 +5824,12 @@ if __name__ == "__main__":
             files_form.addRow('Samples Columns (X Y Z Value Domain)', sample_map_layout)
 
             # Column mapping combo boxes for blocks
-            self.block_x_col = QtWidgets.QComboBox(); self.block_y_col = QtWidgets.QComboBox(); self.block_z_col = QtWidgets.QComboBox(); self.block_domain_col = QtWidgets.QComboBox(); self.block_value_metric_col = QtWidgets.QComboBox()
-            for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col, self.block_value_metric_col]:
+            self.block_x_col = QtWidgets.QComboBox(); self.block_y_col = QtWidgets.QComboBox(); self.block_z_col = QtWidgets.QComboBox(); self.block_domain_col = QtWidgets.QComboBox(); self.block_value_metric_col = QtWidgets.QComboBox(); self.block_weight_metric_col = QtWidgets.QComboBox()
+            for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col, self.block_value_metric_col, self.block_weight_metric_col]:
                 configure_column_combo(cb)
             self.block_domain_col.addItem('(None)')
             self.block_value_metric_col.addItem('(None)')
+            self.block_weight_metric_col.addItem('(Volume)')
             block_map_layout = QtWidgets.QHBoxLayout(); block_map_layout.addWidget(self.block_x_col); block_map_layout.addWidget(self.block_y_col); block_map_layout.addWidget(self.block_z_col); block_map_layout.addWidget(self.block_domain_col)
             for index in range(4):
                 block_map_layout.setStretch(index, 1)
@@ -5346,13 +5894,15 @@ if __name__ == "__main__":
                 # Domain retains (None) entry
                 current_domain = self.block_domain_col.currentText()
                 current_metric_col = self.block_value_metric_col.currentText()
+                current_weight_col = self.block_weight_metric_col.currentText()
                 self.block_domain_col.clear(); self.block_domain_col.addItem('(None)')
                 self.block_value_metric_col.clear(); self.block_value_metric_col.addItem('(None)')
+                self.block_weight_metric_col.clear(); self.block_weight_metric_col.addItem('(Volume)')
                 if not os.path.isfile(path):
                     return
                 try:
                     cols = parse_header_line(path, delim, header_line)
-                    for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col, self.block_value_metric_col]:
+                    for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col, self.block_value_metric_col, self.block_weight_metric_col]:
                         for c in cols:
                             cb.addItem(c)
                     # Auto-suggest
@@ -5374,6 +5924,10 @@ if __name__ == "__main__":
                         idx = self.block_value_metric_col.findText(current_metric_col)
                         if idx >= 0:
                             self.block_value_metric_col.setCurrentIndex(idx)
+                    if current_weight_col and current_weight_col != '(Volume)':
+                        idx = self.block_weight_metric_col.findText(current_weight_col)
+                        if idx >= 0:
+                            self.block_weight_metric_col.setCurrentIndex(idx)
                 except Exception:
                     pass
 
@@ -5421,14 +5975,10 @@ if __name__ == "__main__":
             self.start_domaining_btn = QtWidgets.QPushButton('Start Domaining')
             self.block_domain_metrics_output_edit = QtWidgets.QLineEdit('')
             self.block_domain_metrics_browse = QtWidgets.QPushButton('Browse')
-            self.configure_block_domain_metrics_filters_btn = QtWidgets.QPushButton('Configure Filters...')
             self.start_block_domain_metrics_btn = QtWidgets.QPushButton('Export Metrics')
             self.block_volume_weighted_output_edit = QtWidgets.QLineEdit('')
             self.block_volume_weighted_browse = QtWidgets.QPushButton('Browse')
             self.start_block_volume_weighted_btn = QtWidgets.QPushButton('Export Volume Weighted Average')
-            self.block_domain_sample_filters = []
-            self.block_domain_metrics_filters_summary = QtWidgets.QLabel('No sample filters configured. All samples will be used.')
-            self.block_domain_metrics_filters_summary.setWordWrap(True)
             self._domain_samples_auto_path = ''
             self._block_domain_metrics_auto_path = ''
             self._block_volume_weighted_auto_path = ''
@@ -5509,8 +6059,6 @@ if __name__ == "__main__":
                 block_metrics_id_layout.addWidget(cb)
                 block_metrics_id_layout.setStretch(index, 1)
             block_metrics_form.addRow('Closest Sample ID Columns', block_metrics_id_layout)
-            block_metrics_form.addRow('Sample Filters', self.configure_block_domain_metrics_filters_btn)
-            block_metrics_form.addRow('', self.block_domain_metrics_filters_summary)
             block_metrics_form.addRow('', self.start_block_domain_metrics_btn)
             operations_form.addRow(block_metrics_group)
 
@@ -5522,6 +6070,7 @@ if __name__ == "__main__":
             block_volume_output_layout.addWidget(self.block_volume_weighted_browse)
             block_volume_form.addRow('Output File', block_volume_output_layout)
             block_volume_form.addRow('Weighted Column', self.block_value_metric_col)
+            block_volume_form.addRow('Weight Column', self.block_weight_metric_col)
             block_volume_form.addRow('', self.start_block_volume_weighted_btn)
             operations_form.addRow(block_volume_group)
 
@@ -5531,6 +6080,7 @@ if __name__ == "__main__":
             self.configure_block_domain_metrics_filters_btn.clicked.connect(self.configure_block_domain_metrics_filters)
             self.start_block_domain_metrics_btn.clicked.connect(self.run_block_domain_sample_metrics_only)
             self.block_volume_weighted_browse.clicked.connect(browse_block_volume_weighted_output)
+            self.configure_block_volume_weighted_filters_btn.clicked.connect(self.configure_block_volume_weighted_filters)
             self.start_block_volume_weighted_btn.clicked.connect(self.run_block_volume_weighted_average_only)
             self.samples_edit.textChanged.connect(lambda _: refresh_domain_samples_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
@@ -5542,6 +6092,7 @@ if __name__ == "__main__":
             refresh_block_domain_metrics_output_path(force=True)
             refresh_block_volume_weighted_output_path(force=True)
             self._update_block_domain_metrics_filters_summary()
+            self._update_block_volume_weighted_filters_summary()
 
             # === ANT COLONY TAB ===
             def dbl_spin(default, minv, maxv, step=0.1):
@@ -5729,6 +6280,8 @@ if __name__ == "__main__":
             self.verbose = QtWidgets.QCheckBox(); self.verbose.setChecked(False)
             self.fill_unvisited_domainwise = QtWidgets.QCheckBox(); self.fill_unvisited_domainwise.setChecked(False)
             self.process_domains_sequentially = QtWidgets.QCheckBox(); self.process_domains_sequentially.setChecked(True)
+            self.expand_interpolation_exports_to_subblocks = QtWidgets.QCheckBox(); self.expand_interpolation_exports_to_subblocks.setChecked(True)
+            self.expand_interpolation_exports_to_subblocks.setToolTip('If checked, interpolation CSV exports reuse the original blocks file rows and assign each sub-block the interpolated value of its parent base block. Interpolation still runs on the base-block grid.')
             self.blank_sample_domain_behavior = QtWidgets.QComboBox(); self.blank_sample_domain_behavior.addItems(['Skip', 'Infer From Blocks'])
             self.blank_sample_domain_behavior.setCurrentText('Skip')
             self.blank_sample_domain_behavior.setToolTip('How to handle blank sample domains during domain-based interpolation or metrics.\nSkip: exclude blank-domain rows.\nInfer From Blocks: infer missing sample domains from the blocks model when possible.')
@@ -5741,6 +6294,7 @@ if __name__ == "__main__":
             advanced_form.addRow('Average With Blocks', self.average_with_blocks)
             advanced_form.addRow('Fill Unvisited (Domain-wise)', self.fill_unvisited_domainwise)
             advanced_form.addRow('Process Domains Sequentially', self.process_domains_sequentially)
+            advanced_form.addRow('Expand CSV Export to Sub-Blocks', self.expand_interpolation_exports_to_subblocks)
             advanced_form.addRow('Blank Sample Domains', self.blank_sample_domain_behavior)
             advanced_form.addRow('Verbose', self.verbose)
 
@@ -5920,6 +6474,7 @@ if __name__ == "__main__":
                 'block_volume_weighted_file': self.block_volume_weighted_output_edit.text(),
                 'block_domain_metrics_closest_sample_id_cols': [cb.currentText() for cb in self.block_domain_metrics_id_cols],
                 'block_domain_sample_filters': [dict(entry) for entry in self.block_domain_sample_filters],
+                'block_volume_weighted_filters': [dict(entry) for entry in self.block_volume_weighted_filters],
                 'algorithm': self.algorithm_combo.currentText(),
                 'second_pass_algorithm': self.second_pass_combo.currentText(),
                 'samples_delimiter': self.samples_delim.currentText(),
@@ -5936,6 +6491,7 @@ if __name__ == "__main__":
                 'block_z_col': self.block_z_col.currentText(),
                 'block_domain_col': self.block_domain_col.currentText(),
                 'block_value_metric_col': self.block_value_metric_col.currentText(),
+                'block_weight_metric_col': self.block_weight_metric_col.currentText(),
                 'block_size': (self.block_x.value(), self.block_y.value(), self.block_z.value()),
                 'range_size': self.range_size.value(),
                 'max_pheromone': self.max_pheromone.value(),
@@ -5975,6 +6531,7 @@ if __name__ == "__main__":
                 'average_with_blocks': self.average_with_blocks.isChecked(),
                 'fill_unvisited_domainwise': self.fill_unvisited_domainwise.isChecked(),
                 'process_domains_sequentially': self.process_domains_sequentially.isChecked(),
+                'expand_interpolation_exports_to_subblocks': self.expand_interpolation_exports_to_subblocks.isChecked(),
                 'blank_sample_domain_behavior': 'infer_from_blocks' if self.blank_sample_domain_behavior.currentText() == 'Infer From Blocks' else 'skip',
                 'verbose': self.verbose.isChecked(),
                 'viewer_backend': self.viewer_backend,
@@ -5995,7 +6552,9 @@ if __name__ == "__main__":
             self._suspend_auto_viewer_refresh = True
             try:
                 self.block_domain_sample_filters = []
+                self.block_volume_weighted_filters = []
                 self._update_block_domain_metrics_filters_summary()
+                self._update_block_volume_weighted_filters_summary()
                 if 'samples_file' in config: self.samples_edit.setText(config['samples_file'])
                 if 'blocks_file' in config: self.blocks_edit.setText(config['blocks_file'])
                 if 'color_file' in config: self.color_edit.setText(config['color_file'])
@@ -6026,9 +6585,13 @@ if __name__ == "__main__":
                     for cb, column_name in zip(self.block_domain_metrics_id_cols, config['block_domain_metrics_closest_sample_id_cols']):
                         cb.setCurrentText(column_name)
                 if 'block_value_metric_col' in config: self.block_value_metric_col.setCurrentText(config['block_value_metric_col'])
+                if 'block_weight_metric_col' in config: self.block_weight_metric_col.setCurrentText(config['block_weight_metric_col'])
                 if 'block_domain_sample_filters' in config:
                     self.block_domain_sample_filters = [dict(entry) for entry in config['block_domain_sample_filters']]
                     self._update_block_domain_metrics_filters_summary()
+                if 'block_volume_weighted_filters' in config:
+                    self.block_volume_weighted_filters = [dict(entry) for entry in config['block_volume_weighted_filters']]
+                    self._update_block_volume_weighted_filters_summary()
             
                 if 'block_size' in config:
                     bs = config['block_size']
@@ -6098,6 +6661,7 @@ if __name__ == "__main__":
                 if 'average_with_blocks' in config: self.average_with_blocks.setChecked(config['average_with_blocks'])
                 if 'fill_unvisited_domainwise' in config: self.fill_unvisited_domainwise.setChecked(config['fill_unvisited_domainwise'])
                 if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
+                self.expand_interpolation_exports_to_subblocks.setChecked(bool(config.get('expand_interpolation_exports_to_subblocks', True)))
                 if 'blank_sample_domain_behavior' in config:
                     behavior = str(config['blank_sample_domain_behavior']).strip().lower()
                     self.blank_sample_domain_behavior.setCurrentText('Infer From Blocks' if behavior == 'infer_from_blocks' else 'Skip')
@@ -6151,6 +6715,7 @@ if __name__ == "__main__":
                 blocks_delimiter,
                 blocks_header_line,
                 block_domain_col,
+                block_filters=self.block_volume_weighted_filters,
             )
             cached_catalog = self._domain_catalog_cache or {}
             domains = None
@@ -6184,6 +6749,7 @@ if __name__ == "__main__":
                         blocks_delimiter,
                         blocks_header_line,
                         block_domain_col,
+                        block_filters=self.block_volume_weighted_filters,
                         progress_callback=update_progress,
                     )
                     self._domain_catalog_cache = {
@@ -6217,18 +6783,14 @@ if __name__ == "__main__":
                 else:
                     self.domain_mapping_btn.setText('Configure Domain Algorithms...')
 
-        def _load_samples_dataframe_for_operations(self):
-            cfg = self.to_dict()
-            samples_file = cfg.get('samples_file')
-            if not samples_file or not os.path.isfile(samples_file):
-                raise ValueError('Please select a valid samples file first.')
-            df_samples, _ = load_full_samples_dataframe(
-                samples_file,
-                samples_delimiter=cfg.get('samples_delimiter'),
-                samples_header_line=cfg.get('samples_header_line', 1),
-                progress_label='Reading sample file',
+        def _build_filter_data_source(self, csv_file, delimiter=None, header_line=1):
+            if not csv_file or not os.path.isfile(csv_file):
+                raise ValueError('Please select a valid file first.')
+            return FilterDataSource(
+                csv_file,
+                delimiter=delimiter,
+                header_line=header_line,
             )
-            return df_samples
 
         def _set_operation_buttons_enabled(self, enabled):
             self.start_domaining_btn.setEnabled(enabled)
@@ -6300,29 +6862,62 @@ if __name__ == "__main__":
         def _update_block_domain_metrics_filters_summary(self):
             count = len(self.block_domain_sample_filters)
             if count == 0:
-                self.block_domain_metrics_filters_summary.setText('No sample filters configured. All samples will be used.')
-                self.configure_block_domain_metrics_filters_btn.setText('Configure Filters...')
+                self.block_domain_metrics_filters_summary.setText('No sample filters configured. These filters apply app-wide.')
+                self.configure_block_domain_metrics_filters_btn.setText('Configure Sample Filters...')
                 return
 
             summaries = [summarize_sample_filter_spec(spec) for spec in self.block_domain_sample_filters]
             self.block_domain_metrics_filters_summary.setText('\n'.join(summaries[:4]))
-            self.configure_block_domain_metrics_filters_btn.setText(f'Configure Filters... ({count} active)')
+            self.configure_block_domain_metrics_filters_btn.setText(f'Configure Sample Filters... ({count} active)')
+
+        def _update_block_volume_weighted_filters_summary(self):
+            count = len(self.block_volume_weighted_filters)
+            if count == 0:
+                self.block_volume_weighted_filters_summary.setText('No block filters configured. These filters apply app-wide.')
+                self.configure_block_volume_weighted_filters_btn.setText('Configure Block Filters...')
+                return
+
+            summaries = [summarize_sample_filter_spec(spec) for spec in self.block_volume_weighted_filters]
+            self.block_volume_weighted_filters_summary.setText('\n'.join(summaries[:4]))
+            self.configure_block_volume_weighted_filters_btn.setText(f'Configure Block Filters... ({count} active)')
 
         def configure_block_domain_metrics_filters(self):
             cursor_set = False
             try:
-                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-                cursor_set = True
-                df_samples = self._load_samples_dataframe_for_operations()
-                QtWidgets.QApplication.restoreOverrideCursor()
-                cursor_set = False
+                cfg = self.to_dict()
+                sample_filter_source = self._build_filter_data_source(
+                    cfg.get('samples_file'),
+                    delimiter=cfg.get('samples_delimiter'),
+                    header_line=cfg.get('samples_header_line', 1),
+                )
 
-                dialog = SampleFiltersDialog(df_samples, filters=self.block_domain_sample_filters, parent=self)
+                dialog = SampleFiltersDialog(sample_filter_source, filters=self.block_domain_sample_filters, parent=self, subject_label='Sample')
                 if dialog.exec_() == QtWidgets.QDialog.Accepted:
                     self.block_domain_sample_filters = dialog.get_filters()
                     self._update_block_domain_metrics_filters_summary()
             except Exception as exc:
                 QtWidgets.QMessageBox.critical(self, 'Error', f'Could not configure sample filters:\n{exc}')
+            finally:
+                if cursor_set:
+                    QtWidgets.QApplication.restoreOverrideCursor()
+
+        def configure_block_volume_weighted_filters(self):
+            cursor_set = False
+            try:
+                cfg = self.to_dict()
+                block_filter_source = self._build_filter_data_source(
+                    cfg.get('blocks_file'),
+                    delimiter=cfg.get('blocks_delimiter'),
+                    header_line=cfg.get('blocks_header_line', 1),
+                )
+
+                dialog = SampleFiltersDialog(block_filter_source, filters=self.block_volume_weighted_filters, parent=self, subject_label='Block')
+                if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                    self.block_volume_weighted_filters = dialog.get_filters()
+                    self._update_block_volume_weighted_filters_summary()
+                    self._invalidate_domain_catalog_cache()
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(self, 'Error', f'Could not configure block filters:\n{exc}')
             finally:
                 if cursor_set:
                     QtWidgets.QApplication.restoreOverrideCursor()
@@ -6377,6 +6972,8 @@ if __name__ == "__main__":
                         'block_z_col': cfg.get('block_z_col'),
                         'block_domain_col': cfg.get('block_domain_col'),
                         'block_size': cfg.get('block_size'),
+                        'sample_filters': cfg.get('block_domain_sample_filters'),
+                        'block_filters': cfg.get('block_volume_weighted_filters'),
                     },
                     handle_success,
                     'An error occurred during sample domaining',
@@ -6448,6 +7045,7 @@ if __name__ == "__main__":
                         'block_domain_col': cfg.get('block_domain_col'),
                         'block_size': cfg.get('block_size'),
                         'sample_filters': cfg.get('block_domain_sample_filters'),
+                        'block_filters': cfg.get('block_volume_weighted_filters'),
                         'blank_sample_domain_behavior': cfg.get('blank_sample_domain_behavior', 'skip'),
                     },
                     handle_success,
@@ -6475,34 +7073,47 @@ if __name__ == "__main__":
 
                 def handle_success(result):
                     weighted_average = result['weighted_average']
+                    weight_label = result.get('weight_column') or 'Volume'
                     weighted_average_text = 'NaN' if pd.isna(weighted_average) else f"{weighted_average:.12g}"
+                    filters_text = 'None'
+                    if result['filters_applied']:
+                        filters_text = '\n'.join(entry['summary'] for entry in result['filters_applied'])
                     domain_lines = ''
                     if result.get('domain_column') and result.get('domain_summaries'):
                         preview = []
                         for domain, summary in sorted(result['domain_summaries'].items()):
                             avg_text = 'NaN' if pd.isna(summary['weighted_average']) else f"{summary['weighted_average']:.12g}"
-                            preview.append(
-                                f"{domain}: avg={avg_text}, vol={summary['total_volume']:.12g}, rows={summary['rows_with_numeric_value']:,}"
-                            )
+                            detail = f"{domain}: avg={avg_text}, weight={summary['total_weight']:.12g}, rows={summary['rows_with_numeric_value']:,}"
+                            if not pd.isna(summary['total_volume']):
+                                detail += f", vol={summary['total_volume']:.12g}"
+                            preview.append(detail)
                         domain_lines = (
                             f"\nDomain column: {result['domain_column']}\n"
                             f"Domain summaries:\n" + '\n'.join(preview[:8])
                         )
                         if len(preview) > 8:
                             domain_lines += f"\n... and {len(preview) - 8} more domains"
+                    total_volume_line = ''
+                    if not pd.isna(result['total_volume']):
+                        total_volume_line = f"Total volume: {result['total_volume']:.12g}\n"
                     QtWidgets.QMessageBox.information(
                         self,
                         'Success',
                         (
                             f"Block volume export complete!\nResults saved to:\n{result['output_file']}\n\n"
                             f"Weighted column: {result['value_column']}\n"
-                            f"Volume-weighted average: {weighted_average_text}\n"
-                            f"Total volume: {result['total_volume']:.12g}\n"
+                            f"Weight column: {weight_label}\n"
+                            f"Weighted average: {weighted_average_text}\n"
+                            f"Total weight: {result['total_weight']:.12g}\n"
+                            f"{total_volume_line}"
                             f"Weighted sum: {result['weighted_sum']:.12g}\n"
+                            f"Filtered blocks: {result['filtered_blocks']:,} of {result['input_blocks']:,}\n"
                             f"Processed rows: {result['processed_rows']:,}\n"
                             f"Rows with numeric value: {result['rows_with_numeric_value']:,}\n"
                             f"Invalid coordinates: {result['invalid_coordinate_rows']:,}\n"
-                            f"Invalid values: {result['invalid_value_rows']:,}"
+                            f"Invalid values: {result['invalid_value_rows']:,}\n"
+                            f"Invalid weights: {result['invalid_weight_rows']:,}\n\n"
+                            f"Filters:\n{filters_text}"
                             f"{domain_lines}"
                         ),
                     )
@@ -6521,6 +7132,8 @@ if __name__ == "__main__":
                         'block_y_col': cfg.get('block_y_col'),
                         'block_z_col': cfg.get('block_z_col'),
                         'block_domain_col': cfg.get('block_domain_col'),
+                        'weight_col': cfg.get('block_weight_metric_col'),
+                        'block_filters': cfg.get('block_volume_weighted_filters'),
                         'block_size': cfg.get('block_size'),
                     },
                     handle_success,
@@ -6568,6 +7181,8 @@ if __name__ == "__main__":
                     and str(cfg.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
                 )
                 wants_domain_any = wants_domain or wants_ant_domain
+                sample_filters = get_configured_sample_filters(cfg)
+                block_filters = get_configured_block_filters(cfg)
                 needs_sample_domains = should_resolve_sample_domains_for_interpolation(
                     wants_domain_any,
                     blocks_file=cfg.get('blocks_file'),
@@ -6582,6 +7197,8 @@ if __name__ == "__main__":
                     sample_y_col=sample_y_col,
                     sample_z_col=sample_z_col,
                     sample_value_col=sample_value_col,
+                    sample_domain_col=sample_domain_col,
+                    sample_filters=sample_filters,
                     progress_label='Reading sample file',
                 )
 
@@ -6600,6 +7217,8 @@ if __name__ == "__main__":
                             forced_delimiter=samples_delimiter,
                             progress_label='Reading sample file',
                         )
+                    if sample_filters:
+                        df, _ = apply_sample_filters(df, sample_filters=sample_filters)
                     explicit_sample_map = None
 
                 if needs_sample_domains:
@@ -6630,6 +7249,7 @@ if __name__ == "__main__":
                         block_z_col=cfg.get('block_z_col'),
                         block_domain_col=cfg.get('block_domain_col'),
                         block_size=cfg.get('block_size'),
+                        block_filters=block_filters,
                     )
                     df['Domain'] = df['Domain'].astype(str).str.strip()
                     blank_domain = df['Domain'].isna() | (df['Domain'].str.strip() == '') | (df['Domain'].str.lower() == 'nan')
