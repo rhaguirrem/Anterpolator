@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import csv
 import atexit
+import signal
 from collections import Counter
 import importlib.util
 import io
@@ -11,6 +12,7 @@ import tempfile
 import subprocess
 import traceback
 import warnings
+import math
 from tqdm import tqdm
 import sys
 import os
@@ -563,21 +565,265 @@ def infer_sample_domains_from_blocks(sample_coords, blocks_file, block_size,
         progress_callback=progress_callback,
     )
 
-    coords_for_mapping = coords
-    if block_metadata.get('is_rotated') and len(coords_for_mapping) > 0:
-        rotation_center = block_metadata['rotation_center']
-        rotation_matrix = block_metadata['rotation_matrix']
-        coords_for_mapping = (coords_for_mapping - rotation_center) @ rotation_matrix.T
-
-    all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
-    unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
-    sample_block_indices = np.floor((coords_for_mapping - all_min_bounds) / unified_dims + 1e-6).astype(int)
+    sample_block_indices = _compute_sample_block_indices_from_metadata(coords, block_metadata)
     domain_mapping = block_metadata['domain_mapping']
 
     return np.array(
         [domain_mapping.get((int(idx[0]), int(idx[1]), int(idx[2])), '') for idx in sample_block_indices],
         dtype=object,
     )
+
+
+def _compute_sample_block_indices_from_metadata(coords, block_metadata):
+    coords_array = np.asarray(coords, dtype=float)
+    if len(coords_array) == 0:
+        return np.empty((0, 3), dtype=int)
+
+    coords_for_mapping = coords_array
+    if block_metadata.get('is_rotated'):
+        rotation_center = block_metadata['rotation_center']
+        rotation_matrix = block_metadata['rotation_matrix']
+        coords_for_mapping = (coords_for_mapping - rotation_center) @ rotation_matrix.T
+
+    all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
+    unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
+    return np.floor((coords_for_mapping - all_min_bounds) / unified_dims + 1e-6).astype(int)
+
+
+def _normalize_block_transfer_columns(block_value_cols, block_x_col=None, block_y_col=None, block_z_col=None,
+                                      block_domain_col=None):
+    if isinstance(block_value_cols, str):
+        raw_columns = [part.strip() for part in block_value_cols.split(',')]
+    else:
+        raw_columns = [str(part).strip() for part in (block_value_cols or [])]
+
+    normalized_columns = []
+    seen = set()
+    reserved = {
+        str(block_x_col or '').strip(),
+        str(block_y_col or '').strip(),
+        str(block_z_col or '').strip(),
+        str(block_domain_col or '').strip(),
+    }
+    reserved = {value for value in reserved if value and value != '(None)'}
+
+    for column_name in raw_columns:
+        if not column_name or column_name == '(None)' or column_name in seen:
+            continue
+        if column_name in reserved:
+            raise ValueError(
+                f"Block transfer column '{column_name}' conflicts with the configured coordinate/domain mapping columns."
+            )
+        normalized_columns.append(column_name)
+        seen.add(column_name)
+
+    if not normalized_columns:
+        raise ValueError('Please select at least one block column to transfer to samples.')
+
+    return normalized_columns
+
+
+def _detect_block_transfer_column_modes(blocks_file, delimiter, header_line, block_value_cols,
+                                        block_x_col=None, block_y_col=None, block_z_col=None,
+                                        block_filters=None, progress_callback=None):
+    headers = parse_header_line(blocks_file, delimiter, header_line)
+    final_names = build_unique_column_names(headers)
+    filter_fields = collect_filter_fields(block_filters or [])
+    selected_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
+        final_names,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=None,
+        extra_columns=list(block_value_cols) + filter_fields,
+    )
+    base_read_kwargs = dict(
+        delimiter=delimiter,
+        header=None,
+        names=final_names,
+        skiprows=header_line,
+        comment='#',
+        usecols=selected_columns,
+        chunksize=250_000,
+    )
+    if mapping_mode == 'explicit':
+        print(f"Applied user block column mapping for transfer scan: {rename_map}")
+    else:
+        print(f"Applied generic positional mapping for transfer scan: {rename_map}")
+
+    numeric_candidates = {column_name: True for column_name in block_value_cols}
+    saw_values = {column_name: False for column_name in block_value_cols}
+    for chunk in iterate_csv_with_progress(
+        blocks_file,
+        'Scanning block transfer columns',
+        progress_callback=progress_callback,
+        **base_read_kwargs,
+    ):
+        if block_filters:
+            chunk, _ = apply_dataframe_filters(
+                chunk,
+                filters=block_filters,
+                filter_subject='block',
+                source_label='blocks file chunk',
+                emit_logs=False,
+            )
+        chunk, _ = normalize_block_chunk(chunk, rename_map, domain_copy_source, extra_keep_columns=block_value_cols)
+        if len(chunk) == 0:
+            continue
+        for column_name in block_value_cols:
+            if column_name not in chunk.columns or not numeric_candidates[column_name]:
+                continue
+            values = chunk[column_name].fillna('').astype(str).str.strip()
+            nonblank = values[(values != '') & (values.str.lower() != 'nan')]
+            if len(nonblank) == 0:
+                continue
+            saw_values[column_name] = True
+            if pd.to_numeric(nonblank, errors='coerce').isna().any():
+                numeric_candidates[column_name] = False
+
+    return {
+        column_name: 'numeric' if numeric_candidates[column_name] and saw_values[column_name] else 'categorical'
+        for column_name in block_value_cols
+    }
+
+
+def load_block_value_mappings(blocks_file, delimiter, header_line, block_size, block_value_cols,
+                              block_x_col=None, block_y_col=None, block_z_col=None,
+                              block_filters=None, block_metadata=None, progress_callback=None):
+    if not blocks_file or not os.path.isfile(blocks_file):
+        raise ValueError('Please select a valid blocks file.')
+
+    normalized_columns = _normalize_block_transfer_columns(
+        block_value_cols,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+    )
+    delimiter = delimiter or detect_csv_delimiter(blocks_file)
+    header_line = header_line or 1
+
+    block_metadata = block_metadata or load_large_blocks_metadata(
+        blocks_file,
+        delimiter,
+        header_line,
+        block_size,
+        None,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=None,
+        block_filters=block_filters,
+        config=None,
+        progress_callback=progress_callback,
+    )
+
+    column_modes = _detect_block_transfer_column_modes(
+        blocks_file,
+        delimiter,
+        header_line,
+        normalized_columns,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_filters=block_filters,
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 100, 'Scanning block transfer columns...'),
+    )
+
+    headers = parse_header_line(blocks_file, delimiter, header_line)
+    final_names = build_unique_column_names(headers)
+    filter_fields = collect_filter_fields(block_filters or [])
+    selected_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
+        final_names,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=None,
+        extra_columns=normalized_columns + filter_fields,
+    )
+    base_read_kwargs = dict(
+        delimiter=delimiter,
+        header=None,
+        names=final_names,
+        skiprows=header_line,
+        comment='#',
+        usecols=selected_columns,
+        chunksize=250_000,
+    )
+    if mapping_mode == 'explicit':
+        print(f"Applied user block column mapping for transfer aggregation: {rename_map}")
+    else:
+        print(f"Applied generic positional mapping for transfer aggregation: {rename_map}")
+
+    numeric_summaries = {column_name: {} for column_name, mode in column_modes.items() if mode == 'numeric'}
+    categorical_counts = {column_name: {} for column_name, mode in column_modes.items() if mode != 'numeric'}
+
+    for chunk in iterate_csv_with_progress(
+        blocks_file,
+        'Reading grid file (block transfer mapping)',
+        progress_callback=progress_callback,
+        **base_read_kwargs,
+    ):
+        if block_filters:
+            chunk, _ = apply_dataframe_filters(
+                chunk,
+                filters=block_filters,
+                filter_subject='block',
+                source_label='blocks file chunk',
+                emit_logs=False,
+            )
+        chunk, _ = normalize_block_chunk(chunk, rename_map, domain_copy_source, extra_keep_columns=normalized_columns)
+        if len(chunk) == 0:
+            continue
+
+        block_indices = _compute_sample_block_indices_from_metadata(
+            chunk[['x', 'y', 'z']].to_numpy(copy=False),
+            block_metadata,
+        )
+
+        for column_name, summaries in numeric_summaries.items():
+            if column_name not in chunk.columns:
+                continue
+            numeric_values = pd.to_numeric(chunk[column_name], errors='coerce')
+            valid_mask = numeric_values.notna().to_numpy()
+            if not valid_mask.any():
+                continue
+            for idx, value in zip(block_indices[valid_mask], numeric_values.loc[valid_mask].to_numpy(copy=False)):
+                block_idx = (int(idx[0]), int(idx[1]), int(idx[2]))
+                current_sum, current_count = summaries.get(block_idx, (0.0, 0))
+                summaries[block_idx] = (current_sum + float(value), current_count + 1)
+
+        for column_name, counts_by_block in categorical_counts.items():
+            if column_name not in chunk.columns:
+                continue
+            values = chunk[column_name].fillna('').astype(str).str.strip()
+            valid_mask = ((values != '') & (values.str.lower() != 'nan')).to_numpy()
+            if not valid_mask.any():
+                continue
+            for idx, value in zip(block_indices[valid_mask], values.loc[valid_mask].to_numpy(copy=False)):
+                block_idx = (int(idx[0]), int(idx[1]), int(idx[2]))
+                counts = counts_by_block.setdefault(block_idx, Counter())
+                counts[str(value)] += 1
+
+    value_mappings = {}
+    for column_name, summaries in numeric_summaries.items():
+        for block_idx, (total_value, count) in summaries.items():
+            if count <= 0:
+                continue
+            value_mappings.setdefault(block_idx, {})[column_name] = total_value / count
+
+    for column_name, counts_by_block in categorical_counts.items():
+        for block_idx, counts in counts_by_block.items():
+            if not counts:
+                continue
+            winner = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+            value_mappings.setdefault(block_idx, {})[column_name] = winner
+
+    return {
+        'value_mappings': value_mappings,
+        'column_modes': column_modes,
+        'block_metadata': block_metadata,
+        'columns': normalized_columns,
+    }
 
 
 def apply_blank_sample_domain_behavior(df, blank_domain_behavior='skip', domain_col='Domain',
@@ -883,7 +1129,7 @@ def detect_csv_delimiter(path):
     return delim if counts[delim] > 0 else ','
 
 def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=None,
-                        progress_callback=None):
+            progress_callback=None):
     """Read a CSV file detecting delimiter (comma, semicolon, tab, pipe) unless forced.
     Drops empty columns. Returns DataFrame."""
     if not os.path.isfile(path):
@@ -2693,6 +2939,38 @@ def resolve_domain_samples_export_path(configured_path=None, samples_file=None, 
     return os.path.join(output_dir, f"{base_name}+{domain_suffix}.csv")
 
 
+def resolve_block_value_transfer_export_path(configured_path=None, samples_file=None, block_value_cols=None):
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    if samples_file and str(samples_file).strip():
+        reference_path = str(samples_file).strip()
+    else:
+        reference_path = 'samples.csv'
+
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'samples'
+    normalized_columns = []
+    seen = set()
+    for value in block_value_cols or []:
+        column_name = str(value or '').strip()
+        if not column_name or column_name in seen:
+            continue
+        normalized_columns.append(column_name)
+        seen.add(column_name)
+
+    if not normalized_columns:
+        suffix = 'block_values'
+    else:
+        preview = [_sanitize_filename_fragment(column_name, fallback='value') for column_name in normalized_columns[:3]]
+        if len(normalized_columns) > 3:
+            preview.append(f"plus{len(normalized_columns) - 3}")
+        suffix = '+'.join(preview)
+
+    return os.path.join(output_dir, f"{base_name}+{suffix}.csv")
+
+
 def resolve_block_domain_metrics_export_path(configured_path=None, blocks_file=None, domain_col=None):
     configured_path = str(configured_path or '').strip()
     if configured_path:
@@ -2709,6 +2987,22 @@ def resolve_block_domain_metrics_export_path(configured_path=None, blocks_file=N
     return os.path.join(output_dir, f"{base_name}+{domain_suffix}_sample_metrics.csv")
 
 
+def resolve_domain_interpolation_confidence_export_path(configured_path=None, blocks_file=None, domain_col=None):
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    if blocks_file and str(blocks_file).strip():
+        reference_path = str(blocks_file).strip()
+    else:
+        reference_path = 'blocks.csv'
+
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'blocks'
+    domain_suffix = _sanitize_filename_fragment(domain_col, fallback='Domain')
+    return os.path.join(output_dir, f"{base_name}+{domain_suffix}_interpolation_confidence.csv")
+
+
 def resolve_block_volume_weighted_average_export_path(configured_path=None, blocks_file=None, value_col=None):
     configured_path = str(configured_path or '').strip()
     if configured_path:
@@ -2723,6 +3017,400 @@ def resolve_block_volume_weighted_average_export_path(configured_path=None, bloc
     base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'blocks'
     value_suffix = _sanitize_filename_fragment(value_col, fallback='Value')
     return os.path.join(output_dir, f"{base_name}+{value_suffix}_volume_weighted.csv")
+
+
+def resolve_equation_finder_export_path(configured_path=None, samples_file=None, value_col=None, domain_col=None):
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    if samples_file and str(samples_file).strip():
+        reference_path = str(samples_file).strip()
+    else:
+        reference_path = 'samples.csv'
+
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'samples'
+    value_suffix = _sanitize_filename_fragment(value_col, fallback='Value')
+    domain_suffix = _sanitize_filename_fragment(domain_col, fallback='Domain')
+    return os.path.join(output_dir, f"{base_name}+{domain_suffix}+{value_suffix}_equations.csv")
+
+
+def load_samples_preview_dataframe(samples_file, samples_delimiter=None, samples_header_line=1, max_rows=500):
+    delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
+    preview_rows = max(int(max_rows or 0), 1)
+
+    if samples_header_line and samples_header_line != 1:
+        headers = parse_header_line(samples_file, delimiter, samples_header_line)
+        final_names = build_unique_column_names(headers)
+        read_kwargs = prepare_csv_read_kwargs(
+            samples_file,
+            delimiter=delimiter,
+            header=None,
+            names=final_names,
+            skiprows=max(int(samples_header_line) - 1, 0),
+            comment='#',
+            nrows=preview_rows + 1,
+        )
+        df = pd.read_csv(samples_file, **read_kwargs)
+        if df.shape[0] and all(str(df.iloc[0, i]).strip() == final_names[i] for i in range(min(len(final_names), df.shape[1]))):
+            df = df.iloc[1:].reset_index(drop=True)
+    else:
+        read_kwargs = prepare_csv_read_kwargs(
+            samples_file,
+            delimiter=delimiter,
+            comment='#',
+            nrows=preview_rows,
+        )
+        df = pd.read_csv(samples_file, **read_kwargs)
+
+    df = strip_leading_non_data_rows(df)
+
+    def is_all_empty(series):
+        return series.isna().all() or (series.astype(str).str.strip() == '').all()
+
+    empty_cols = [column_name for column_name in df.columns if is_all_empty(df[column_name])]
+    if empty_cols:
+        df = df.drop(columns=empty_cols)
+
+    df._detected_delimiter = delimiter
+    return df, delimiter
+
+
+def infer_numeric_sample_columns(df, delimiter=None, minimum_success_ratio=0.8):
+    numeric_columns = []
+    for column_name in df.columns:
+        series = df[column_name]
+        if pd.api.types.is_bool_dtype(series):
+            continue
+        if pd.api.types.is_numeric_dtype(series):
+            numeric_columns.append(str(column_name))
+            continue
+
+        non_blank = series.dropna()
+        if len(non_blank) == 0:
+            continue
+        non_blank = non_blank.astype(str).str.strip()
+        non_blank = non_blank[non_blank != '']
+        if len(non_blank) == 0:
+            continue
+
+        converted = pd.to_numeric(non_blank, errors='coerce')
+        success_ratio = float(converted.notna().mean()) if len(converted) else 0.0
+
+        if success_ratio < float(minimum_success_ratio):
+            normalized = non_blank.str.replace('\u00a0', '', regex=False).str.replace(' ', '', regex=False)
+            if delimiter and delimiter != ',':
+                normalized = normalized.str.replace(',', '.', regex=False)
+            converted = pd.to_numeric(normalized, errors='coerce')
+            success_ratio = float(converted.notna().mean()) if len(converted) else 0.0
+
+        if success_ratio >= float(minimum_success_ratio):
+            numeric_columns.append(str(column_name))
+    return numeric_columns
+
+
+def coerce_numeric_series(series, delimiter=None):
+    numeric_series = pd.to_numeric(series, errors='coerce')
+    missing_mask = numeric_series.isna()
+    if not missing_mask.any():
+        return numeric_series
+
+    text_series = series.astype(str)
+    normalized = text_series.str.replace('\u00a0', '', regex=False).str.replace(' ', '', regex=False)
+    if delimiter and delimiter != ',':
+        normalized = normalized.str.replace(',', '.', regex=False)
+    alternate_numeric = pd.to_numeric(normalized, errors='coerce')
+    numeric_series = numeric_series.where(~missing_mask, alternate_numeric)
+    return numeric_series
+
+
+def _safe_metric_r2(y_true, y_pred):
+    if len(y_true) < 2:
+        return np.nan
+    from sklearn.metrics import r2_score
+
+    try:
+        return float(r2_score(y_true, y_pred))
+    except Exception:
+        return np.nan
+
+
+def export_domain_symbolic_regression_equations(samples_file, output_file=None,
+                                                samples_delimiter=None, samples_header_line=1,
+                                                sample_value_col=None, sample_domain_col=None,
+                                                predictor_cols=None, sample_filters=None,
+                                                min_samples_per_domain=25,
+                                                validation_fraction=0.2,
+                                                max_iterations=100,
+                                                timeout_seconds=60,
+                                                progress_callback=None):
+    if not samples_file or not os.path.isfile(samples_file):
+        raise ValueError('Please select a valid samples file.')
+
+    target_column = str(sample_value_col or '').strip()
+    if not target_column or target_column == '(None)':
+        raise ValueError('Please select a value column in "Samples Columns" first.')
+
+    domain_column = str(sample_domain_col or '').strip()
+    if not domain_column or domain_column == '(None)':
+        raise ValueError('Please select a domain column in "Samples Columns" first.')
+
+    predictor_columns = []
+    for column_name in predictor_cols or []:
+        text = str(column_name or '').strip()
+        if text and text not in predictor_columns:
+            predictor_columns.append(text)
+    predictor_columns = [col for col in predictor_columns if col != target_column]
+    if not predictor_columns:
+        raise ValueError('Please select at least one predictor column.')
+
+    try:
+        pysr_module = importlib.import_module('pysr')
+        PySRRegressor = pysr_module.PySRRegressor
+    except Exception as exc:
+        raise RuntimeError(
+            'PySR is not available. Install the pysr package and ensure Julia bootstrap works on this machine before running the equation finder.'
+        ) from exc
+
+    output_file = resolve_equation_finder_export_path(
+        output_file,
+        samples_file=samples_file,
+        value_col=target_column,
+        domain_col=domain_column,
+    )
+    output_dir = os.path.dirname(output_file) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(output_file))[0] or 'equations'
+    details_dir = os.path.join(output_dir, f'{base_name}_details')
+    os.makedirs(details_dir, exist_ok=True)
+
+    selected_columns = [target_column, domain_column, *predictor_columns]
+    selected_columns.extend(collect_filter_fields(sample_filters))
+    selected_columns = list(dict.fromkeys(selected_columns))
+
+    _emit_progress(progress_callback, 0, 100, 'Reading sample file...')
+    delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
+    df_samples, _ = read_selected_columns_with_header(
+        samples_file,
+        delimiter,
+        samples_header_line or 1,
+        selected_columns,
+        progress_label='Reading sample file',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 20, 'Reading sample file...'),
+    )
+    if sample_filters:
+        df_samples, _ = apply_sample_filters(df_samples, sample_filters=sample_filters)
+
+    missing_columns = [
+        column_name for column_name in [target_column, domain_column, *predictor_columns]
+        if column_name not in df_samples.columns
+    ]
+    if missing_columns:
+        raise ValueError(f'Selected columns not found in samples file: {missing_columns}')
+
+    _emit_progress(progress_callback, 22, 100, 'Validating predictors...')
+    predictor_frame = pd.DataFrame(index=df_samples.index)
+    for column_name in predictor_columns:
+        predictor_frame[column_name] = coerce_numeric_series(df_samples[column_name], delimiter=delimiter)
+    target_series = coerce_numeric_series(df_samples[target_column], delimiter=delimiter)
+    domain_series = df_samples[domain_column].fillna('').astype(str).str.strip()
+    domain_series = domain_series.replace('nan', '')
+
+    invalid_predictors = []
+    for column_name in predictor_columns:
+        non_blank = df_samples[column_name].dropna().astype(str).str.strip()
+        non_blank = non_blank[non_blank != '']
+        if len(non_blank) == 0:
+            invalid_predictors.append(column_name)
+            continue
+        converted = coerce_numeric_series(non_blank, delimiter=delimiter)
+        if not converted.notna().any():
+            invalid_predictors.append(column_name)
+
+    skipped_predictors = list(invalid_predictors)
+    predictor_columns = [column_name for column_name in predictor_columns if column_name not in skipped_predictors]
+    if not predictor_columns:
+        raise ValueError('None of the selected predictor columns contain usable numeric values after coercion.')
+    if skipped_predictors:
+        predictor_frame = predictor_frame[predictor_columns].copy()
+        _emit_progress(
+            progress_callback,
+            23,
+            100,
+            f'Skipping {len(skipped_predictors)} predictor columns without usable numeric values...',
+        )
+
+    valid_mask = domain_series.ne('') & target_series.notna() & predictor_frame.notna().all(axis=1)
+    filtered_row_count = int(valid_mask.sum())
+    working_df = pd.DataFrame({
+        'Domain': domain_series.loc[valid_mask].to_numpy(dtype=object, copy=False),
+        'Target': target_series.loc[valid_mask].to_numpy(dtype=float, copy=False),
+    })
+    for column_name in predictor_columns:
+        working_df[column_name] = predictor_frame.loc[valid_mask, column_name].to_numpy(dtype=float, copy=False)
+
+    if len(working_df) == 0:
+        raise ValueError('No valid rows remain after removing blank domains and non-numeric target/predictor values.')
+
+    domain_names = sorted(str(name) for name in working_df['Domain'].dropna().unique())
+    if not domain_names:
+        raise ValueError('No valid domain values remain after filtering.')
+
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from sklearn.model_selection import train_test_split
+
+    min_samples = max(int(min_samples_per_domain or 0), 2)
+    test_fraction = float(validation_fraction or 0.0)
+    if not np.isfinite(test_fraction):
+        test_fraction = 0.2
+    test_fraction = min(max(test_fraction, 0.0), 0.5)
+    niterations = max(int(max_iterations or 0), 1)
+    timeout_value = None
+    if timeout_seconds is not None:
+        timeout_value = max(float(timeout_seconds or 0.0), 0.0)
+        if timeout_value <= 0:
+            timeout_value = None
+
+    summary_rows = []
+    processed_domains = 0
+    skipped_domains = 0
+    for domain_index, domain_name in enumerate(domain_names, start=1):
+        domain_df = working_df.loc[working_df['Domain'] == domain_name].copy()
+        domain_row_count = int(len(domain_df))
+        domain_slug = _sanitize_filename_fragment(domain_name, fallback=f'domain_{domain_index}')
+        detail_path = os.path.join(details_dir, f'{domain_index:03d}_{domain_slug}_hall_of_fame.csv')
+
+        base_progress = 25 + int(round(((domain_index - 1) / max(len(domain_names), 1)) * 70))
+        _emit_progress(progress_callback, base_progress, 100, f'Fitting domain {domain_index}/{len(domain_names)}: {domain_name}')
+        print(f'Equation finder: domain {domain_index}/{len(domain_names)} -> {domain_name} ({domain_row_count:,} valid rows)')
+
+        if domain_row_count < min_samples:
+            skipped_domains += 1
+            print(f'Equation finder: skipped domain {domain_name} because it has {domain_row_count:,} valid rows; requires at least {min_samples:,}.')
+            summary_rows.append({
+                'Domain': domain_name,
+                'Samples': domain_row_count,
+                'Predictor_Count': len(predictor_columns),
+                'Predictors': ', '.join(predictor_columns),
+                'Skipped_Predictors': ', '.join(skipped_predictors),
+                'Equation': '',
+                'Complexity': np.nan,
+                'Loss': np.nan,
+                'Train_RMSE': np.nan,
+                'Train_MAE': np.nan,
+                'Train_R2': np.nan,
+                'Validation_RMSE': np.nan,
+                'Validation_MAE': np.nan,
+                'Validation_R2': np.nan,
+                'Status': f'Skipped: requires at least {min_samples} rows',
+                'Hall_Of_Fame_File': detail_path,
+            })
+            continue
+
+        X = domain_df[predictor_columns].to_numpy(dtype=float, copy=False)
+        y = domain_df['Target'].to_numpy(dtype=float, copy=False)
+
+        if test_fraction > 0.0 and domain_row_count >= max(min_samples, 5):
+            X_train, X_test, y_train, y_test = train_test_split(
+                X,
+                y,
+                test_size=test_fraction,
+                random_state=42,
+            )
+        else:
+            X_train, X_test, y_train, y_test = X, X, y, y
+
+        model = PySRRegressor(
+            model_selection='best',
+            niterations=niterations,
+            timeout_in_seconds=timeout_value,
+            binary_operators=['+', '-', '*', '/'],
+            unary_operators=['square'],
+            maxsize=30,
+            verbosity=0,
+            progress=False,
+            input_stream='devnull',
+            temp_equation_file=True,
+            warm_start=False,
+        )
+
+        try:
+            model.fit(X_train, y_train)
+        except Exception as exc:
+            raise RuntimeError(
+                f'Equation search failed for domain "{domain_name}". PySR requires a working Julia runtime/bootstrap on this machine. Original error: {exc}'
+            ) from exc
+        print(f'Equation finder: finished domain {domain_name}.')
+
+        train_pred = np.asarray(model.predict(X_train), dtype=float)
+        test_pred = np.asarray(model.predict(X_test), dtype=float)
+        equations_df = getattr(model, 'equations_', None)
+        best_equation = str(model.sympy()) if hasattr(model, 'sympy') else ''
+        complexity_value = np.nan
+        loss_value = np.nan
+
+        if isinstance(equations_df, pd.DataFrame) and not equations_df.empty:
+            equations_export = equations_df.copy()
+            selected_mask = pd.Series(False, index=equations_export.index)
+            if 'sympy_format' in equations_export.columns and best_equation:
+                selected_mask = equations_export['sympy_format'].astype(str) == best_equation
+            if not selected_mask.any() and 'pick' in equations_export.columns:
+                pick_text = equations_export['pick'].astype(str)
+                selected_mask = pick_text.str.contains('>', regex=False) | pick_text.isin(['True', 'true', '1'])
+            equations_export.insert(0, 'Domain', domain_name)
+            equations_export.insert(1, 'Selected_By_App', selected_mask.to_numpy(dtype=bool, copy=False))
+            equations_export.to_csv(detail_path, index=False)
+
+            if selected_mask.any():
+                selected_row = equations_export.loc[selected_mask].iloc[0]
+                complexity_value = selected_row.get('complexity', np.nan)
+                loss_value = selected_row.get('loss', np.nan)
+        else:
+            pd.DataFrame([
+                {
+                    'Domain': domain_name,
+                    'Selected_By_App': True,
+                    'equation': best_equation,
+                }
+            ]).to_csv(detail_path, index=False)
+
+        processed_domains += 1
+        summary_rows.append({
+            'Domain': domain_name,
+            'Samples': domain_row_count,
+            'Predictor_Count': len(predictor_columns),
+            'Predictors': ', '.join(predictor_columns),
+            'Skipped_Predictors': ', '.join(skipped_predictors),
+            'Equation': best_equation,
+            'Complexity': complexity_value,
+            'Loss': loss_value,
+            'Train_RMSE': float(np.sqrt(mean_squared_error(y_train, train_pred))),
+            'Train_MAE': float(mean_absolute_error(y_train, train_pred)),
+            'Train_R2': _safe_metric_r2(y_train, train_pred),
+            'Validation_RMSE': float(np.sqrt(mean_squared_error(y_test, test_pred))),
+            'Validation_MAE': float(mean_absolute_error(y_test, test_pred)),
+            'Validation_R2': _safe_metric_r2(y_test, test_pred),
+            'Status': 'OK',
+            'Hall_Of_Fame_File': detail_path,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    _emit_progress(progress_callback, 100, 100, 'Equation search complete.')
+    return {
+        'output_file': output_file,
+        'details_directory': details_dir,
+        'summary_dataframe': summary_df,
+        'target_column': target_column,
+        'domain_column': domain_column,
+        'predictor_columns': list(predictor_columns),
+        'skipped_predictor_columns': list(skipped_predictors),
+        'input_rows': int(len(df_samples)),
+        'valid_rows': filtered_row_count,
+        'domain_count': len(domain_names),
+        'processed_domains': processed_domains,
+        'skipped_domains': skipped_domains,
+    }
 
 
 def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_header_line=1,
@@ -3058,25 +3746,46 @@ def apply_sample_filters(df_samples, sample_filters=None, progress_callback=None
 def _compute_point_to_set_distance_stats(query_points, reference_points, query_chunk_size=1024,
                                          reference_chunk_size=4096, progress_callback=None,
                                          progress_label='Computing distance statistics',
-                                         return_nearest_index=False):
+                                         return_nearest_index=False,
+                                         distance_band_edges=None):
     query_points = np.asarray(query_points, dtype=float)
     reference_points = np.asarray(reference_points, dtype=float)
+    band_edges = None if distance_band_edges is None else np.asarray(distance_band_edges, dtype=float)
+    return_band_counts = band_edges is not None and band_edges.size > 0
+    if return_band_counts:
+        if np.any(~np.isfinite(band_edges)):
+            raise ValueError('Distance band edges must be finite numbers.')
+        if np.any(band_edges <= 0):
+            raise ValueError('Distance band edges must be greater than zero.')
+        if np.any(np.diff(band_edges) <= 0):
+            raise ValueError('Distance band edges must be strictly increasing.')
 
     if len(query_points) == 0:
         nearest_empty = np.empty(0, dtype=float)
         average_empty = np.empty(0, dtype=float)
+        band_counts_empty = np.empty((0, len(band_edges) + 1), dtype=int) if return_band_counts else None
         if return_nearest_index:
+            if return_band_counts:
+                return nearest_empty, average_empty, np.empty(0, dtype=int), band_counts_empty
             return nearest_empty, average_empty, np.empty(0, dtype=int)
+        if return_band_counts:
+            return nearest_empty, average_empty, band_counts_empty
         return nearest_empty, average_empty
     if len(reference_points) == 0:
         nan_values = np.full(len(query_points), np.nan, dtype=float)
+        band_counts_empty = np.zeros((len(query_points), len(band_edges) + 1), dtype=int) if return_band_counts else None
         if return_nearest_index:
+            if return_band_counts:
+                return nan_values.copy(), nan_values, np.full(len(query_points), -1, dtype=int), band_counts_empty
             return nan_values.copy(), nan_values, np.full(len(query_points), -1, dtype=int)
+        if return_band_counts:
+            return nan_values.copy(), nan_values, band_counts_empty
         return nan_values.copy(), nan_values
 
     nearest = np.empty(len(query_points), dtype=float)
     average = np.empty(len(query_points), dtype=float)
     nearest_indices = np.full(len(query_points), -1, dtype=int) if return_nearest_index else None
+    band_counts = np.zeros((len(query_points), len(band_edges) + 1), dtype=int) if return_band_counts else None
 
     for query_start in range(0, len(query_points), query_chunk_size):
         query_end = min(query_start + query_chunk_size, len(query_points))
@@ -3085,6 +3794,7 @@ def _compute_point_to_set_distance_stats(query_points, reference_points, query_c
         chunk_distance_sum = np.zeros(len(query_chunk), dtype=float)
         chunk_count = 0
         chunk_nearest_indices = np.full(len(query_chunk), -1, dtype=int) if return_nearest_index else None
+        chunk_band_counts = np.zeros((len(query_chunk), len(band_edges) + 1), dtype=int) if return_band_counts else None
 
         for reference_start in range(0, len(reference_points), reference_chunk_size):
             reference_end = min(reference_start + reference_chunk_size, len(reference_points))
@@ -3099,17 +3809,160 @@ def _compute_point_to_set_distance_stats(query_points, reference_points, query_c
                 chunk_nearest_indices[update_mask] = reference_start + chunk_min_indices[update_mask]
             chunk_distance_sum += distances.sum(axis=1)
             chunk_count += distances.shape[1]
+            if return_band_counts:
+                bucket_indices = np.searchsorted(band_edges, distances, side='right')
+                for bucket_index in range(len(band_edges) + 1):
+                    chunk_band_counts[:, bucket_index] += np.count_nonzero(bucket_indices == bucket_index, axis=1)
 
         nearest[query_start:query_end] = chunk_nearest
         average[query_start:query_end] = chunk_distance_sum / max(chunk_count, 1)
         if return_nearest_index:
             nearest_indices[query_start:query_end] = chunk_nearest_indices
+        if return_band_counts:
+            band_counts[query_start:query_end] = chunk_band_counts
         if progress_callback:
             progress_callback(query_end, len(query_points), progress_label)
 
     if return_nearest_index:
+        if return_band_counts:
+            return nearest, average, nearest_indices, band_counts
         return nearest, average, nearest_indices
+    if return_band_counts:
+        return nearest, average, band_counts
     return nearest, average
+
+
+def _format_metric_distance_token(distance_value):
+    rounded_value = round(float(distance_value), 6)
+    if math.isclose(rounded_value, round(rounded_value), abs_tol=1e-6):
+        return str(int(round(rounded_value)))
+    formatted = f'{rounded_value:.6f}'.rstrip('0').rstrip('.')
+    return formatted.replace('-', 'neg').replace('.', 'p')
+
+
+def _build_distance_band_column_names(domain_column_name, distance_step, distance_factor):
+    if distance_step is None or distance_factor is None:
+        return [], np.empty(0, dtype=float)
+
+    step_value = float(distance_step)
+    factor_value = int(distance_factor)
+    if not np.isfinite(step_value) or step_value <= 0:
+        raise ValueError('Distance count step must be greater than zero.')
+    if factor_value <= 0:
+        raise ValueError('Distance count max factor must be at least 1.')
+
+    band_edges = np.arange(1, factor_value + 1, dtype=float) * step_value
+    column_names = []
+    previous_label = '0'
+    for edge in band_edges:
+        edge_label = _format_metric_distance_token(edge)
+        column_names.append(f'{domain_column_name}_Sample_Count_{previous_label}_{edge_label}')
+        previous_label = edge_label
+    column_names.append(f'{domain_column_name}_Sample_Count_GE_{_format_metric_distance_token(band_edges[-1])}')
+    return column_names, band_edges
+
+
+def _compute_average_pairwise_distance(points, query_chunk_size=512, reference_chunk_size=2048,
+                                       progress_callback=None, progress_label='Computing pairwise distance statistics'):
+    points = np.asarray(points, dtype=float)
+    point_count = len(points)
+    if point_count < 2:
+        return np.nan
+
+    total_distance = 0.0
+    pair_count = 0
+
+    for query_start in range(0, point_count, query_chunk_size):
+        query_end = min(query_start + query_chunk_size, point_count)
+        query_chunk = points[query_start:query_end]
+
+        within_deltas = query_chunk[:, None, :] - query_chunk[None, :, :]
+        within_distances = np.sqrt(np.sum(within_deltas * within_deltas, axis=2))
+        upper_indices = np.triu_indices(len(query_chunk), k=1)
+        if len(upper_indices[0]) > 0:
+            total_distance += float(within_distances[upper_indices].sum())
+            pair_count += int(len(upper_indices[0]))
+
+        for reference_start in range(query_end, point_count, reference_chunk_size):
+            reference_end = min(reference_start + reference_chunk_size, point_count)
+            reference_chunk = points[reference_start:reference_end]
+            deltas = query_chunk[:, None, :] - reference_chunk[None, :, :]
+            distances = np.sqrt(np.sum(deltas * deltas, axis=2))
+            total_distance += float(distances.sum())
+            pair_count += int(distances.size)
+
+        if progress_callback:
+            progress_callback(query_end, point_count, progress_label)
+
+    if pair_count == 0:
+        return np.nan
+    return total_distance / pair_count
+
+
+def _compute_average_pairwise_axis_distances(points, query_chunk_size=512, reference_chunk_size=2048,
+                                             progress_callback=None, progress_label='Computing pairwise axis distance statistics'):
+    points = np.asarray(points, dtype=float)
+    point_count = len(points)
+    if point_count < 2:
+        return np.full(3, np.nan, dtype=float)
+
+    total_axis_distance = np.zeros(3, dtype=float)
+    pair_count = 0
+
+    for query_start in range(0, point_count, query_chunk_size):
+        query_end = min(query_start + query_chunk_size, point_count)
+        query_chunk = points[query_start:query_end]
+
+        within_abs_deltas = np.abs(query_chunk[:, None, :] - query_chunk[None, :, :])
+        upper_indices = np.triu_indices(len(query_chunk), k=1)
+        if len(upper_indices[0]) > 0:
+            total_axis_distance += within_abs_deltas[upper_indices].sum(axis=0)
+            pair_count += int(len(upper_indices[0]))
+
+        for reference_start in range(query_end, point_count, reference_chunk_size):
+            reference_end = min(reference_start + reference_chunk_size, point_count)
+            reference_chunk = points[reference_start:reference_end]
+            abs_deltas = np.abs(query_chunk[:, None, :] - reference_chunk[None, :, :])
+            total_axis_distance += abs_deltas.sum(axis=(0, 1))
+            pair_count += int(abs_deltas.shape[0] * abs_deltas.shape[1])
+
+        if progress_callback:
+            progress_callback(query_end, point_count, progress_label)
+
+    if pair_count == 0:
+        return np.full(3, np.nan, dtype=float)
+    return total_axis_distance / pair_count
+
+
+def _compute_average_point_to_set_axis_distances(query_points, reference_points, query_chunk_size=1024,
+                                                 reference_chunk_size=4096, progress_callback=None,
+                                                 progress_label='Computing point-to-set axis distance statistics'):
+    query_points = np.asarray(query_points, dtype=float)
+    reference_points = np.asarray(reference_points, dtype=float)
+
+    if len(query_points) == 0 or len(reference_points) == 0:
+        return np.full(3, np.nan, dtype=float)
+
+    total_axis_distance = np.zeros(3, dtype=float)
+    pair_count = 0
+
+    for query_start in range(0, len(query_points), query_chunk_size):
+        query_end = min(query_start + query_chunk_size, len(query_points))
+        query_chunk = query_points[query_start:query_end]
+
+        for reference_start in range(0, len(reference_points), reference_chunk_size):
+            reference_end = min(reference_start + reference_chunk_size, len(reference_points))
+            reference_chunk = reference_points[reference_start:reference_end]
+            abs_deltas = np.abs(query_chunk[:, None, :] - reference_chunk[None, :, :])
+            total_axis_distance += abs_deltas.sum(axis=(0, 1))
+            pair_count += int(abs_deltas.shape[0] * abs_deltas.shape[1])
+
+        if progress_callback:
+            progress_callback(query_end, len(query_points), progress_label)
+
+    if pair_count == 0:
+        return np.full(3, np.nan, dtype=float)
+    return total_axis_distance / pair_count
 
 
 def _cluster_axis_centers(values, tolerance):
@@ -3255,6 +4108,8 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
                                        sample_x_col=None, sample_y_col=None, sample_z_col=None,
                                        sample_domain_col=None,
                                        closest_sample_id_cols=None,
+                                       distance_count_step=None,
+                                       distance_count_max_factor=None,
                                        block_x_col=None, block_y_col=None, block_z_col=None,
                                        block_domain_col=None, block_size=None,
                                        sample_filters=None, block_filters=None, progress_callback=None,
@@ -3438,6 +4293,12 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
     matched_sample_domains = np.asarray(candidate_sample_domains, dtype=object)[candidate_domain_mask]
     matched_sample_ids = None if candidate_sample_ids is None else np.asarray(candidate_sample_ids, dtype=object)[candidate_domain_mask]
 
+    distance_count_columns, distance_band_edges = _build_distance_band_column_names(
+        domain_column_name,
+        distance_count_step,
+        distance_count_max_factor,
+    )
+
     samples_by_domain = {}
     for domain in np.unique(matched_sample_domains):
         domain_mask = matched_sample_domains == domain
@@ -3455,6 +4316,8 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
     output_df[avg_column] = np.nan
     if closest_id_column:
         output_df[closest_id_column] = ''
+    for column_name in distance_count_columns:
+        output_df[column_name] = 0
 
     processed_block_count = 0
     populated_block_count = 0
@@ -3505,17 +4368,26 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
                 )
             ),
             return_nearest_index=bool(closest_id_column),
+            distance_band_edges=distance_band_edges,
         )
         if closest_id_column:
-            nearest_distances, average_distances, nearest_sample_indices = distance_stats
+            if distance_count_columns:
+                nearest_distances, average_distances, nearest_sample_indices, distance_band_counts = distance_stats
+            else:
+                nearest_distances, average_distances, nearest_sample_indices = distance_stats
         else:
-            nearest_distances, average_distances = distance_stats
+            if distance_count_columns:
+                nearest_distances, average_distances, distance_band_counts = distance_stats
+            else:
+                nearest_distances, average_distances = distance_stats
         output_df.loc[domain_block_indices, nn_column] = nearest_distances
         output_df.loc[domain_block_indices, avg_column] = average_distances
         if closest_id_column:
             domain_ids = domain_samples['ids']
             closest_ids = [domain_ids[index] if index >= 0 else '' for index in nearest_sample_indices]
             output_df.loc[domain_block_indices, closest_id_column] = closest_ids
+        if distance_count_columns:
+            output_df.loc[domain_block_indices, distance_count_columns] = distance_band_counts
         populated_block_count += len(domain_block_indices)
         completed_domain_blocks += len(domain_block_indices)
         now = time.perf_counter()
@@ -3547,6 +4419,9 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
         'average_distance_column': avg_column,
         'closest_sample_id_column': closest_id_column,
         'closest_sample_id_source_columns': list(selected_id_columns),
+        'distance_count_columns': list(distance_count_columns),
+        'distance_count_step': None if distance_count_step is None else float(distance_count_step),
+        'distance_count_max_factor': None if distance_count_max_factor is None else int(distance_count_max_factor),
         'input_samples': int(len(df_samples)),
         'filtered_samples': int(len(filtered_samples_df)),
         'filters_applied': applied_filters,
@@ -3557,6 +4432,265 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
         'processed_blocks': int(processed_block_count),
         'blocks_with_samples_in_domain': int(populated_block_count),
         'invalid_coordinate_blocks': int((~valid_block_mask).sum()),
+    }
+
+
+def export_domain_interpolation_confidence_metrics(samples_file, blocks_file, output_file=None,
+                                                   samples_delimiter=None, blocks_delimiter=None,
+                                                   samples_header_line=1, blocks_header_line=1,
+                                                   sample_x_col=None, sample_y_col=None, sample_z_col=None,
+                                                   sample_domain_col=None,
+                                                   block_x_col=None, block_y_col=None, block_z_col=None,
+                                                   block_domain_col=None, block_size=None,
+                                                   sample_filters=None, block_filters=None, progress_callback=None,
+                                                   blank_sample_domain_behavior='skip'):
+    if not samples_file or not os.path.isfile(samples_file):
+        raise ValueError('Please select a valid samples file.')
+    if not blocks_file or not os.path.isfile(blocks_file):
+        raise ValueError('Please select a valid blocks file.')
+
+    domain_column_name = str(block_domain_col or '').strip()
+    if not domain_column_name or domain_column_name == '(None)':
+        raise ValueError('Please select a domain column in "Blocks Columns" first.')
+    sample_domain_column_name = str(sample_domain_col or '').strip()
+    use_explicit_sample_domains = bool(sample_domain_column_name and sample_domain_column_name != '(None)')
+
+    blocks_delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
+    output_file = resolve_domain_interpolation_confidence_export_path(
+        output_file,
+        blocks_file=blocks_file,
+        domain_col=domain_column_name,
+    )
+    _emit_progress(progress_callback, 0, 100, 'Preparing domain interpolation confidence export...')
+
+    block_metadata = None
+    if not use_explicit_sample_domains:
+        if block_size is None:
+            raise ValueError('Block size must be specified for interpolation confidence metrics when no sample domain column is configured.')
+
+        print(
+            f"Using inferred sample-domain matching: samples will be mapped into block domains using block size {block_size}."
+        )
+        print(f"Loading block domain mapping from {blocks_file}...")
+        block_metadata = load_large_blocks_metadata(
+            blocks_file,
+            blocks_delimiter,
+            blocks_header_line or 1,
+            block_size,
+            None,
+            block_x_col=block_x_col,
+            block_y_col=block_y_col,
+            block_z_col=block_z_col,
+            block_domain_col=domain_column_name,
+            block_filters=block_filters,
+            config=None,
+            progress_callback=_make_scaled_progress_callback(progress_callback, 0, 25, 'Loading block domain mapping...'),
+        )
+    else:
+        print(
+            f"Using explicit domain matching: sample column '{sample_domain_column_name}' -> block column '{domain_column_name}'. "
+            f"Skipping block-size domain inference."
+        )
+
+    print(f"Loading samples from {samples_file}...")
+    df_samples, _ = load_full_samples_dataframe(
+        samples_file,
+        samples_delimiter=samples_delimiter,
+        samples_header_line=samples_header_line,
+        progress_label='Reading sample file',
+        progress_callback=_make_scaled_progress_callback(
+            progress_callback,
+            10 if use_explicit_sample_domains else 25,
+            35 if use_explicit_sample_domains else 50,
+            'Reading sample file...',
+        ),
+    )
+
+    _emit_progress(progress_callback, 36 if use_explicit_sample_domains else 51, 100, 'Applying sample filters...')
+    filtered_samples_df, applied_filters = apply_sample_filters(
+        df_samples,
+        sample_filters=sample_filters,
+        progress_callback=_make_scaled_progress_callback(
+            progress_callback,
+            36 if use_explicit_sample_domains else 51,
+            45 if use_explicit_sample_domains else 60,
+            'Applying sample filters...',
+        ),
+        progress_label='Applying sample filters...',
+    )
+
+    sample_x_col, sample_y_col, sample_z_col = resolve_sample_coordinate_columns(
+        list(filtered_samples_df.columns),
+        sample_x_col=sample_x_col,
+        sample_y_col=sample_y_col,
+        sample_z_col=sample_z_col,
+    )
+
+    if use_explicit_sample_domains:
+        if sample_domain_column_name not in filtered_samples_df.columns:
+            raise ValueError(f'Selected sample domain column not found in samples file: {sample_domain_column_name}')
+
+        filtered_samples_df, _ = apply_blank_sample_domain_behavior(
+            filtered_samples_df,
+            blank_domain_behavior=blank_sample_domain_behavior,
+            domain_col=sample_domain_column_name,
+            x_col=sample_x_col,
+            y_col=sample_y_col,
+            z_col=sample_z_col,
+            blocks_file=blocks_file,
+            blocks_delimiter=blocks_delimiter,
+            blocks_header_line=blocks_header_line,
+            block_x_col=block_x_col,
+            block_y_col=block_y_col,
+            block_z_col=block_z_col,
+            block_domain_col=domain_column_name,
+            block_size=block_size,
+        )
+
+    sample_coord_frame = filtered_samples_df[[sample_x_col, sample_y_col, sample_z_col]].apply(pd.to_numeric, errors='coerce')
+    valid_sample_mask = sample_coord_frame.notna().all(axis=1)
+    valid_sample_coords = sample_coord_frame.loc[valid_sample_mask].to_numpy(copy=False)
+
+    if use_explicit_sample_domains:
+        _emit_progress(progress_callback, 46, 100, 'Grouping filtered samples by explicit domain...')
+        explicit_domain_values = filtered_samples_df.loc[valid_sample_mask, sample_domain_column_name].fillna('').astype(str).str.strip()
+        explicit_domain_values = explicit_domain_values.replace('nan', '')
+        candidate_sample_domains = explicit_domain_values.to_numpy(dtype=object, copy=False)
+    else:
+        sample_coords_for_mapping = valid_sample_coords
+        if block_metadata.get('is_rotated') and len(sample_coords_for_mapping) > 0:
+            rotation_center = block_metadata['rotation_center']
+            rotation_matrix = block_metadata['rotation_matrix']
+            sample_coords_for_mapping = (sample_coords_for_mapping - rotation_center) @ rotation_matrix.T
+
+        all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
+        unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
+        sample_block_indices = np.floor((sample_coords_for_mapping - all_min_bounds) / unified_dims + 1e-6).astype(int)
+        domain_mapping = block_metadata['domain_mapping']
+
+        _emit_progress(progress_callback, 61, 100, 'Mapping filtered samples to domains...')
+        candidate_sample_domains = np.array(
+            [domain_mapping.get((int(idx[0]), int(idx[1]), int(idx[2])), '') for idx in sample_block_indices],
+            dtype=object,
+        )
+
+    print(f"Loading blocks from {blocks_file}...")
+    df_blocks, output_delimiter = load_full_blocks_dataframe(
+        blocks_file,
+        blocks_delimiter=blocks_delimiter,
+        blocks_header_line=blocks_header_line,
+        block_filters=block_filters,
+        progress_label='Reading blocks file',
+        progress_callback=_make_scaled_progress_callback(
+            progress_callback,
+            50 if use_explicit_sample_domains else 65,
+            75 if use_explicit_sample_domains else 85,
+            'Reading blocks file...',
+        ),
+    )
+
+    block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
+        list(df_blocks.columns),
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+    )
+    if domain_column_name not in df_blocks.columns:
+        raise ValueError(f'Selected domain column not found in blocks file: {domain_column_name}')
+
+    block_coord_frame = df_blocks[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
+    valid_block_mask = block_coord_frame.notna().all(axis=1)
+    block_domain_series = df_blocks[domain_column_name].fillna('').astype(str).str.strip()
+    block_domains = [value for value in sorted(block_domain_series.unique()) if value]
+    block_domain_set = set(block_domains)
+
+    candidate_domain_mask = np.array(
+        [str(domain).strip() in block_domain_set for domain in candidate_sample_domains],
+        dtype=bool,
+    ) if len(candidate_sample_domains) else np.empty(0, dtype=bool)
+    matched_sample_coords = valid_sample_coords[candidate_domain_mask]
+    matched_sample_domains = np.asarray(candidate_sample_domains, dtype=object)[candidate_domain_mask]
+
+    valid_block_count = int(valid_block_mask.sum())
+    print(
+        f"Finished reading blocks file. Computing interpolation confidence metrics for {len(block_domains):,} domains, "
+        f"{len(matched_sample_coords):,} matched samples, and {valid_block_count:,} valid blocks..."
+    )
+
+    domain_rows = []
+    axis_labels = ('X', 'Y', 'Z')
+    _emit_progress(progress_callback, 80 if use_explicit_sample_domains else 88, 100, 'Computing interpolation confidence metrics...')
+
+    for domain_index, domain in enumerate(block_domains, start=1):
+        progress_base = 80 if use_explicit_sample_domains else 88
+        progress_span = 18 if use_explicit_sample_domains else 10
+        progress_value = progress_base + int(round((domain_index / max(len(block_domains), 1)) * progress_span))
+        _emit_progress(progress_callback, progress_value, 100, f'Computing interpolation confidence metrics... ({domain})')
+
+        domain_sample_mask = matched_sample_domains == domain
+        domain_sample_coords = matched_sample_coords[domain_sample_mask]
+        domain_block_mask = valid_block_mask & (block_domain_series == domain)
+        domain_block_coords = block_coord_frame.loc[domain_block_mask].to_numpy(copy=False)
+
+        avg_source_sample_distance = _compute_average_pairwise_distance(domain_sample_coords)
+        avg_source_sample_axis_distances = _compute_average_pairwise_axis_distances(domain_sample_coords)
+        avg_domain_block_distance = _compute_average_pairwise_distance(domain_block_coords)
+        avg_domain_block_axis_distances = _compute_average_pairwise_axis_distances(domain_block_coords)
+        if len(domain_block_coords) > 0 and len(domain_sample_coords) > 0:
+            _, block_average_distances = _compute_point_to_set_distance_stats(
+                domain_block_coords,
+                domain_sample_coords,
+            )
+            avg_block_to_source_sample_distance = float(np.nanmean(block_average_distances))
+            avg_block_to_source_sample_axis_distances = _compute_average_point_to_set_axis_distances(
+                domain_block_coords,
+                domain_sample_coords,
+            )
+        else:
+            avg_block_to_source_sample_distance = np.nan
+            avg_block_to_source_sample_axis_distances = np.full(3, np.nan, dtype=float)
+
+        if np.isfinite(avg_source_sample_distance) and np.isfinite(avg_domain_block_distance) and avg_domain_block_distance != 0:
+            sample_to_block_ratio = avg_source_sample_distance / avg_domain_block_distance
+        else:
+            sample_to_block_ratio = np.nan
+
+        row = {
+            'Domain': domain,
+            'Source_Sample_Count': int(len(domain_sample_coords)),
+            'Domain_Block_Count': int(len(domain_block_coords)),
+            'Avg_Source_Sample_Distance': avg_source_sample_distance,
+            'Avg_Block_To_Source_Sample_Distance': avg_block_to_source_sample_distance,
+            'Avg_Domain_Block_Distance': avg_domain_block_distance,
+            'Sample_To_Block_Distance_Ratio': sample_to_block_ratio,
+        }
+        for axis_index, axis_label in enumerate(axis_labels):
+            row[f'Avg_Source_Sample_Distance_{axis_label}'] = avg_source_sample_axis_distances[axis_index]
+            row[f'Avg_Block_To_Source_Sample_Distance_{axis_label}'] = avg_block_to_source_sample_axis_distances[axis_index]
+            row[f'Avg_Domain_Block_Distance_{axis_label}'] = avg_domain_block_axis_distances[axis_index]
+        domain_rows.append(row)
+
+    output_df = pd.DataFrame(domain_rows)
+    output_dir = os.path.dirname(output_file) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+    _emit_progress(progress_callback, 99, 100, 'Writing interpolation confidence export...')
+    output_df.to_csv(output_file, index=False, sep=output_delimiter)
+    _emit_progress(progress_callback, 100, 100, 'Domain interpolation confidence export complete.')
+
+    return {
+        'output_file': output_file,
+        'domain_column': domain_column_name,
+        'domain_count': int(len(domain_rows)),
+        'input_samples': int(len(df_samples)),
+        'filtered_samples': int(len(filtered_samples_df)),
+        'filters_applied': applied_filters,
+        'valid_coordinate_samples': int(valid_sample_mask.sum()),
+        'matched_samples': int(len(matched_sample_domains)),
+        'unmatched_samples': int(valid_sample_mask.sum() - len(matched_sample_domains)),
+        'invalid_coordinate_samples': int((~valid_sample_mask).sum()),
+        'processed_blocks': int(valid_block_count),
+        'invalid_coordinate_blocks': int((~valid_block_mask).sum()),
+        'columns': list(output_df.columns),
     }
 
 
@@ -3912,6 +5046,152 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
         'unmatched_samples': int(unmatched_count),
         'invalid_coordinate_samples': int(invalid_coordinate_count),
         'domain_column': domain_column_name,
+    }
+
+
+def export_samples_with_block_values_from_blocks(samples_file, blocks_file, output_file=None,
+                                                 samples_delimiter=None, blocks_delimiter=None,
+                                                 samples_header_line=1, blocks_header_line=1,
+                                                 sample_x_col=None, sample_y_col=None, sample_z_col=None,
+                                                 block_x_col=None, block_y_col=None, block_z_col=None,
+                                                 block_value_cols=None, block_size=None,
+                                                 sample_filters=None, block_filters=None,
+                                                 progress_callback=None):
+    if not samples_file or not os.path.isfile(samples_file):
+        raise ValueError('Please select a valid samples file.')
+    if not blocks_file or not os.path.isfile(blocks_file):
+        raise ValueError('Please select a valid blocks file.')
+    if block_size is None:
+        raise ValueError('Block size must be specified for block-to-sample value transfer.')
+
+    selected_columns = _normalize_block_transfer_columns(
+        block_value_cols,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+    )
+    blocks_delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
+    output_file = resolve_block_value_transfer_export_path(
+        output_file,
+        samples_file=samples_file,
+        block_value_cols=selected_columns,
+    )
+    _emit_progress(progress_callback, 0, 100, 'Preparing block value transfer export...')
+
+    print(f"Loading block geometry from {blocks_file}...")
+    block_metadata = load_large_blocks_metadata(
+        blocks_file,
+        blocks_delimiter,
+        blocks_header_line or 1,
+        block_size,
+        None,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=None,
+        block_filters=block_filters,
+        config=None,
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 45, 'Loading block geometry...'),
+    )
+
+    print(f"Building block value mapping from {blocks_file}...")
+    block_value_mapping_data = load_block_value_mappings(
+        blocks_file,
+        blocks_delimiter,
+        blocks_header_line or 1,
+        block_size,
+        selected_columns,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_filters=block_filters,
+        block_metadata=block_metadata,
+        progress_callback=_make_scaled_progress_callback(progress_callback, 45, 75, 'Building block value mapping...'),
+    )
+    value_mappings = block_value_mapping_data['value_mappings']
+
+    print(f"Loading samples from {samples_file}...")
+    df_samples, sample_delimiter = load_full_samples_dataframe(
+        samples_file,
+        samples_delimiter=samples_delimiter,
+        samples_header_line=samples_header_line,
+        sample_filters=sample_filters,
+        progress_label='Reading sample file',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 75, 90, 'Reading sample file...'),
+    )
+
+    sample_x_col, sample_y_col, sample_z_col = resolve_sample_coordinate_columns(
+        list(df_samples.columns),
+        sample_x_col=sample_x_col,
+        sample_y_col=sample_y_col,
+        sample_z_col=sample_z_col,
+    )
+
+    coord_frame = df_samples[[sample_x_col, sample_y_col, sample_z_col]].apply(pd.to_numeric, errors='coerce')
+    valid_mask = coord_frame.notna().all(axis=1)
+    valid_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
+    block_indices = _compute_sample_block_indices_from_metadata(valid_coords, block_metadata)
+
+    assigned_values = {column_name: [] for column_name in selected_columns}
+    matched_count = 0
+    total_indices = len(block_indices)
+    assign_started_at = time.perf_counter()
+    next_terminal_report_at = assign_started_at
+    _emit_progress(progress_callback, 90, 100, 'Assigning block values to samples...')
+    for index, idx in enumerate(block_indices, start=1):
+        block_idx = (int(idx[0]), int(idx[1]), int(idx[2]))
+        block_values = value_mappings.get(block_idx)
+        if block_values:
+            matched_count += 1
+        for column_name in selected_columns:
+            assigned_values[column_name].append(block_values.get(column_name, '') if block_values else '')
+        if progress_callback and (index == total_indices or index % 50_000 == 0):
+            progress_value = 90 + int(round((index / max(total_indices, 1)) * 8))
+            _emit_progress(progress_callback, progress_value, 100, 'Assigning block values to samples...')
+        now = time.perf_counter()
+        if now >= next_terminal_report_at:
+            elapsed_seconds = max(int(now - assign_started_at), 0)
+            percent = int(round((index / max(total_indices, 1)) * 100)) if total_indices > 0 else 100
+            print(
+                f"Block transfer progress: {index:,}/{total_indices:,} valid samples ({percent}%) assigned; "
+                f"matched={matched_count:,}; elapsed~{elapsed_seconds}s"
+            )
+            next_terminal_report_at = now + 5.0
+
+    elapsed_seconds = max(int(time.perf_counter() - assign_started_at), 0)
+    print(
+        f"Block transfer complete: {total_indices:,} valid samples processed; "
+        f"matched={matched_count:,}; elapsed~{elapsed_seconds}s"
+    )
+
+    output_dir = os.path.dirname(output_file) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_df = df_samples.copy()
+    for column_name in selected_columns:
+        output_series = pd.Series([''] * len(output_df), index=output_df.index, dtype=object)
+        output_series.loc[valid_mask] = assigned_values[column_name]
+        output_df[column_name] = output_series
+    _emit_progress(progress_callback, 99, 100, 'Writing block value transfer export...')
+    output_df.to_csv(output_file, index=False, sep=sample_delimiter)
+    _emit_progress(progress_callback, 100, 100, 'Block value transfer export complete.')
+
+    invalid_coordinate_count = int((~valid_mask).sum())
+    unmatched_count = int(len(output_df) - matched_count)
+    print(f"Exported {len(output_df):,} samples with transferred block values to {output_file}")
+    print(
+        f"Matched {matched_count:,} samples to block values; "
+        f"{unmatched_count:,} unmatched ({invalid_coordinate_count:,} invalid coordinates)."
+    )
+
+    return {
+        'output_file': output_file,
+        'total_samples': int(len(output_df)),
+        'matched_samples': int(matched_count),
+        'unmatched_samples': int(unmatched_count),
+        'invalid_coordinate_samples': int(invalid_coordinate_count),
+        'transferred_columns': list(selected_columns),
+        'column_modes': dict(block_value_mapping_data['column_modes']),
     }
 
 
@@ -5239,7 +6519,7 @@ if __name__ == "__main__":
                 algo2_combo.currentTextChanged.connect(
                     lambda text, row=i: self.on_second_pass_changed(row, text)
                 )
-        
+
         def on_first_pass_changed(self, row, text):
             """Handle changes to first pass algorithm"""
             algo2_combo = self.table.cellWidget(row, 2)
@@ -5639,8 +6919,18 @@ if __name__ == "__main__":
             tabs.addTab(files_tab, "Files & Data")
 
             operations_tab = QtWidgets.QWidget()
+            operations_tab_layout = QtWidgets.QVBoxLayout()
+            operations_tab_layout.setContentsMargins(0, 0, 0, 0)
+            operations_tab.setLayout(operations_tab_layout)
+            operations_scroll = QtWidgets.QScrollArea()
+            operations_scroll.setWidgetResizable(True)
+            operations_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            operations_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            operations_tab_layout.addWidget(operations_scroll)
+            operations_content = QtWidgets.QWidget()
             operations_form = QtWidgets.QFormLayout()
-            operations_tab.setLayout(operations_form)
+            operations_content.setLayout(operations_form)
+            operations_scroll.setWidget(operations_content)
             tabs.addTab(operations_tab, "Operations")
             
             # Tab 2: Ant Colony Parameters
@@ -5963,6 +7253,20 @@ if __name__ == "__main__":
                     domain_col=self.block_domain_col.currentText(),
                 )
 
+            def suggested_block_value_transfer_path():
+                return resolve_block_value_transfer_export_path(
+                    None,
+                    samples_file=self.samples_edit.text().strip(),
+                    block_value_cols=self._get_selected_block_value_transfer_columns(),
+                )
+
+            def suggested_domain_interpolation_confidence_path():
+                return resolve_domain_interpolation_confidence_export_path(
+                    None,
+                    blocks_file=self.blocks_edit.text().strip(),
+                    domain_col=self.block_domain_col.currentText(),
+                )
+
             def suggested_block_volume_weighted_path():
                 return resolve_block_volume_weighted_average_export_path(
                     None,
@@ -5970,18 +7274,45 @@ if __name__ == "__main__":
                     value_col=self.block_value_metric_col.currentText(),
                 )
 
+            def suggested_equation_finder_path():
+                return resolve_equation_finder_export_path(
+                    None,
+                    samples_file=self.samples_edit.text().strip(),
+                    value_col=self.sample_value_col.currentText(),
+                    domain_col=self.sample_domain_col.currentText(),
+                )
+
             self.domain_samples_output_edit = QtWidgets.QLineEdit('')
             self.domain_samples_browse = QtWidgets.QPushButton('Browse')
             self.start_domaining_btn = QtWidgets.QPushButton('Start Domaining')
+            self.block_value_transfer_output_edit = QtWidgets.QLineEdit('')
+            self.block_value_transfer_browse = QtWidgets.QPushButton('Browse')
+            self.start_block_value_transfer_btn = QtWidgets.QPushButton('Transfer Columns')
             self.block_domain_metrics_output_edit = QtWidgets.QLineEdit('')
             self.block_domain_metrics_browse = QtWidgets.QPushButton('Browse')
             self.start_block_domain_metrics_btn = QtWidgets.QPushButton('Export Metrics')
+            self.block_value_transfer_cols = QtWidgets.QListWidget()
+            self.block_value_transfer_cols.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+            self.block_value_transfer_cols.setMinimumHeight(120)
+            self.block_value_transfer_select_all_btn = QtWidgets.QPushButton('Select All')
+            self.block_value_transfer_clear_btn = QtWidgets.QPushButton('Clear')
+            self.block_value_transfer_summary = QtWidgets.QLabel('No block columns selected for transfer.')
+            self.domain_interpolation_confidence_output_edit = QtWidgets.QLineEdit('')
+            self.domain_interpolation_confidence_browse = QtWidgets.QPushButton('Browse')
+            self.start_domain_interpolation_confidence_btn = QtWidgets.QPushButton('Export Confidence Metrics')
             self.block_volume_weighted_output_edit = QtWidgets.QLineEdit('')
             self.block_volume_weighted_browse = QtWidgets.QPushButton('Browse')
             self.start_block_volume_weighted_btn = QtWidgets.QPushButton('Export Volume Weighted Average')
+            self.equation_finder_output_edit = QtWidgets.QLineEdit('')
+            self.equation_finder_browse = QtWidgets.QPushButton('Browse')
+            self.start_equation_finder_btn = QtWidgets.QPushButton('Find Equations')
             self._domain_samples_auto_path = ''
+            self._block_value_transfer_auto_path = ''
             self._block_domain_metrics_auto_path = ''
+            self._domain_interpolation_confidence_auto_path = ''
             self._block_volume_weighted_auto_path = ''
+            self._equation_finder_auto_path = ''
+            self._pending_block_value_transfer_cols = []
 
             def refresh_domain_samples_output_path(force=False):
                 suggested = suggested_domain_samples_path()
@@ -5990,6 +7321,15 @@ if __name__ == "__main__":
                     self.domain_samples_output_edit.setText(suggested)
                 self._domain_samples_auto_path = suggested
 
+            def refresh_block_value_transfer_output_path(force=False):
+                suggested = suggested_block_value_transfer_path()
+                current = self.block_value_transfer_output_edit.text().strip()
+                if force or not current or current == self._block_value_transfer_auto_path:
+                    self.block_value_transfer_output_edit.setText(suggested)
+                self._block_value_transfer_auto_path = suggested
+
+            self._refresh_block_value_transfer_output_path = refresh_block_value_transfer_output_path
+
             def refresh_block_domain_metrics_output_path(force=False):
                 suggested = suggested_block_domain_metrics_path()
                 current = self.block_domain_metrics_output_edit.text().strip()
@@ -5997,12 +7337,26 @@ if __name__ == "__main__":
                     self.block_domain_metrics_output_edit.setText(suggested)
                 self._block_domain_metrics_auto_path = suggested
 
+            def refresh_domain_interpolation_confidence_output_path(force=False):
+                suggested = suggested_domain_interpolation_confidence_path()
+                current = self.domain_interpolation_confidence_output_edit.text().strip()
+                if force or not current or current == self._domain_interpolation_confidence_auto_path:
+                    self.domain_interpolation_confidence_output_edit.setText(suggested)
+                self._domain_interpolation_confidence_auto_path = suggested
+
             def refresh_block_volume_weighted_output_path(force=False):
                 suggested = suggested_block_volume_weighted_path()
                 current = self.block_volume_weighted_output_edit.text().strip()
                 if force or not current or current == self._block_volume_weighted_auto_path:
                     self.block_volume_weighted_output_edit.setText(suggested)
                 self._block_volume_weighted_auto_path = suggested
+
+            def refresh_equation_finder_output_path(force=False):
+                suggested = suggested_equation_finder_path()
+                current = self.equation_finder_output_edit.text().strip()
+                if force or not current or current == self._equation_finder_auto_path:
+                    self.equation_finder_output_edit.setText(suggested)
+                self._equation_finder_auto_path = suggested
 
             def browse_domain_samples_output():
                 initial_path = self.domain_samples_output_edit.text().strip() or suggested_domain_samples_path()
@@ -6015,6 +7369,17 @@ if __name__ == "__main__":
                 if path:
                     self.domain_samples_output_edit.setText(path)
 
+            def browse_block_value_transfer_output():
+                initial_path = self.block_value_transfer_output_edit.text().strip() or suggested_block_value_transfer_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Block Value Transfer Output File',
+                    initial_path,
+                    'CSV Files (*.csv)'
+                )
+                if path:
+                    self.block_value_transfer_output_edit.setText(path)
+
             def browse_block_domain_metrics_output():
                 initial_path = self.block_domain_metrics_output_edit.text().strip() or suggested_block_domain_metrics_path()
                 path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -6025,6 +7390,17 @@ if __name__ == "__main__":
                 )
                 if path:
                     self.block_domain_metrics_output_edit.setText(path)
+
+            def browse_domain_interpolation_confidence_output():
+                initial_path = self.domain_interpolation_confidence_output_edit.text().strip() or suggested_domain_interpolation_confidence_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Domain Interpolation Confidence Output File',
+                    initial_path,
+                    'CSV Files (*.csv)'
+                )
+                if path:
+                    self.domain_interpolation_confidence_output_edit.setText(path)
 
             def browse_block_volume_weighted_output():
                 initial_path = self.block_volume_weighted_output_edit.text().strip() or suggested_block_volume_weighted_path()
@@ -6037,6 +7413,17 @@ if __name__ == "__main__":
                 if path:
                     self.block_volume_weighted_output_edit.setText(path)
 
+            def browse_equation_finder_output():
+                initial_path = self.equation_finder_output_edit.text().strip() or suggested_equation_finder_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Equation Finder Output File',
+                    initial_path,
+                    'CSV Files (*.csv)'
+                )
+                if path:
+                    self.equation_finder_output_edit.setText(path)
+
             domain_samples_group = QtWidgets.QGroupBox('Domain Samples')
             domain_samples_form = QtWidgets.QFormLayout()
             domain_samples_group.setLayout(domain_samples_form)
@@ -6046,6 +7433,22 @@ if __name__ == "__main__":
             domain_samples_form.addRow('Output File', domain_output_layout)
             domain_samples_form.addRow('', self.start_domaining_btn)
             operations_form.addRow(domain_samples_group)
+
+            block_value_transfer_group = QtWidgets.QGroupBox('Assign Block Columns To Samples')
+            block_value_transfer_form = QtWidgets.QFormLayout()
+            block_value_transfer_group.setLayout(block_value_transfer_form)
+            block_value_transfer_output_layout = QtWidgets.QHBoxLayout()
+            block_value_transfer_output_layout.addWidget(self.block_value_transfer_output_edit)
+            block_value_transfer_output_layout.addWidget(self.block_value_transfer_browse)
+            block_value_transfer_form.addRow('Output File', block_value_transfer_output_layout)
+            block_value_transfer_form.addRow('Block Columns', self.block_value_transfer_cols)
+            block_value_transfer_buttons = QtWidgets.QHBoxLayout()
+            block_value_transfer_buttons.addWidget(self.block_value_transfer_select_all_btn)
+            block_value_transfer_buttons.addWidget(self.block_value_transfer_clear_btn)
+            block_value_transfer_form.addRow('', block_value_transfer_buttons)
+            block_value_transfer_form.addRow('', self.block_value_transfer_summary)
+            block_value_transfer_form.addRow('', self.start_block_value_transfer_btn)
+            operations_form.addRow(block_value_transfer_group)
 
             block_metrics_group = QtWidgets.QGroupBox('Block Domain Sample Metrics')
             block_metrics_form = QtWidgets.QFormLayout()
@@ -6059,8 +7462,38 @@ if __name__ == "__main__":
                 block_metrics_id_layout.addWidget(cb)
                 block_metrics_id_layout.setStretch(index, 1)
             block_metrics_form.addRow('Closest Sample ID Columns', block_metrics_id_layout)
+            self.block_domain_metrics_distance_counts_enabled = QtWidgets.QCheckBox('Enable distance-band sample counts')
+            self.block_domain_metrics_distance_counts_enabled.setChecked(False)
+            self.block_domain_metrics_distance_counts_enabled.setToolTip(
+                'Add per-block counts of same-domain samples in distance bands: [0, step), [step, 2*step), ..., [factor-1*step, factor*step), and >= factor*step.'
+            )
+            self.block_domain_metrics_distance_step = QtWidgets.QDoubleSpinBox()
+            self.block_domain_metrics_distance_step.setDecimals(3)
+            self.block_domain_metrics_distance_step.setRange(0.001, 1_000_000.0)
+            self.block_domain_metrics_distance_step.setValue(50.0)
+            self.block_domain_metrics_distance_step.setSuffix(' m')
+            self.block_domain_metrics_distance_step.setToolTip('Distance step used to build half-open sample-count bands.')
+            self.block_domain_metrics_max_factor = QtWidgets.QSpinBox()
+            self.block_domain_metrics_max_factor.setRange(1, 999)
+            self.block_domain_metrics_max_factor.setValue(5)
+            self.block_domain_metrics_max_factor.setToolTip('Maximum multiple of the distance step before the >= overflow bucket.')
+            block_metrics_distance_layout = QtWidgets.QHBoxLayout()
+            block_metrics_distance_layout.addWidget(self.block_domain_metrics_distance_counts_enabled)
+            block_metrics_distance_layout.addWidget(self.block_domain_metrics_distance_step)
+            block_metrics_distance_layout.addWidget(self.block_domain_metrics_max_factor)
+            block_metrics_form.addRow('Distance Bands', block_metrics_distance_layout)
             block_metrics_form.addRow('', self.start_block_domain_metrics_btn)
             operations_form.addRow(block_metrics_group)
+
+            domain_confidence_group = QtWidgets.QGroupBox('Domain Interpolation Confidence')
+            domain_confidence_form = QtWidgets.QFormLayout()
+            domain_confidence_group.setLayout(domain_confidence_form)
+            domain_confidence_output_layout = QtWidgets.QHBoxLayout()
+            domain_confidence_output_layout.addWidget(self.domain_interpolation_confidence_output_edit)
+            domain_confidence_output_layout.addWidget(self.domain_interpolation_confidence_browse)
+            domain_confidence_form.addRow('Output File', domain_confidence_output_layout)
+            domain_confidence_form.addRow('', self.start_domain_interpolation_confidence_btn)
+            operations_form.addRow(domain_confidence_group)
 
             block_volume_group = QtWidgets.QGroupBox('Block Volume Weighted Average')
             block_volume_form = QtWidgets.QFormLayout()
@@ -6074,23 +7507,121 @@ if __name__ == "__main__":
             block_volume_form.addRow('', self.start_block_volume_weighted_btn)
             operations_form.addRow(block_volume_group)
 
+            equation_finder_group = QtWidgets.QGroupBox('Equation Finder By Domain')
+            equation_finder_form = QtWidgets.QFormLayout()
+            equation_finder_group.setLayout(equation_finder_form)
+            equation_output_layout = QtWidgets.QHBoxLayout()
+            equation_output_layout.addWidget(self.equation_finder_output_edit)
+            equation_output_layout.addWidget(self.equation_finder_browse)
+            equation_finder_form.addRow('Summary Output', equation_output_layout)
+            self.equation_include_coords = QtWidgets.QCheckBox('Include coordinate columns (x, y, z)')
+            self.equation_include_coords.setChecked(True)
+            self.equation_include_coords.setToolTip('When enabled, the configured sample coordinate columns are included in the selectable numeric predictor list and selected by default.')
+            equation_finder_form.addRow('Coordinate Predictors', self.equation_include_coords)
+            self.equation_predictor_list = QtWidgets.QListWidget()
+            self.equation_predictor_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+            self.equation_predictor_list.setMinimumHeight(140)
+            equation_finder_form.addRow('Predictor Columns', self.equation_predictor_list)
+            equation_predictor_buttons = QtWidgets.QHBoxLayout()
+            self.equation_refresh_predictors_btn = QtWidgets.QPushButton('Refresh')
+            self.equation_select_all_predictors_btn = QtWidgets.QPushButton('Select All')
+            self.equation_clear_predictors_btn = QtWidgets.QPushButton('Clear')
+            equation_predictor_buttons.addWidget(self.equation_refresh_predictors_btn)
+            equation_predictor_buttons.addWidget(self.equation_select_all_predictors_btn)
+            equation_predictor_buttons.addWidget(self.equation_clear_predictors_btn)
+            equation_finder_form.addRow('', equation_predictor_buttons)
+            self.equation_predictor_summary = QtWidgets.QLabel('No numeric predictor columns loaded.')
+            self.equation_predictor_summary.setWordWrap(True)
+            equation_finder_form.addRow('', self.equation_predictor_summary)
+            self.equation_min_samples_per_domain = QtWidgets.QSpinBox()
+            self.equation_min_samples_per_domain.setRange(2, 1_000_000)
+            self.equation_min_samples_per_domain.setValue(25)
+            self.equation_min_samples_per_domain.setToolTip('Domains with fewer rows than this are skipped.')
+            equation_finder_form.addRow('Min Samples Per Domain', self.equation_min_samples_per_domain)
+            self.equation_validation_fraction = QtWidgets.QDoubleSpinBox()
+            self.equation_validation_fraction.setRange(0.0, 0.5)
+            self.equation_validation_fraction.setSingleStep(0.05)
+            self.equation_validation_fraction.setDecimals(2)
+            self.equation_validation_fraction.setValue(0.20)
+            self.equation_validation_fraction.setToolTip('Fraction of each domain reserved for validation metrics. Set to 0 to score on the full domain only.')
+            equation_finder_form.addRow('Validation Fraction', self.equation_validation_fraction)
+            self.equation_max_iterations = QtWidgets.QSpinBox()
+            self.equation_max_iterations.setRange(1, 10_000_000)
+            self.equation_max_iterations.setValue(100)
+            self.equation_max_iterations.setToolTip('Maximum PySR search iterations per domain. The best equation found so far is returned when this limit is reached.')
+            equation_finder_form.addRow('Max Iterations', self.equation_max_iterations)
+            self.equation_timeout_seconds = QtWidgets.QSpinBox()
+            self.equation_timeout_seconds.setRange(0, 86_400)
+            self.equation_timeout_seconds.setValue(60)
+            self.equation_timeout_seconds.setSuffix(' s')
+            self.equation_timeout_seconds.setToolTip('Maximum wall-clock time per domain. Set to 0 to disable the timeout. The best equation found so far is returned when the timeout is reached.')
+            equation_finder_form.addRow('Timeout', self.equation_timeout_seconds)
+            equation_finder_form.addRow('', self.start_equation_finder_btn)
+            operations_form.addRow(equation_finder_group)
+
             self.domain_samples_browse.clicked.connect(browse_domain_samples_output)
             self.start_domaining_btn.clicked.connect(self.run_domain_samples_only)
+            self.block_value_transfer_browse.clicked.connect(browse_block_value_transfer_output)
+            self.start_block_value_transfer_btn.clicked.connect(self.run_block_value_transfer_only)
+            self.block_value_transfer_select_all_btn.clicked.connect(self.block_value_transfer_cols.selectAll)
+            self.block_value_transfer_select_all_btn.clicked.connect(self._update_block_value_transfer_summary)
+            self.block_value_transfer_select_all_btn.clicked.connect(lambda: refresh_block_value_transfer_output_path())
+            self.block_value_transfer_clear_btn.clicked.connect(self.block_value_transfer_cols.clearSelection)
+            self.block_value_transfer_clear_btn.clicked.connect(self._update_block_value_transfer_summary)
+            self.block_value_transfer_clear_btn.clicked.connect(lambda: refresh_block_value_transfer_output_path())
+            self.block_value_transfer_cols.itemSelectionChanged.connect(self._update_block_value_transfer_summary)
+            self.block_value_transfer_cols.itemSelectionChanged.connect(lambda: refresh_block_value_transfer_output_path())
             self.block_domain_metrics_browse.clicked.connect(browse_block_domain_metrics_output)
             self.configure_block_domain_metrics_filters_btn.clicked.connect(self.configure_block_domain_metrics_filters)
             self.start_block_domain_metrics_btn.clicked.connect(self.run_block_domain_sample_metrics_only)
+            self.samples_edit.textChanged.connect(lambda _: refresh_block_value_transfer_output_path())
+            self.blocks_edit.textChanged.connect(lambda _: self._refresh_block_value_transfer_columns())
+            self.blocks_delim.currentIndexChanged.connect(lambda _: self._refresh_block_value_transfer_columns())
+            self.blocks_header_line.valueChanged.connect(lambda _: self._refresh_block_value_transfer_columns())
+            self.block_x_col.currentTextChanged.connect(lambda _: self._refresh_block_value_transfer_columns())
+            self.block_y_col.currentTextChanged.connect(lambda _: self._refresh_block_value_transfer_columns())
+            self.block_z_col.currentTextChanged.connect(lambda _: self._refresh_block_value_transfer_columns())
+            self.domain_interpolation_confidence_browse.clicked.connect(browse_domain_interpolation_confidence_output)
+            self.start_domain_interpolation_confidence_btn.clicked.connect(self.run_domain_interpolation_confidence_only)
             self.block_volume_weighted_browse.clicked.connect(browse_block_volume_weighted_output)
             self.configure_block_volume_weighted_filters_btn.clicked.connect(self.configure_block_volume_weighted_filters)
             self.start_block_volume_weighted_btn.clicked.connect(self.run_block_volume_weighted_average_only)
+            self.equation_finder_browse.clicked.connect(browse_equation_finder_output)
+            self.start_equation_finder_btn.clicked.connect(self.run_equation_finder_only)
+            self.equation_refresh_predictors_btn.clicked.connect(self._refresh_equation_finder_predictor_columns)
+            self.equation_select_all_predictors_btn.clicked.connect(self.equation_predictor_list.selectAll)
+            self.equation_select_all_predictors_btn.clicked.connect(self._update_equation_finder_predictor_summary)
+            self.equation_clear_predictors_btn.clicked.connect(self.equation_predictor_list.clearSelection)
+            self.equation_clear_predictors_btn.clicked.connect(self._update_equation_finder_predictor_summary)
+            self.equation_predictor_list.itemSelectionChanged.connect(self._update_equation_finder_predictor_summary)
+            self.equation_include_coords.toggled.connect(lambda _: self._refresh_equation_finder_predictor_columns())
             self.samples_edit.textChanged.connect(lambda _: refresh_domain_samples_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
+            self.blocks_edit.textChanged.connect(lambda _: refresh_domain_interpolation_confidence_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_volume_weighted_output_path())
+            self.samples_edit.textChanged.connect(lambda _: refresh_equation_finder_output_path())
             self.block_domain_col.currentTextChanged.connect(lambda _: refresh_domain_samples_output_path())
             self.block_domain_col.currentTextChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
+            self.block_domain_col.currentTextChanged.connect(lambda _: refresh_domain_interpolation_confidence_output_path())
             self.block_value_metric_col.currentTextChanged.connect(lambda _: refresh_block_volume_weighted_output_path())
+            self.sample_value_col.currentTextChanged.connect(lambda _: refresh_equation_finder_output_path())
+            self.sample_domain_col.currentTextChanged.connect(lambda _: refresh_equation_finder_output_path())
+            self.samples_edit.textChanged.connect(lambda _: self._refresh_equation_finder_predictor_columns())
+            self.samples_delim.currentIndexChanged.connect(lambda _: self._refresh_equation_finder_predictor_columns())
+            self.samples_header_line.valueChanged.connect(lambda _: self._refresh_equation_finder_predictor_columns())
+            self.sample_value_col.currentTextChanged.connect(lambda _: self._refresh_equation_finder_predictor_columns())
+            self.sample_domain_col.currentTextChanged.connect(lambda _: self._refresh_equation_finder_predictor_columns())
+            self.sample_x_col.currentTextChanged.connect(lambda _: self._refresh_equation_finder_predictor_columns())
+            self.sample_y_col.currentTextChanged.connect(lambda _: self._refresh_equation_finder_predictor_columns())
+            self.sample_z_col.currentTextChanged.connect(lambda _: self._refresh_equation_finder_predictor_columns())
             refresh_domain_samples_output_path(force=True)
+            self._refresh_block_value_transfer_columns()
+            refresh_block_value_transfer_output_path(force=True)
             refresh_block_domain_metrics_output_path(force=True)
+            refresh_domain_interpolation_confidence_output_path(force=True)
             refresh_block_volume_weighted_output_path(force=True)
+            refresh_equation_finder_output_path(force=True)
+            self._refresh_equation_finder_predictor_columns()
             self._update_block_domain_metrics_filters_summary()
             self._update_block_volume_weighted_filters_summary()
 
@@ -6379,6 +7910,11 @@ if __name__ == "__main__":
                     pass
             self._cleanup_finished_viewer()
 
+        def _prepare_for_shutdown(self):
+            if getattr(self, '_viewer_process_timer', None) is not None and self._viewer_process_timer.isActive():
+                self._viewer_process_timer.stop()
+            self._terminate_viewer_process()
+
         def refresh_viewer(self):
             if not self._is_viewer_running():
                 self._cleanup_finished_viewer()
@@ -6455,7 +7991,7 @@ if __name__ == "__main__":
                 QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to launch viewer: {e}')
 
         def closeEvent(self, event):
-            self._terminate_viewer_process()
+            self._prepare_for_shutdown()
             super().closeEvent(event)
 
         def _invalidate_domain_catalog_cache(self):
@@ -6470,11 +8006,24 @@ if __name__ == "__main__":
                 'export_block_evaluated_samples': self.block_evaluated_samples_enabled.isChecked(),
                 'block_evaluated_samples_file': self.block_evaluated_samples_edit.text(),
                 'domain_samples_file': self.domain_samples_output_edit.text(),
+                'block_value_transfer_file': self.block_value_transfer_output_edit.text(),
+                'block_value_transfer_cols': self._get_selected_block_value_transfer_columns(),
                 'block_domain_metrics_file': self.block_domain_metrics_output_edit.text(),
+                'domain_interpolation_confidence_file': self.domain_interpolation_confidence_output_edit.text(),
                 'block_volume_weighted_file': self.block_volume_weighted_output_edit.text(),
+                'equation_finder_file': self.equation_finder_output_edit.text(),
                 'block_domain_metrics_closest_sample_id_cols': [cb.currentText() for cb in self.block_domain_metrics_id_cols],
+                'block_domain_metrics_distance_counts_enabled': self.block_domain_metrics_distance_counts_enabled.isChecked(),
+                'block_domain_metrics_distance_step': self.block_domain_metrics_distance_step.value(),
+                'block_domain_metrics_max_factor': self.block_domain_metrics_max_factor.value(),
                 'block_domain_sample_filters': [dict(entry) for entry in self.block_domain_sample_filters],
                 'block_volume_weighted_filters': [dict(entry) for entry in self.block_volume_weighted_filters],
+                'equation_finder_predictor_cols': self._get_selected_equation_predictor_columns(),
+                'equation_finder_include_coordinates': self.equation_include_coords.isChecked(),
+                'equation_finder_min_samples_per_domain': self.equation_min_samples_per_domain.value(),
+                'equation_finder_validation_fraction': self.equation_validation_fraction.value(),
+                'equation_finder_max_iterations': self.equation_max_iterations.value(),
+                'equation_finder_timeout_seconds': self.equation_timeout_seconds.value(),
                 'algorithm': self.algorithm_combo.currentText(),
                 'second_pass_algorithm': self.second_pass_combo.currentText(),
                 'samples_delimiter': self.samples_delim.currentText(),
@@ -6579,20 +8128,44 @@ if __name__ == "__main__":
                 if 'block_z_col' in config: self.block_z_col.setCurrentText(config['block_z_col'])
                 if 'block_domain_col' in config: self.block_domain_col.setCurrentText(config['block_domain_col'])
                 if 'domain_samples_file' in config: self.domain_samples_output_edit.setText(config['domain_samples_file'])
+                if 'block_value_transfer_file' in config: self.block_value_transfer_output_edit.setText(config['block_value_transfer_file'])
                 if 'block_domain_metrics_file' in config: self.block_domain_metrics_output_edit.setText(config['block_domain_metrics_file'])
+                if 'domain_interpolation_confidence_file' in config: self.domain_interpolation_confidence_output_edit.setText(config['domain_interpolation_confidence_file'])
                 if 'block_volume_weighted_file' in config: self.block_volume_weighted_output_edit.setText(config['block_volume_weighted_file'])
+                if 'equation_finder_file' in config: self.equation_finder_output_edit.setText(config['equation_finder_file'])
+                self._pending_block_value_transfer_cols = list(config.get('block_value_transfer_cols', []))
+                if hasattr(self, '_refresh_block_value_transfer_columns'):
+                    self._refresh_block_value_transfer_columns()
                 if 'block_domain_metrics_closest_sample_id_cols' in config:
                     for cb, column_name in zip(self.block_domain_metrics_id_cols, config['block_domain_metrics_closest_sample_id_cols']):
                         cb.setCurrentText(column_name)
+                if 'block_domain_metrics_distance_counts_enabled' in config:
+                    self.block_domain_metrics_distance_counts_enabled.setChecked(bool(config['block_domain_metrics_distance_counts_enabled']))
+                if 'block_domain_metrics_distance_step' in config:
+                    self.block_domain_metrics_distance_step.setValue(float(config['block_domain_metrics_distance_step']))
+                if 'block_domain_metrics_max_factor' in config:
+                    self.block_domain_metrics_max_factor.setValue(int(config['block_domain_metrics_max_factor']))
                 if 'block_value_metric_col' in config: self.block_value_metric_col.setCurrentText(config['block_value_metric_col'])
                 if 'block_weight_metric_col' in config: self.block_weight_metric_col.setCurrentText(config['block_weight_metric_col'])
+                if 'equation_finder_include_coordinates' in config:
+                    self.equation_include_coords.setChecked(bool(config['equation_finder_include_coordinates']))
+                if 'equation_finder_min_samples_per_domain' in config:
+                    self.equation_min_samples_per_domain.setValue(int(config['equation_finder_min_samples_per_domain']))
+                if 'equation_finder_validation_fraction' in config:
+                    self.equation_validation_fraction.setValue(float(config['equation_finder_validation_fraction']))
+                if 'equation_finder_max_iterations' in config:
+                    self.equation_max_iterations.setValue(int(config['equation_finder_max_iterations']))
+                if 'equation_finder_timeout_seconds' in config:
+                    self.equation_timeout_seconds.setValue(int(config['equation_finder_timeout_seconds']))
+                self._pending_equation_predictor_selection = list(config.get('equation_finder_predictor_cols', []))
+                if hasattr(self, '_refresh_equation_finder_predictor_columns'):
+                    self._refresh_equation_finder_predictor_columns()
                 if 'block_domain_sample_filters' in config:
                     self.block_domain_sample_filters = [dict(entry) for entry in config['block_domain_sample_filters']]
                     self._update_block_domain_metrics_filters_summary()
                 if 'block_volume_weighted_filters' in config:
                     self.block_volume_weighted_filters = [dict(entry) for entry in config['block_volume_weighted_filters']]
                     self._update_block_volume_weighted_filters_summary()
-            
                 if 'block_size' in config:
                     bs = config['block_size']
                     if isinstance(bs, (list, tuple)) and len(bs) == 3:
@@ -6603,7 +8176,6 @@ if __name__ == "__main__":
                         self.block_x.setValue(int(bs))
                         self.block_y.setValue(int(bs))
                         self.block_z.setValue(int(bs))
-            
                 if 'range_size' in config: self.range_size.setValue(config['range_size'])
                 if 'max_pheromone' in config: self.max_pheromone.setValue(config['max_pheromone'])
                 if 'ants_per_sample' in config: self.ants_per_sample.setValue(config['ants_per_sample'])
@@ -6618,7 +8190,6 @@ if __name__ == "__main__":
                 if 'ant_colony_interpolate_target' in config:
                     tgt = str(config['ant_colony_interpolate_target']).strip().lower()
                     self.ant_interpolate_target.setCurrentText('Domain' if tgt == 'domain' else 'Value')
-            
                 if 'molecular_clock_params' in config:
                     mc = config['molecular_clock_params']
                     if 'spatial_weight' in mc: self.mc_spatial_weight.setValue(mc['spatial_weight'])
@@ -6629,7 +8200,6 @@ if __name__ == "__main__":
                     if 'max_samples' in mc: self.mc_max_samples.setValue(mc['max_samples'])
                     if 'detect_multiple' in mc: self.mc_detect_multiple.setChecked(mc['detect_multiple'])
                     if 'interp_method' in mc: self.mc_interp_method.setCurrentText(mc['interp_method'])
-
                 if 'string_theory_params' in config:
                     st = config['string_theory_params']
                     if 'interpolate_target' in st:
@@ -6653,11 +8223,9 @@ if __name__ == "__main__":
                         self.st_min_dip_freq.setEnabled(st['filter_by_frequency'])
                     if 'min_azimuth_freq' in st: self.st_min_azimuth_freq.setValue(st['min_azimuth_freq'])
                     if 'min_dip_freq' in st: self.st_min_dip_freq.setValue(st['min_dip_freq'])
-                
                 # Backward compatibility for tolerance params (ignore or convert?)
                 # If old params exist but new ones don't, we could try to map them, but they are different concepts.
                 # We'll just ignore them for now.
-
                 if 'average_with_blocks' in config: self.average_with_blocks.setChecked(config['average_with_blocks'])
                 if 'fill_unvisited_domainwise' in config: self.fill_unvisited_domainwise.setChecked(config['fill_unvisited_domainwise'])
                 if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
@@ -6792,10 +8360,179 @@ if __name__ == "__main__":
                 header_line=header_line,
             )
 
+        def _get_selected_block_value_transfer_columns(self):
+            if not hasattr(self, 'block_value_transfer_cols'):
+                return []
+            return [item.text() for item in self.block_value_transfer_cols.selectedItems()]
+
+        def _set_selected_block_value_transfer_columns(self, column_names):
+            if not hasattr(self, 'block_value_transfer_cols'):
+                return
+            desired = {str(name or '').strip() for name in (column_names or []) if str(name or '').strip()}
+            for index in range(self.block_value_transfer_cols.count()):
+                item = self.block_value_transfer_cols.item(index)
+                item.setSelected(item.text() in desired)
+            self._update_block_value_transfer_summary()
+
+        def _update_block_value_transfer_summary(self):
+            if not hasattr(self, 'block_value_transfer_summary'):
+                return
+            total = self.block_value_transfer_cols.count() if hasattr(self, 'block_value_transfer_cols') else 0
+            selected = len(self._get_selected_block_value_transfer_columns())
+            if total == 0:
+                self.block_value_transfer_summary.setText('No transferable block columns are available.')
+                return
+            if selected == 0:
+                self.block_value_transfer_summary.setText(
+                    f'0 of {total} available block columns selected. Choose one or more columns to copy onto the samples file.'
+                )
+                return
+            self.block_value_transfer_summary.setText(
+                f'{selected} of {total} available block columns selected for transfer.'
+            )
+
+        def _refresh_block_value_transfer_columns(self):
+            if not hasattr(self, 'block_value_transfer_cols'):
+                return
+
+            current_selection = set(self._get_selected_block_value_transfer_columns())
+            pending_selection = set(getattr(self, '_pending_block_value_transfer_cols', []) or [])
+            desired_selection = pending_selection or current_selection
+            self.block_value_transfer_cols.clear()
+
+            path = self.blocks_edit.text().strip()
+            if not os.path.isfile(path):
+                self._pending_block_value_transfer_cols = []
+                self._update_block_value_transfer_summary()
+                refresher = getattr(self, '_refresh_block_value_transfer_output_path', None)
+                if callable(refresher):
+                    refresher()
+                return
+
+            try:
+                cols = parse_header_line(path, self.blocks_delim.currentText(), self.blocks_header_line.value())
+                excluded = {
+                    str(self.block_x_col.currentText() or '').strip(),
+                    str(self.block_y_col.currentText() or '').strip(),
+                    str(self.block_z_col.currentText() or '').strip(),
+                }
+                excluded = {value for value in excluded if value and value != '(None)'}
+                for column_name in cols:
+                    if column_name in excluded:
+                        continue
+                    item = QtWidgets.QListWidgetItem(column_name)
+                    item.setSelected(column_name in desired_selection)
+                    self.block_value_transfer_cols.addItem(item)
+            except Exception:
+                pass
+
+            self._pending_block_value_transfer_cols = []
+            self._update_block_value_transfer_summary()
+            refresher = getattr(self, '_refresh_block_value_transfer_output_path', None)
+            if callable(refresher):
+                refresher()
+
+        def _get_selected_equation_predictor_columns(self):
+            if not hasattr(self, 'equation_predictor_list'):
+                return []
+            return [item.text() for item in self.equation_predictor_list.selectedItems()]
+
+        def _set_selected_equation_predictor_columns(self, column_names):
+            desired = {str(name or '').strip() for name in (column_names or []) if str(name or '').strip()}
+            for index in range(self.equation_predictor_list.count()):
+                item = self.equation_predictor_list.item(index)
+                item.setSelected(item.text() in desired)
+            self._update_equation_finder_predictor_summary()
+
+        def _update_equation_finder_predictor_summary(self):
+            if not hasattr(self, 'equation_predictor_list'):
+                return
+            total = self.equation_predictor_list.count()
+            selected = len(self.equation_predictor_list.selectedItems())
+            if total == 0:
+                self.equation_predictor_summary.setText('No numeric predictor columns loaded.')
+                return
+            self.equation_predictor_summary.setText(
+                f'{selected} of {total} available predictor columns selected. '
+                'Columns that do not look numeric in the preview are still shown, but the equation search will reject non-numeric selections at runtime.'
+            )
+
+        def _refresh_equation_finder_predictor_columns(self):
+            if not hasattr(self, 'equation_predictor_list'):
+                return
+
+            current_selection = set(self._get_selected_equation_predictor_columns())
+            pending_selection = set(getattr(self, '_pending_equation_predictor_selection', []) or [])
+            self.equation_predictor_list.clear()
+
+            samples_file = self.samples_edit.text().strip()
+            if not samples_file or not os.path.isfile(samples_file):
+                self._update_equation_finder_predictor_summary()
+                return
+
+            try:
+                available_columns = parse_header_line(
+                    samples_file,
+                    self.samples_delim.currentText(),
+                    self.samples_header_line.value(),
+                )
+            except Exception:
+                self._update_equation_finder_predictor_summary()
+                return
+
+            preview_df = None
+            try:
+                preview_df, _ = load_samples_preview_dataframe(
+                    samples_file,
+                    samples_delimiter=self.samples_delim.currentText(),
+                    samples_header_line=self.samples_header_line.value(),
+                )
+            except Exception:
+                preview_df = None
+
+            target_column = self.sample_value_col.currentText().strip()
+            domain_column = self.sample_domain_col.currentText().strip()
+            coordinate_columns = [
+                self.sample_x_col.currentText().strip(),
+                self.sample_y_col.currentText().strip(),
+                self.sample_z_col.currentText().strip(),
+            ]
+            available_columns = [str(column_name) for column_name in available_columns]
+            available_columns = [col for col in available_columns if col != target_column and col != domain_column]
+            if not self.equation_include_coords.isChecked():
+                available_columns = [col for col in available_columns if col not in coordinate_columns]
+
+            numeric_columns = infer_numeric_sample_columns(
+                preview_df,
+                delimiter=self.samples_delim.currentText(),
+            ) if preview_df is not None else []
+            numeric_column_set = {
+                col for col in numeric_columns
+                if col != target_column and col != domain_column and (self.equation_include_coords.isChecked() or col not in coordinate_columns)
+            }
+
+            for column_name in available_columns:
+                item = QtWidgets.QListWidgetItem(column_name)
+                if column_name not in numeric_column_set:
+                    item.setToolTip('This column did not look numeric in the preview. The equation search may reject it if selected.')
+                self.equation_predictor_list.addItem(item)
+
+            desired_selection = pending_selection or current_selection
+            if not desired_selection:
+                desired_selection = set(numeric_column_set)
+                if self.equation_include_coords.isChecked():
+                    desired_selection.update({col for col in coordinate_columns if col in numeric_column_set})
+
+            self._set_selected_equation_predictor_columns(desired_selection)
+            self._pending_equation_predictor_selection = []
+
         def _set_operation_buttons_enabled(self, enabled):
             self.start_domaining_btn.setEnabled(enabled)
+            self.start_block_value_transfer_btn.setEnabled(enabled)
             self.start_block_domain_metrics_btn.setEnabled(enabled)
+            self.start_domain_interpolation_confidence_btn.setEnabled(enabled)
             self.start_block_volume_weighted_btn.setEnabled(enabled)
+            self.start_equation_finder_btn.setEnabled(enabled)
 
         def _run_operation_with_progress(self, title, initial_message, operation, kwargs,
                                          success_handler, error_context):
@@ -6983,6 +8720,65 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during sample domaining:\n{str(e)}')
 
+        def run_block_value_transfer_only(self):
+            """Assign selected block columns directly to the samples file and export the result."""
+            try:
+                cfg = self.to_dict()
+                selected_columns = cfg.get('block_value_transfer_cols') or []
+                output_file = resolve_block_value_transfer_export_path(
+                    cfg.get('block_value_transfer_file'),
+                    samples_file=cfg.get('samples_file'),
+                    block_value_cols=selected_columns,
+                )
+                self.block_value_transfer_output_edit.setText(output_file)
+
+                print("=" * 60)
+                print("Assigning selected block columns to samples...")
+                print("=" * 60)
+
+                def handle_success(result):
+                    print("=" * 60)
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"Block value transfer complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Transferred columns: {', '.join(result['transferred_columns'])}\n"
+                            f"Matched samples: {result['matched_samples']:,}\n"
+                            f"Unmatched samples: {result['unmatched_samples']:,}\n"
+                            f"Invalid coordinates: {result['invalid_coordinate_samples']:,}"
+                        ),
+                    )
+
+                self._run_operation_with_progress(
+                    'Block Value Transfer',
+                    'Preparing block value transfer export...',
+                    export_samples_with_block_values_from_blocks,
+                    {
+                        'samples_file': cfg.get('samples_file'),
+                        'blocks_file': cfg.get('blocks_file'),
+                        'output_file': output_file,
+                        'samples_delimiter': cfg.get('samples_delimiter'),
+                        'blocks_delimiter': cfg.get('blocks_delimiter'),
+                        'samples_header_line': cfg.get('samples_header_line', 1),
+                        'blocks_header_line': cfg.get('blocks_header_line', 1),
+                        'sample_x_col': cfg.get('sample_x_col'),
+                        'sample_y_col': cfg.get('sample_y_col'),
+                        'sample_z_col': cfg.get('sample_z_col'),
+                        'block_x_col': cfg.get('block_x_col'),
+                        'block_y_col': cfg.get('block_y_col'),
+                        'block_z_col': cfg.get('block_z_col'),
+                        'block_value_cols': selected_columns,
+                        'block_size': cfg.get('block_size'),
+                    },
+                    handle_success,
+                    'An error occurred during block value transfer',
+                )
+            except Exception as e:
+                print(f"Error during block value transfer: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block value transfer:\n{str(e)}')
+
         def run_block_domain_sample_metrics_only(self):
             """Export block rows with distance statistics to filtered samples inside the same domain."""
             try:
@@ -7005,6 +8801,12 @@ if __name__ == "__main__":
                     closest_id_text = 'None'
                     if result.get('closest_sample_id_source_columns'):
                         closest_id_text = ', '.join(result['closest_sample_id_source_columns'])
+                    distance_bands_text = 'Disabled'
+                    if result.get('distance_count_columns'):
+                        distance_bands_text = (
+                            f"step={result['distance_count_step']:,g}, max factor={result['distance_count_max_factor']:,}; "
+                            f"columns={', '.join(result['distance_count_columns'])}"
+                        )
 
                     QtWidgets.QMessageBox.information(
                         self,
@@ -7017,7 +8819,8 @@ if __name__ == "__main__":
                             f"Processed blocks: {result['processed_blocks']:,}\n"
                             f"Blocks with samples in domain: {result['blocks_with_samples_in_domain']:,}\n"
                             f"Invalid sample coordinates: {result['invalid_coordinate_samples']:,}\n"
-                            f"Closest sample ID columns: {closest_id_text}\n\n"
+                            f"Closest sample ID columns: {closest_id_text}\n"
+                            f"Distance bands: {distance_bands_text}\n\n"
                             f"Filters:\n{filters_text}"
                         ),
                     )
@@ -7039,6 +8842,8 @@ if __name__ == "__main__":
                         'sample_z_col': cfg.get('sample_z_col'),
                         'sample_domain_col': cfg.get('sample_domain_col'),
                         'closest_sample_id_cols': cfg.get('block_domain_metrics_closest_sample_id_cols'),
+                        'distance_count_step': cfg.get('block_domain_metrics_distance_step') if cfg.get('block_domain_metrics_distance_counts_enabled') else None,
+                        'distance_count_max_factor': cfg.get('block_domain_metrics_max_factor') if cfg.get('block_domain_metrics_distance_counts_enabled') else None,
                         'block_x_col': cfg.get('block_x_col'),
                         'block_y_col': cfg.get('block_y_col'),
                         'block_z_col': cfg.get('block_z_col'),
@@ -7055,6 +8860,75 @@ if __name__ == "__main__":
                 print(f"Error during block domain metrics export: {e}")
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block domain metrics export:\n{str(e)}')
+        def run_domain_interpolation_confidence_only(self):
+            """Export one row per domain with source-sample, block-to-sample, and block-to-block spacing metrics."""
+            try:
+                cfg = self.to_dict()
+                output_file = resolve_domain_interpolation_confidence_export_path(
+                    cfg.get('domain_interpolation_confidence_file'),
+                    blocks_file=cfg.get('blocks_file'),
+                    domain_col=cfg.get('block_domain_col'),
+                )
+                self.domain_interpolation_confidence_output_edit.setText(output_file)
+
+                print("=" * 60)
+                print("Calculating domain interpolation confidence metrics...")
+                print("=" * 60)
+
+                def handle_success(result):
+                    filters_text = 'None'
+                    if result['filters_applied']:
+                        filters_text = '\n'.join(entry['summary'] for entry in result['filters_applied'])
+
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"Domain confidence export complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Domain column: {result['domain_column']}\n"
+                            f"Domains summarized: {result['domain_count']:,}\n"
+                            f"Filtered samples: {result['filtered_samples']:,} of {result['input_samples']:,}\n"
+                            f"Matched samples: {result['matched_samples']:,}\n"
+                            f"Processed blocks: {result['processed_blocks']:,}\n"
+                            f"Invalid sample coordinates: {result['invalid_coordinate_samples']:,}\n\n"
+                            f"Includes ratio column: Sample_To_Block_Distance_Ratio\n"
+                            f"Includes axis columns: *_X, *_Y, *_Z\n\n"
+                            f"Filters:\n{filters_text}"
+                        ),
+                    )
+
+                self._run_operation_with_progress(
+                    'Domain Interpolation Confidence Export',
+                    'Preparing domain interpolation confidence export...',
+                    export_domain_interpolation_confidence_metrics,
+                    {
+                        'samples_file': cfg.get('samples_file'),
+                        'blocks_file': cfg.get('blocks_file'),
+                        'output_file': output_file,
+                        'samples_delimiter': cfg.get('samples_delimiter'),
+                        'blocks_delimiter': cfg.get('blocks_delimiter'),
+                        'samples_header_line': cfg.get('samples_header_line', 1),
+                        'blocks_header_line': cfg.get('blocks_header_line', 1),
+                        'sample_x_col': cfg.get('sample_x_col'),
+                        'sample_y_col': cfg.get('sample_y_col'),
+                        'sample_z_col': cfg.get('sample_z_col'),
+                        'sample_domain_col': cfg.get('sample_domain_col'),
+                        'block_x_col': cfg.get('block_x_col'),
+                        'block_y_col': cfg.get('block_y_col'),
+                        'block_z_col': cfg.get('block_z_col'),
+                        'block_domain_col': cfg.get('block_domain_col'),
+                        'block_size': cfg.get('block_size'),
+                        'sample_filters': cfg.get('block_domain_sample_filters'),
+                        'block_filters': cfg.get('block_volume_weighted_filters'),
+                        'blank_sample_domain_behavior': cfg.get('blank_sample_domain_behavior', 'skip'),
+                    },
+                    handle_success,
+                    'An error occurred during domain interpolation confidence export',
+                )
+            except Exception as e:
+                print(f"Error during domain interpolation confidence export: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during domain interpolation confidence export:\n{str(e)}')
 
         def run_block_volume_weighted_average_only(self):
             """Export inferred per-row block volumes and compute a volume-weighted average for a selected blocks column."""
@@ -7143,7 +9017,104 @@ if __name__ == "__main__":
                 print(f"Error during block volume export: {e}")
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block volume export:\n{str(e)}')
-        
+
+        def run_equation_finder_only(self):
+            """Run domain-wise symbolic regression on the configured samples file."""
+            try:
+                cfg = self.to_dict()
+                output_file = resolve_equation_finder_export_path(
+                    cfg.get('equation_finder_file'),
+                    samples_file=cfg.get('samples_file'),
+                    value_col=cfg.get('sample_value_col'),
+                    domain_col=cfg.get('sample_domain_col'),
+                )
+                self.equation_finder_output_edit.setText(output_file)
+
+                predictor_columns = self._get_selected_equation_predictor_columns()
+                if not predictor_columns:
+                    raise ValueError('Please select at least one numeric predictor column.')
+
+                print("=" * 60)
+                print("Finding equations by domain...")
+                print("=" * 60)
+
+                def handle_success(result):
+                    summary_df = result.get('summary_dataframe')
+                    while summary_df is not None:
+                        try:
+                            summary_df.to_csv(result['output_file'], index=False)
+                            break
+                        except PermissionError as exc:
+                            message_box = QtWidgets.QMessageBox(self)
+                            message_box.setIcon(QtWidgets.QMessageBox.Warning)
+                            message_box.setWindowTitle('Equation Summary Save Failed')
+                            message_box.setText('Could not save the equation summary CSV.')
+                            message_box.setInformativeText(
+                                f"Permission denied for:\n{result['output_file']}\n\n"
+                                'The file may be open in Excel or locked by OneDrive sync. '
+                                'Close the file and click Retry to save again, or click Cancel to leave only the per-domain detail files.'
+                            )
+                            message_box.setDetailedText(str(exc))
+                            message_box.setStandardButtons(QtWidgets.QMessageBox.Retry | QtWidgets.QMessageBox.Cancel)
+                            message_box.setDefaultButton(QtWidgets.QMessageBox.Retry)
+                            if message_box.exec_() == QtWidgets.QMessageBox.Retry:
+                                continue
+                            QtWidgets.QMessageBox.warning(
+                                self,
+                                'Summary Not Saved',
+                                (
+                                    'Equation search completed, but the summary CSV was not saved.\n\n'
+                                    f"Per-domain detail files are available in:\n{result['details_directory']}"
+                                ),
+                            )
+                            return
+
+                    predictor_text = ', '.join(result['predictor_columns']) if result['predictor_columns'] else 'None'
+                    skipped_predictor_text = ', '.join(result.get('skipped_predictor_columns') or []) or 'None'
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"Equation finder complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Details directory:\n{result['details_directory']}\n\n"
+                            f"Target column: {result['target_column']}\n"
+                            f"Domain column: {result['domain_column']}\n"
+                            f"Predictors: {predictor_text}\n"
+                            f"Skipped predictors: {skipped_predictor_text}\n"
+                            f"Input rows: {result['input_rows']:,}\n"
+                            f"Valid rows: {result['valid_rows']:,}\n"
+                            f"Domains found: {result['domain_count']:,}\n"
+                            f"Processed domains: {result['processed_domains']:,}\n"
+                            f"Skipped domains: {result['skipped_domains']:,}"
+                        ),
+                    )
+
+                self._run_operation_with_progress(
+                    'Equation Finder',
+                    'Preparing equation search...',
+                    export_domain_symbolic_regression_equations,
+                    {
+                        'samples_file': cfg.get('samples_file'),
+                        'output_file': output_file,
+                        'samples_delimiter': cfg.get('samples_delimiter'),
+                        'samples_header_line': cfg.get('samples_header_line', 1),
+                        'sample_value_col': cfg.get('sample_value_col'),
+                        'sample_domain_col': cfg.get('sample_domain_col'),
+                        'predictor_cols': predictor_columns,
+                        'sample_filters': get_configured_sample_filters(cfg),
+                        'min_samples_per_domain': cfg.get('equation_finder_min_samples_per_domain', 25),
+                        'validation_fraction': cfg.get('equation_finder_validation_fraction', 0.2),
+                        'max_iterations': cfg.get('equation_finder_max_iterations', 100),
+                        'timeout_seconds': cfg.get('equation_finder_timeout_seconds', 60),
+                    },
+                    handle_success,
+                    'An error occurred during equation search',
+                )
+            except Exception as e:
+                print(f"Error during equation search: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during equation search:\n{str(e)}')
+
         def run_interpolation_only(self):
             """Run interpolation without visualization"""
             try:
@@ -7413,8 +9384,26 @@ if __name__ == "__main__":
     # Create and run application
     app = QtWidgets.QApplication(sys.argv)
     dialog = ConfigDialog()
-    app.aboutToQuit.connect(dialog._terminate_viewer_process)
-    atexit.register(dialog._terminate_viewer_process)
+    app.aboutToQuit.connect(dialog._prepare_for_shutdown)
+    atexit.register(dialog._prepare_for_shutdown)
+
+    def _handle_sigint(*_args):
+        if not dialog.isVisible():
+            return
+        QtCore.QTimer.singleShot(0, dialog.close)
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    sigint_pump = QtCore.QTimer()
+    sigint_pump.setInterval(200)
+    sigint_pump.timeout.connect(lambda: None)
+    sigint_pump.start()
+
     dialog.show()
 
-    sys.exit(app.exec_())
+    try:
+        exit_code = app.exec_()
+    finally:
+        if sigint_pump.isActive():
+            sigint_pump.stop()
+        dialog._prepare_for_shutdown()
+    sys.exit(exit_code)

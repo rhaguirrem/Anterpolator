@@ -23,7 +23,9 @@ from anterpolator3DViewer import (
     ensure_sample_domains_for_domain_operations,
     export_block_volume_weighted_average,
     export_block_domain_sample_metrics,
+    export_domain_interpolation_confidence_metrics,
     export_domained_samples_from_blocks,
+    export_samples_with_block_values_from_blocks,
     load_block_domain_catalog,
     load_large_blocks_metadata,
     normalize_selected_sample_domain_column,
@@ -292,6 +294,56 @@ def test_export_domained_samples_uses_aggregated_subblock_domains():
         assert output_df.loc[0, "dom"] == "A"
 
 
+def test_export_samples_with_block_values_from_blocks_transfers_multiple_columns():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "samples_with_blocks.csv")
+
+        block_rows = []
+        for x, grade, lith in [
+            (2.5, 1.0, "ore"),
+            (7.5, 3.0, "ore"),
+            (12.5, 5.0, "waste"),
+            (17.5, 7.0, "waste"),
+        ]:
+            for y in (2.5, 7.5):
+                for z in (2.5, 7.5):
+                    block_rows.append({"x": x, "y": y, "z": z, "grade": grade, "lith": lith})
+
+        pd.DataFrame(block_rows).to_csv(blocks_path, index=False)
+        pd.DataFrame(
+            [
+                {"sx": 5.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 15.0, "sy": 5.0, "sz": 5.0},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_samples_with_block_values_from_blocks(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_value_cols=["grade", "lith"],
+            block_size=(10, 10, 10),
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["matched_samples"] == 2
+        assert result["transferred_columns"] == ["grade", "lith"]
+        assert result["column_modes"] == {"grade": "numeric", "lith": "categorical"}
+        assert output_df.loc[0, "grade"] == pytest.approx(2.0)
+        assert output_df.loc[0, "lith"] == "ore"
+        assert output_df.loc[1, "grade"] == pytest.approx(6.0)
+        assert output_df.loc[1, "lith"] == "waste"
+
+
 def test_export_block_domain_sample_metrics_applies_sample_filters():
     with tempfile.TemporaryDirectory() as td:
         blocks_path = os.path.join(td, "blocks.csv")
@@ -443,6 +495,229 @@ def test_export_block_domain_sample_metrics_uses_explicit_sample_domains_without
         assert output_df.loc[0, "dom_NN_Distance"] == 3.0
         assert output_df.loc[1, "dom_NN_Distance"] == 3.0
         assert output_df.loc[2, "dom_NN_Distance"] == 0.0
+
+
+def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_explicit_domains():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "block_metrics.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A"},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": "A"},
+                {"x": 25.0, "y": 5.0, "z": 5.0, "dom": "B"},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A"},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A"},
+                {"sx": 40.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A"},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B"},
+                {"sx": 31.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B"},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_block_domain_sample_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            sample_domain_col="sample_dom",
+            distance_count_step=5.0,
+            distance_count_max_factor=2,
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_size=None,
+        )
+
+        output_df = pd.read_csv(output_path)
+        expected_columns = [
+            "dom_Sample_Count_0_5",
+            "dom_Sample_Count_5_10",
+            "dom_Sample_Count_GE_10",
+        ]
+
+        assert result["distance_count_columns"] == expected_columns
+        assert result["distance_count_step"] == 5.0
+        assert result["distance_count_max_factor"] == 2
+
+        assert output_df.loc[0, expected_columns].tolist() == [1, 0, 2]
+        assert output_df.loc[1, expected_columns].tolist() == [1, 0, 2]
+        assert output_df.loc[2, expected_columns].tolist() == [1, 1, 0]
+
+
+def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_inferred_domains():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "block_metrics.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A"},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": "A"},
+                {"x": 25.0, "y": 5.0, "z": 5.0, "dom": "B"},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 28.0, "sy": 5.0, "sz": 5.0},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_block_domain_sample_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            distance_count_step=5.0,
+            distance_count_max_factor=2,
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_size=(10, 10, 10),
+        )
+
+        output_df = pd.read_csv(output_path)
+        expected_columns = [
+            "dom_Sample_Count_0_5",
+            "dom_Sample_Count_5_10",
+            "dom_Sample_Count_GE_10",
+        ]
+
+        assert result["matched_samples"] == 4
+        assert output_df.loc[0, expected_columns].tolist() == [1, 0, 1]
+        assert output_df.loc[1, expected_columns].tolist() == [1, 0, 1]
+        assert output_df.loc[2, expected_columns].tolist() == [2, 0, 0]
+
+
+def test_export_domain_interpolation_confidence_metrics_summarizes_per_domain_distances():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "domain_confidence.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 0.0, "y": 0.0, "z": 0.0, "dom": "A"},
+                {"x": 10.0, "y": 0.0, "z": 0.0, "dom": "A"},
+                {"x": 100.0, "y": 0.0, "z": 0.0, "dom": "B"},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 0.0, "sy": 0.0, "sz": 0.0, "sample_dom": "A"},
+                {"sx": 10.0, "sy": 0.0, "sz": 0.0, "sample_dom": "A"},
+                {"sx": 100.0, "sy": 0.0, "sz": 0.0, "sample_dom": "B"},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_domain_interpolation_confidence_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            sample_domain_col="sample_dom",
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["domain_count"] == 2
+        assert result["matched_samples"] == 3
+        assert result["processed_blocks"] == 3
+
+        domain_a = output_df.loc[output_df["Domain"] == "A"].iloc[0]
+        assert domain_a["Source_Sample_Count"] == 2
+        assert domain_a["Domain_Block_Count"] == 2
+        assert domain_a["Avg_Source_Sample_Distance"] == pytest.approx(10.0)
+        assert domain_a["Avg_Block_To_Source_Sample_Distance"] == pytest.approx(5.0)
+        assert domain_a["Avg_Domain_Block_Distance"] == pytest.approx(10.0)
+        assert domain_a["Sample_To_Block_Distance_Ratio"] == pytest.approx(1.0)
+
+        domain_b = output_df.loc[output_df["Domain"] == "B"].iloc[0]
+        assert domain_b["Source_Sample_Count"] == 1
+        assert domain_b["Domain_Block_Count"] == 1
+        assert pd.isna(domain_b["Avg_Source_Sample_Distance"])
+        assert domain_b["Avg_Block_To_Source_Sample_Distance"] == pytest.approx(0.0)
+        assert pd.isna(domain_b["Avg_Domain_Block_Distance"])
+        assert pd.isna(domain_b["Sample_To_Block_Distance_Ratio"])
+
+
+def test_export_domain_interpolation_confidence_metrics_includes_axiswise_distances():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "domain_confidence_axes.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 0.0, "y": 0.0, "z": 0.0, "dom": "A"},
+                {"x": 10.0, "y": 20.0, "z": 30.0, "dom": "A"},
+                {"x": 50.0, "y": 50.0, "z": 50.0, "dom": "B"},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 0.0, "sy": 0.0, "sz": 0.0, "sample_dom": "A"},
+                {"sx": 10.0, "sy": 20.0, "sz": 30.0, "sample_dom": "A"},
+                {"sx": 50.0, "sy": 50.0, "sz": 50.0, "sample_dom": "B"},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        export_domain_interpolation_confidence_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            sample_domain_col="sample_dom",
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        domain_a = output_df.loc[output_df["Domain"] == "A"].iloc[0]
+        assert domain_a["Avg_Source_Sample_Distance_X"] == pytest.approx(10.0)
+        assert domain_a["Avg_Source_Sample_Distance_Y"] == pytest.approx(20.0)
+        assert domain_a["Avg_Source_Sample_Distance_Z"] == pytest.approx(30.0)
+        assert domain_a["Avg_Block_To_Source_Sample_Distance_X"] == pytest.approx(5.0)
+        assert domain_a["Avg_Block_To_Source_Sample_Distance_Y"] == pytest.approx(10.0)
+        assert domain_a["Avg_Block_To_Source_Sample_Distance_Z"] == pytest.approx(15.0)
+        assert domain_a["Avg_Domain_Block_Distance_X"] == pytest.approx(10.0)
+        assert domain_a["Avg_Domain_Block_Distance_Y"] == pytest.approx(20.0)
+        assert domain_a["Avg_Domain_Block_Distance_Z"] == pytest.approx(30.0)
+
+        domain_b = output_df.loc[output_df["Domain"] == "B"].iloc[0]
+        assert pd.isna(domain_b["Avg_Source_Sample_Distance_X"])
+        assert domain_b["Avg_Block_To_Source_Sample_Distance_X"] == pytest.approx(0.0)
+        assert pd.isna(domain_b["Avg_Domain_Block_Distance_X"])
 
 
 def test_export_block_volume_weighted_average_infers_subblock_volumes_from_centroids():
