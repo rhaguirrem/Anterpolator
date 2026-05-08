@@ -211,6 +211,23 @@ def test_load_block_domain_catalog_applies_filters_on_small_files():
         assert domains == ["A", "C"]
 
 
+def test_apply_sample_filters_matches_decimal_string_equivalents():
+    df = pd.DataFrame(
+        {
+            "Valido 2": [1.0, 0.0, 1, "1.0", "01", "A"],
+            "value": [10, 20, 30, 40, 50, 60],
+        }
+    )
+
+    filtered_df, applied_filters = viewer_module.apply_sample_filters(
+        df,
+        sample_filters=[{"field": "Valido 2", "type": "categorical", "values": [1]}],
+    )
+
+    assert filtered_df["Valido 2"].tolist() == [1.0, 1, "1.0"]
+    assert applied_filters[0]["summary"] == "Valido 2 in [1]"
+
+
 def test_load_block_domain_catalog_uses_path_chunk_reader_for_large_filtered_files(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         blocks_path = os.path.join(td, "blocks.csv")
@@ -485,7 +502,7 @@ def test_export_block_domain_sample_metrics_uses_explicit_sample_domains_without
             block_y_col="y",
             block_z_col="z",
             block_domain_col="dom",
-            block_size=None,
+            block_size=(10, 10, 10),
         )
 
         output_df = pd.read_csv(output_path)
@@ -535,7 +552,7 @@ def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_ex
             block_y_col="y",
             block_z_col="z",
             block_domain_col="dom",
-            block_size=None,
+            block_size=(10, 10, 10),
         )
 
         output_df = pd.read_csv(output_path)
@@ -545,13 +562,80 @@ def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_ex
             "dom_Sample_Count_GE_10",
         ]
 
-        assert result["distance_count_columns"] == expected_columns
+        assert result["distance_count_columns"] == []
+        assert result["distance_summary_thresholds"] == [5.0, 10.0]
         assert result["distance_count_step"] == 5.0
         assert result["distance_count_max_factor"] == 2
+        assert result["summary_output_file"]
 
-        assert output_df.loc[0, expected_columns].tolist() == [1, 0, 2]
-        assert output_df.loc[1, expected_columns].tolist() == [1, 0, 2]
-        assert output_df.loc[2, expected_columns].tolist() == [1, 1, 0]
+        for column_name in expected_columns:
+            assert column_name not in output_df.columns
+
+        summary_df = pd.read_csv(result["summary_output_file"])
+        assert len(summary_df) == 2
+
+        domain_a = summary_df.loc[summary_df["Domain"] == "A"].iloc[0]
+        assert domain_a["Domain_Sample_Count"] == 3
+        assert domain_a["Domain_Block_Volume"] == pytest.approx(2000.0)
+        assert domain_a["Domain_Sample_Density"] == pytest.approx(0.0015)
+        assert domain_a["Covered_Block_Count_LEQ_5"] == 2
+        assert domain_a["Covered_Block_Volume_LEQ_5"] == pytest.approx(2000.0)
+        assert domain_a["Coverage_Fraction_LEQ_5"] == pytest.approx(1.0)
+        assert domain_a["Coverage_Density_LEQ_5"] == pytest.approx(0.0015)
+        assert domain_a["Covered_Block_Count_LEQ_10"] == 2
+        assert domain_a["Coverage_Density_LEQ_10"] == pytest.approx(0.0015)
+
+
+def test_export_block_domain_sample_metrics_summary_works_for_inferred_domains():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "block_metrics.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A"},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": "A"},
+                {"x": 25.0, "y": 5.0, "z": 5.0, "dom": "B"},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 28.0, "sy": 5.0, "sz": 5.0},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_block_domain_sample_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            distance_count_step=5.0,
+            distance_count_max_factor=2,
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_size=(10, 10, 10),
+        )
+
+        summary_df = pd.read_csv(result["summary_output_file"])
+        domain_b = summary_df.loc[summary_df["Domain"] == "B"].iloc[0]
+
+        assert domain_b["Domain_Sample_Count"] == 2
+        assert domain_b["Domain_Block_Volume"] == pytest.approx(1000.0)
+        assert domain_b["Domain_Sample_Density"] == pytest.approx(0.002)
+        assert domain_b["Covered_Block_Count_LEQ_5"] == 1
+        assert domain_b["Covered_Block_Volume_LEQ_5"] == pytest.approx(1000.0)
+        assert domain_b["Coverage_Density_LEQ_5"] == pytest.approx(0.002)
+        assert domain_b["Covered_Block_Count_LEQ_10"] == 1
+        assert domain_b["Coverage_Density_LEQ_10"] == pytest.approx(0.002)
 
 
 def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_inferred_domains():
@@ -601,9 +685,8 @@ def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_in
         ]
 
         assert result["matched_samples"] == 4
-        assert output_df.loc[0, expected_columns].tolist() == [1, 0, 1]
-        assert output_df.loc[1, expected_columns].tolist() == [1, 0, 1]
-        assert output_df.loc[2, expected_columns].tolist() == [2, 0, 0]
+        for column_name in expected_columns:
+            assert column_name not in output_df.columns
 
 
 def test_export_domain_interpolation_confidence_metrics_summarizes_per_domain_distances():
@@ -653,16 +736,15 @@ def test_export_domain_interpolation_confidence_metrics_summarizes_per_domain_di
         assert domain_a["Domain_Block_Count"] == 2
         assert domain_a["Avg_Source_Sample_Distance"] == pytest.approx(10.0)
         assert domain_a["Avg_Block_To_Source_Sample_Distance"] == pytest.approx(5.0)
-        assert domain_a["Avg_Domain_Block_Distance"] == pytest.approx(10.0)
-        assert domain_a["Sample_To_Block_Distance_Ratio"] == pytest.approx(1.0)
+        assert domain_a["Sample_To_Block_Distance_Ratio"] == pytest.approx(2.0)
 
         domain_b = output_df.loc[output_df["Domain"] == "B"].iloc[0]
         assert domain_b["Source_Sample_Count"] == 1
         assert domain_b["Domain_Block_Count"] == 1
         assert pd.isna(domain_b["Avg_Source_Sample_Distance"])
         assert domain_b["Avg_Block_To_Source_Sample_Distance"] == pytest.approx(0.0)
-        assert pd.isna(domain_b["Avg_Domain_Block_Distance"])
         assert pd.isna(domain_b["Sample_To_Block_Distance_Ratio"])
+        assert "Avg_Domain_Block_Distance" not in output_df.columns
 
 
 def test_export_domain_interpolation_confidence_metrics_includes_axiswise_distances():
@@ -710,14 +792,13 @@ def test_export_domain_interpolation_confidence_metrics_includes_axiswise_distan
         assert domain_a["Avg_Block_To_Source_Sample_Distance_X"] == pytest.approx(5.0)
         assert domain_a["Avg_Block_To_Source_Sample_Distance_Y"] == pytest.approx(10.0)
         assert domain_a["Avg_Block_To_Source_Sample_Distance_Z"] == pytest.approx(15.0)
-        assert domain_a["Avg_Domain_Block_Distance_X"] == pytest.approx(10.0)
-        assert domain_a["Avg_Domain_Block_Distance_Y"] == pytest.approx(20.0)
-        assert domain_a["Avg_Domain_Block_Distance_Z"] == pytest.approx(30.0)
+        assert "Avg_Domain_Block_Distance_X" not in output_df.columns
+        assert "Avg_Domain_Block_Distance_Y" not in output_df.columns
+        assert "Avg_Domain_Block_Distance_Z" not in output_df.columns
 
         domain_b = output_df.loc[output_df["Domain"] == "B"].iloc[0]
         assert pd.isna(domain_b["Avg_Source_Sample_Distance_X"])
         assert domain_b["Avg_Block_To_Source_Sample_Distance_X"] == pytest.approx(0.0)
-        assert pd.isna(domain_b["Avg_Domain_Block_Distance_X"])
 
 
 def test_export_block_volume_weighted_average_infers_subblock_volumes_from_centroids():

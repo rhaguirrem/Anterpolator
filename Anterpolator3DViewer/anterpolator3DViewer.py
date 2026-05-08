@@ -13,6 +13,7 @@ import subprocess
 import traceback
 import warnings
 import math
+from decimal import Decimal, InvalidOperation
 from tqdm import tqdm
 import sys
 import os
@@ -95,6 +96,20 @@ class BackgroundOperationWorker(QtCore.QObject):
 
     def _emit_progress(self, value, maximum=100, message=''):
         self.progress.emit(int(value or 0), max(int(maximum or 0), 1), str(message or 'Working...'))
+
+
+class TrimmedDisplayDoubleSpinBox(QtWidgets.QDoubleSpinBox):
+    def textFromValue(self, value):
+        decimals = max(int(self.decimals()), 0)
+        text = f'{float(value):.{decimals}f}'
+        if '.' in text:
+            text = text.rstrip('0').rstrip('.')
+        if text in {'-0', '-0.0', ''}:
+            text = '0'
+        decimal_point = str(self.locale().decimalPoint())
+        if decimal_point != '.':
+            text = text.replace('.', decimal_point)
+        return text
 
 # --- Interpolator Factory ---
 def create_interpolator(config, domain=None, current_algorithm=None):
@@ -2987,6 +3002,20 @@ def resolve_block_domain_metrics_export_path(configured_path=None, blocks_file=N
     return os.path.join(output_dir, f"{base_name}+{domain_suffix}_sample_metrics.csv")
 
 
+def resolve_block_domain_metrics_summary_export_path(metrics_file=None, blocks_file=None, domain_col=None):
+    reference_path = str(metrics_file or '').strip()
+    if not reference_path:
+        reference_path = resolve_block_domain_metrics_export_path(
+            None,
+            blocks_file=blocks_file,
+            domain_col=domain_col,
+        )
+
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'blocks'
+    return os.path.join(output_dir, f"{base_name}_summary.csv")
+
+
 def resolve_domain_interpolation_confidence_export_path(configured_path=None, blocks_file=None, domain_col=None):
     configured_path = str(configured_path or '').strip()
     if configured_path:
@@ -3646,6 +3675,34 @@ def get_configured_block_filters(config):
     return [dict(entry) for entry in (filters or [])]
 
 
+def _normalize_categorical_filter_token(value):
+    if pd.isna(value):
+        return ''
+
+    text = str(value).strip()
+    if not text:
+        return ''
+
+    lower_text = text.lower()
+    if '.' not in text and 'e' not in lower_text:
+        return text
+
+    try:
+        numeric_value = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return text
+
+    if not numeric_value.is_finite():
+        return text
+
+    normalized = format(numeric_value.normalize(), 'f')
+    if '.' in normalized:
+        normalized = normalized.rstrip('0').rstrip('.')
+    if normalized == '-0':
+        normalized = '0'
+    return normalized or '0'
+
+
 def apply_dataframe_filters(df_source, filters=None, filter_subject='row', source_label='file',
                             progress_callback=None, progress_label=None, emit_logs=True):
     if not filters:
@@ -3678,10 +3735,20 @@ def apply_dataframe_filters(df_source, filters=None, filter_subject='row', sourc
         series = filtered_df[field]
         if filter_type == 'categorical':
             raw_values = filter_spec.get('values', [])
-            allowed_values = [str(value) for value in raw_values]
+            allowed_values = [str(value).strip() for value in raw_values]
             if not allowed_values:
                 raise ValueError(f'Categorical filter for {field} must include at least one value.')
-            mask = series.fillna('').astype(str).isin(allowed_values)
+            series_text = series.fillna('').astype(str).str.strip()
+            mask = series_text.isin(allowed_values)
+
+            normalized_allowed_values = {
+                _normalize_categorical_filter_token(value)
+                for value in raw_values
+            }
+            normalized_allowed_values.discard('')
+            if normalized_allowed_values:
+                normalized_series = series.map(_normalize_categorical_filter_token)
+                mask |= normalized_series.isin(normalized_allowed_values)
         elif filter_type == 'numeric':
             numeric_series = pd.to_numeric(series, errors='coerce')
             min_value = filter_spec.get('min', None)
@@ -3860,6 +3927,83 @@ def _build_distance_band_column_names(domain_column_name, distance_step, distanc
         previous_label = edge_label
     column_names.append(f'{domain_column_name}_Sample_Count_GE_{_format_metric_distance_token(band_edges[-1])}')
     return column_names, band_edges
+
+
+def _format_distance_band_label(lower_bound, upper_bound):
+    lower_label = _format_metric_distance_token(lower_bound)
+    if np.isfinite(upper_bound):
+        upper_label = _format_metric_distance_token(upper_bound)
+        return f'{lower_label}-{upper_label}'
+    return f'>={lower_label}'
+
+
+def _build_block_domain_metrics_summary_dataframe(output_df, domain_column_name,
+                                                  nearest_distance_column, distance_band_edges,
+                                                  domain_sample_counts=None, block_row_volumes=None):
+    if not nearest_distance_column or nearest_distance_column not in output_df.columns:
+        return pd.DataFrame()
+
+    if domain_sample_counts is None:
+        domain_sample_counts = {}
+    if block_row_volumes is None:
+        block_row_volumes = np.full(len(output_df), np.nan, dtype=float)
+
+    domain_series = output_df[domain_column_name].fillna('').astype(str).str.strip()
+    distance_thresholds = np.asarray(distance_band_edges, dtype=float)
+    if distance_thresholds.ndim != 1:
+        raise ValueError('Distance thresholds must be a one-dimensional array.')
+    summary_rows = []
+
+    for domain in sorted(value for value in domain_series.unique() if value):
+        domain_mask = domain_series == domain
+        domain_row_volumes = np.asarray(block_row_volumes, dtype=float)[domain_mask.to_numpy()]
+        has_domain_volume = bool(np.any(np.isfinite(domain_row_volumes)))
+        domain_total_volume = float(np.nansum(domain_row_volumes)) if has_domain_volume else np.nan
+        domain_sample_count = int(domain_sample_counts.get(domain, 0))
+        domain_sample_density = (
+            float(domain_sample_count) / float(domain_total_volume)
+            if has_domain_volume and domain_total_volume > 0 else np.nan
+        )
+        domain_nearest_distances = pd.to_numeric(
+            output_df.loc[domain_mask, nearest_distance_column],
+            errors='coerce',
+        ).to_numpy(dtype=float, copy=False)
+        if domain_nearest_distances.size == 0:
+            continue
+
+        row = {
+            'Domain': domain,
+            'Domain_Sample_Count': domain_sample_count,
+            'Domain_Block_Volume': domain_total_volume,
+            'Domain_Sample_Density': domain_sample_density,
+        }
+
+        finite_distance_mask = np.isfinite(domain_nearest_distances)
+        for threshold in distance_thresholds:
+            threshold_label = _format_metric_distance_token(threshold)
+            covered_mask = finite_distance_mask & (domain_nearest_distances <= threshold)
+            covered_block_count = int(np.count_nonzero(covered_mask))
+            covered_volume = (
+                float(np.nansum(domain_row_volumes[covered_mask]))
+                if has_domain_volume and covered_block_count > 0 else 0.0
+            )
+            coverage_fraction = (
+                float(covered_volume) / float(domain_total_volume)
+                if has_domain_volume and domain_total_volume > 0 else np.nan
+            )
+            coverage_density = (
+                float(domain_sample_count) / float(covered_volume)
+                if domain_sample_count > 0 and covered_volume > 0 else np.nan
+            )
+
+            row[f'Covered_Block_Count_LEQ_{threshold_label}'] = covered_block_count
+            row[f'Covered_Block_Volume_LEQ_{threshold_label}'] = covered_volume
+            row[f'Coverage_Fraction_LEQ_{threshold_label}'] = coverage_fraction
+            row[f'Coverage_Density_LEQ_{threshold_label}'] = coverage_density
+
+        summary_rows.append(row)
+
+    return pd.DataFrame(summary_rows)
 
 
 def _compute_average_pairwise_distance(points, query_chunk_size=512, reference_chunk_size=2048,
@@ -4292,12 +4436,18 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
     matched_sample_coords = candidate_sample_coords[candidate_domain_mask]
     matched_sample_domains = np.asarray(candidate_sample_domains, dtype=object)[candidate_domain_mask]
     matched_sample_ids = None if candidate_sample_ids is None else np.asarray(candidate_sample_ids, dtype=object)[candidate_domain_mask]
+    domain_sample_counts = {
+        str(domain): int(np.count_nonzero(matched_sample_domains == domain))
+        for domain in np.unique(matched_sample_domains)
+    }
 
     distance_count_columns, distance_band_edges = _build_distance_band_column_names(
         domain_column_name,
         distance_count_step,
         distance_count_max_factor,
     )
+    if distance_count_columns and block_size is None:
+        raise ValueError('Block size must be specified when distance-band summary export is enabled.')
 
     samples_by_domain = {}
     for domain in np.unique(matched_sample_domains):
@@ -4316,8 +4466,6 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
     output_df[avg_column] = np.nan
     if closest_id_column:
         output_df[closest_id_column] = ''
-    for column_name in distance_count_columns:
-        output_df[column_name] = 0
 
     processed_block_count = 0
     populated_block_count = 0
@@ -4368,26 +4516,17 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
                 )
             ),
             return_nearest_index=bool(closest_id_column),
-            distance_band_edges=distance_band_edges,
         )
         if closest_id_column:
-            if distance_count_columns:
-                nearest_distances, average_distances, nearest_sample_indices, distance_band_counts = distance_stats
-            else:
-                nearest_distances, average_distances, nearest_sample_indices = distance_stats
+            nearest_distances, average_distances, nearest_sample_indices = distance_stats
         else:
-            if distance_count_columns:
-                nearest_distances, average_distances, distance_band_counts = distance_stats
-            else:
-                nearest_distances, average_distances = distance_stats
+            nearest_distances, average_distances = distance_stats
         output_df.loc[domain_block_indices, nn_column] = nearest_distances
         output_df.loc[domain_block_indices, avg_column] = average_distances
         if closest_id_column:
             domain_ids = domain_samples['ids']
             closest_ids = [domain_ids[index] if index >= 0 else '' for index in nearest_sample_indices]
             output_df.loc[domain_block_indices, closest_id_column] = closest_ids
-        if distance_count_columns:
-            output_df.loc[domain_block_indices, distance_count_columns] = distance_band_counts
         populated_block_count += len(domain_block_indices)
         completed_domain_blocks += len(domain_block_indices)
         now = time.perf_counter()
@@ -4406,20 +4545,53 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
         f"blocks with matching domain samples={populated_block_count:,}; elapsed~{elapsed_seconds}s"
     )
 
+    block_row_volumes = np.full(len(output_df), np.nan, dtype=float)
+    if distance_count_columns and block_size is not None:
+        valid_block_coords = block_coord_frame.loc[valid_block_mask].to_numpy(copy=False)
+        if len(valid_block_coords) > 0:
+            _emit_progress(progress_callback, 98, 100, 'Inferring block volumes for summary...')
+            volume_coords = valid_block_coords
+            rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(volume_coords, block_size_hint=block_size)
+            if is_rotated:
+                volume_coords = (volume_coords - rotation_center) @ rotation_matrix.T
+            row_volumes, _ = infer_block_row_volumes(volume_coords, block_size)
+            block_row_volumes[valid_block_mask.to_numpy()] = row_volumes
+
+    summary_output_file = None
+    summary_df = _build_block_domain_metrics_summary_dataframe(
+        output_df,
+        domain_column_name,
+        nn_column,
+        distance_band_edges,
+        domain_sample_counts=domain_sample_counts,
+        block_row_volumes=block_row_volumes,
+    )
+
     output_dir = os.path.dirname(output_file) or '.'
     os.makedirs(output_dir, exist_ok=True)
     _emit_progress(progress_callback, 99, 100, 'Writing metrics export...')
     output_df.to_csv(output_file, index=False, sep=output_delimiter)
+    if not summary_df.empty:
+        summary_output_file = resolve_block_domain_metrics_summary_export_path(
+            metrics_file=output_file,
+            blocks_file=blocks_file,
+            domain_col=domain_column_name,
+        )
+        summary_df.to_csv(summary_output_file, index=False, sep=output_delimiter)
     _emit_progress(progress_callback, 100, 100, 'Block-domain sample metrics export complete.')
 
     return {
         'output_file': output_file,
+        'summary_output_file': summary_output_file,
         'domain_column': domain_column_name,
         'nearest_distance_column': nn_column,
         'average_distance_column': avg_column,
         'closest_sample_id_column': closest_id_column,
         'closest_sample_id_source_columns': list(selected_id_columns),
-        'distance_count_columns': list(distance_count_columns),
+        'distance_count_columns': [],
+        'distance_summary_thresholds': [float(value) for value in np.asarray(distance_band_edges, dtype=float)],
+        'summary_columns': list(summary_df.columns),
+        'summary_row_count': int(len(summary_df)),
         'distance_count_step': None if distance_count_step is None else float(distance_count_step),
         'distance_count_max_factor': None if distance_count_max_factor is None else int(distance_count_max_factor),
         'input_samples': int(len(df_samples)),
@@ -4634,8 +4806,6 @@ def export_domain_interpolation_confidence_metrics(samples_file, blocks_file, ou
 
         avg_source_sample_distance = _compute_average_pairwise_distance(domain_sample_coords)
         avg_source_sample_axis_distances = _compute_average_pairwise_axis_distances(domain_sample_coords)
-        avg_domain_block_distance = _compute_average_pairwise_distance(domain_block_coords)
-        avg_domain_block_axis_distances = _compute_average_pairwise_axis_distances(domain_block_coords)
         if len(domain_block_coords) > 0 and len(domain_sample_coords) > 0:
             _, block_average_distances = _compute_point_to_set_distance_stats(
                 domain_block_coords,
@@ -4650,8 +4820,12 @@ def export_domain_interpolation_confidence_metrics(samples_file, blocks_file, ou
             avg_block_to_source_sample_distance = np.nan
             avg_block_to_source_sample_axis_distances = np.full(3, np.nan, dtype=float)
 
-        if np.isfinite(avg_source_sample_distance) and np.isfinite(avg_domain_block_distance) and avg_domain_block_distance != 0:
-            sample_to_block_ratio = avg_source_sample_distance / avg_domain_block_distance
+        if (
+            np.isfinite(avg_source_sample_distance)
+            and np.isfinite(avg_block_to_source_sample_distance)
+            and avg_block_to_source_sample_distance != 0
+        ):
+            sample_to_block_ratio = avg_source_sample_distance / avg_block_to_source_sample_distance
         else:
             sample_to_block_ratio = np.nan
 
@@ -4661,13 +4835,11 @@ def export_domain_interpolation_confidence_metrics(samples_file, blocks_file, ou
             'Domain_Block_Count': int(len(domain_block_coords)),
             'Avg_Source_Sample_Distance': avg_source_sample_distance,
             'Avg_Block_To_Source_Sample_Distance': avg_block_to_source_sample_distance,
-            'Avg_Domain_Block_Distance': avg_domain_block_distance,
             'Sample_To_Block_Distance_Ratio': sample_to_block_ratio,
         }
         for axis_index, axis_label in enumerate(axis_labels):
             row[f'Avg_Source_Sample_Distance_{axis_label}'] = avg_source_sample_axis_distances[axis_index]
             row[f'Avg_Block_To_Source_Sample_Distance_{axis_label}'] = avg_block_to_source_sample_axis_distances[axis_index]
-            row[f'Avg_Domain_Block_Distance_{axis_label}'] = avg_domain_block_axis_distances[axis_index]
         domain_rows.append(row)
 
     output_df = pd.DataFrame(domain_rows)
@@ -7425,16 +7597,25 @@ if __name__ == "__main__":
                     self.equation_finder_output_edit.setText(path)
 
             domain_samples_group = QtWidgets.QGroupBox('Domain Samples')
+            domain_samples_group.setToolTip(
+                'Assign a domain to each sample row from the blocks model and export the domained samples to a new CSV.'
+            )
             domain_samples_form = QtWidgets.QFormLayout()
             domain_samples_group.setLayout(domain_samples_form)
             domain_output_layout = QtWidgets.QHBoxLayout()
             domain_output_layout.addWidget(self.domain_samples_output_edit)
             domain_output_layout.addWidget(self.domain_samples_browse)
             domain_samples_form.addRow('Output File', domain_output_layout)
+            self.start_domaining_btn.setToolTip(
+                'Export a copy of the samples file with one domain assigned to each sample from the configured blocks and block size.'
+            )
             domain_samples_form.addRow('', self.start_domaining_btn)
             operations_form.addRow(domain_samples_group)
 
             block_value_transfer_group = QtWidgets.QGroupBox('Assign Block Columns To Samples')
+            block_value_transfer_group.setToolTip(
+                'Copy selected block columns onto sample rows by matching each sample to its containing block.'
+            )
             block_value_transfer_form = QtWidgets.QFormLayout()
             block_value_transfer_group.setLayout(block_value_transfer_form)
             block_value_transfer_output_layout = QtWidgets.QHBoxLayout()
@@ -7447,10 +7628,16 @@ if __name__ == "__main__":
             block_value_transfer_buttons.addWidget(self.block_value_transfer_clear_btn)
             block_value_transfer_form.addRow('', block_value_transfer_buttons)
             block_value_transfer_form.addRow('', self.block_value_transfer_summary)
+            self.start_block_value_transfer_btn.setToolTip(
+                'Export the samples file with the selected block columns transferred onto each matched sample row.'
+            )
             block_value_transfer_form.addRow('', self.start_block_value_transfer_btn)
             operations_form.addRow(block_value_transfer_group)
 
             block_metrics_group = QtWidgets.QGroupBox('Block Domain Sample Metrics')
+            block_metrics_group.setToolTip(
+                'Export per-block nearest distance, average block-to-sample distance, closest sample ID, and optional distance-band sample counts within each domain.'
+            )
             block_metrics_form = QtWidgets.QFormLayout()
             block_metrics_group.setLayout(block_metrics_form)
             block_metrics_output_layout = QtWidgets.QHBoxLayout()
@@ -7462,12 +7649,12 @@ if __name__ == "__main__":
                 block_metrics_id_layout.addWidget(cb)
                 block_metrics_id_layout.setStretch(index, 1)
             block_metrics_form.addRow('Closest Sample ID Columns', block_metrics_id_layout)
-            self.block_domain_metrics_distance_counts_enabled = QtWidgets.QCheckBox('Enable distance-band sample counts')
+            self.block_domain_metrics_distance_counts_enabled = QtWidgets.QCheckBox('Enable distance-threshold summary')
             self.block_domain_metrics_distance_counts_enabled.setChecked(False)
             self.block_domain_metrics_distance_counts_enabled.setToolTip(
-                'Add per-block counts of same-domain samples in distance bands: [0, step), [step, 2*step), ..., [factor-1*step, factor*step), and >= factor*step.'
+                'Add a per-domain summary with covered block volume and N/V(d) at thresholds step, 2*step, ..., max factor*step.'
             )
-            self.block_domain_metrics_distance_step = QtWidgets.QDoubleSpinBox()
+            self.block_domain_metrics_distance_step = TrimmedDisplayDoubleSpinBox()
             self.block_domain_metrics_distance_step.setDecimals(3)
             self.block_domain_metrics_distance_step.setRange(0.001, 1_000_000.0)
             self.block_domain_metrics_distance_step.setValue(50.0)
@@ -7482,20 +7669,32 @@ if __name__ == "__main__":
             block_metrics_distance_layout.addWidget(self.block_domain_metrics_distance_step)
             block_metrics_distance_layout.addWidget(self.block_domain_metrics_max_factor)
             block_metrics_form.addRow('Distance Bands', block_metrics_distance_layout)
+            self.start_block_domain_metrics_btn.setToolTip(
+                'Export block-by-block sample support metrics and, when distance bands are enabled, a second summary CSV with one row per domain containing covered volume and N/V(d) at each distance threshold.'
+            )
             block_metrics_form.addRow('', self.start_block_domain_metrics_btn)
             operations_form.addRow(block_metrics_group)
 
             domain_confidence_group = QtWidgets.QGroupBox('Domain Interpolation Confidence')
+            domain_confidence_group.setToolTip(
+                'Summarize each domain with average sample spacing, average distance from blocks to samples, and their ratio.'
+            )
             domain_confidence_form = QtWidgets.QFormLayout()
             domain_confidence_group.setLayout(domain_confidence_form)
             domain_confidence_output_layout = QtWidgets.QHBoxLayout()
             domain_confidence_output_layout.addWidget(self.domain_interpolation_confidence_output_edit)
             domain_confidence_output_layout.addWidget(self.domain_interpolation_confidence_browse)
             domain_confidence_form.addRow('Output File', domain_confidence_output_layout)
+            self.start_domain_interpolation_confidence_btn.setToolTip(
+                'Export one row per domain with average distance between samples, average distance from blocks to samples, and the ratio between those two metrics.'
+            )
             domain_confidence_form.addRow('', self.start_domain_interpolation_confidence_btn)
             operations_form.addRow(domain_confidence_group)
 
             block_volume_group = QtWidgets.QGroupBox('Block Volume Weighted Average')
+            block_volume_group.setToolTip(
+                'Infer per-row block volumes when needed and export a volume-weighted average for the selected blocks column.'
+            )
             block_volume_form = QtWidgets.QFormLayout()
             block_volume_group.setLayout(block_volume_form)
             block_volume_output_layout = QtWidgets.QHBoxLayout()
@@ -7504,10 +7703,16 @@ if __name__ == "__main__":
             block_volume_form.addRow('Output File', block_volume_output_layout)
             block_volume_form.addRow('Weighted Column', self.block_value_metric_col)
             block_volume_form.addRow('Weight Column', self.block_weight_metric_col)
+            self.start_block_volume_weighted_btn.setToolTip(
+                'Export a summary CSV containing inferred total volume, weighted sum, and weighted average for the selected blocks field.'
+            )
             block_volume_form.addRow('', self.start_block_volume_weighted_btn)
             operations_form.addRow(block_volume_group)
 
             equation_finder_group = QtWidgets.QGroupBox('Equation Finder By Domain')
+            equation_finder_group.setToolTip(
+                'Run symbolic regression independently on each domain to search for equations that explain the selected target from the chosen predictors.'
+            )
             equation_finder_form = QtWidgets.QFormLayout()
             equation_finder_group.setLayout(equation_finder_form)
             equation_output_layout = QtWidgets.QHBoxLayout()
@@ -7556,6 +7761,9 @@ if __name__ == "__main__":
             self.equation_timeout_seconds.setSuffix(' s')
             self.equation_timeout_seconds.setToolTip('Maximum wall-clock time per domain. Set to 0 to disable the timeout. The best equation found so far is returned when the timeout is reached.')
             equation_finder_form.addRow('Timeout', self.equation_timeout_seconds)
+            self.start_equation_finder_btn.setToolTip(
+                'Fit candidate equations per domain and export both the per-domain winner summary and detailed equation search results.'
+            )
             equation_finder_form.addRow('', self.start_equation_finder_btn)
             operations_form.addRow(equation_finder_group)
 
@@ -8802,10 +9010,20 @@ if __name__ == "__main__":
                     if result.get('closest_sample_id_source_columns'):
                         closest_id_text = ', '.join(result['closest_sample_id_source_columns'])
                     distance_bands_text = 'Disabled'
-                    if result.get('distance_count_columns'):
+                    if result.get('distance_summary_thresholds'):
+                        threshold_tokens = ', '.join(
+                            _format_metric_distance_token(value)
+                            for value in result['distance_summary_thresholds']
+                        )
                         distance_bands_text = (
                             f"step={result['distance_count_step']:,g}, max factor={result['distance_count_max_factor']:,}; "
-                            f"columns={', '.join(result['distance_count_columns'])}"
+                            f"summary thresholds={threshold_tokens}"
+                        )
+                    summary_text = 'Not generated'
+                    if result.get('summary_output_file'):
+                        summary_text = (
+                            f"{result['summary_output_file']} "
+                            f"({result.get('summary_row_count', 0):,} rows)"
                         )
 
                     QtWidgets.QMessageBox.information(
@@ -8813,6 +9031,7 @@ if __name__ == "__main__":
                         'Success',
                         (
                             f"Block metrics export complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Summary saved to:\n{summary_text}\n\n"
                             f"Domain column: {result['domain_column']}\n"
                             f"Filtered samples: {result['filtered_samples']:,} of {result['input_samples']:,}\n"
                             f"Matched samples: {result['matched_samples']:,}\n"
@@ -8891,8 +9110,8 @@ if __name__ == "__main__":
                             f"Matched samples: {result['matched_samples']:,}\n"
                             f"Processed blocks: {result['processed_blocks']:,}\n"
                             f"Invalid sample coordinates: {result['invalid_coordinate_samples']:,}\n\n"
-                            f"Includes ratio column: Sample_To_Block_Distance_Ratio\n"
-                            f"Includes axis columns: *_X, *_Y, *_Z\n\n"
+                            f"Ratio: Avg_Source_Sample_Distance / Avg_Block_To_Source_Sample_Distance\n"
+                            f"Includes axis columns for sample and block-to-sample distances: *_X, *_Y, *_Z\n\n"
                             f"Filters:\n{filters_text}"
                         ),
                     )
