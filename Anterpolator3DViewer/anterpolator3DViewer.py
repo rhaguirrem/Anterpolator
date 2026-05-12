@@ -179,6 +179,19 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             verbose=config.get('verbose', False)
         )
 
+    elif algo_type == 'gaussian_kernel':
+        from gaussian_kernel_interpolator import GaussianKernelInterpolator
+
+        gk_params = config.get('gaussian_kernel_params', {})
+        return GaussianKernelInterpolator(
+            bandwidth=gk_params.get('bandwidth', 3.0),
+            cutoff_sigma=gk_params.get('cutoff_sigma', 3.0),
+            use_nearest_fallback=gk_params.get('use_nearest_fallback', True),
+            fill_background=gk_params.get('fill_background', False),
+            background_value=gk_params.get('background_value', 0.0),
+            verbose=config.get('verbose', False),
+        )
+
     
     elif algo_type == 'string_theory' or algo_type == 'net_connector':
         from string_theory_interpolator import StringTheoryInterpolator
@@ -2229,6 +2242,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     elif algo_type == 'molecular_clock':
                         interp1.allowed_grid_override = allowed_grid
                         interp1.domain_mapping = domain_mapping
+                    elif algo_type == 'gaussian_kernel':
+                        interp1.allowed_grid_override = allowed_grid
+                        interp1.domain_mapping = domain_mapping
                     elif algo_type == 'string_theory':
                         interp1.allowed_grid_override = allowed_grid
                         interp1.domain_mapping = domain_mapping
@@ -2254,6 +2270,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                         interp2.allowed_grid_override = allowed_grid
                         interp2.domain_mapping = domain_mapping
                     elif algo2 == 'molecular_clock':
+                        interp2.allowed_grid_override = allowed_grid
+                        interp2.domain_mapping = domain_mapping
+                    elif algo2 == 'gaussian_kernel':
                         interp2.allowed_grid_override = allowed_grid
                         interp2.domain_mapping = domain_mapping
                     elif algo2 == 'string_theory':
@@ -2294,6 +2313,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                         interpolator.allowed_grid_override = allowed_grid
                         interpolator.domain_mapping = domain_mapping
                     elif algo_type == 'molecular_clock':
+                        interpolator.allowed_grid_override = allowed_grid
+                        interpolator.domain_mapping = domain_mapping
+                    elif algo_type == 'gaussian_kernel':
                         interpolator.allowed_grid_override = allowed_grid
                         interpolator.domain_mapping = domain_mapping
                     elif algo_type == 'string_theory':
@@ -5593,6 +5615,8 @@ def _normalize_export_algorithm_name(algo_name):
         return 'String Theory', 'string_theory'
     if 'molecular clock' in name or 'phylogeographic' in name or 'biochemical clock' in name:
         return 'Molecular Clock', 'molecular_clock'
+    if 'gaussian kernel' in name:
+        return 'Gaussian Kernel', 'gaussian_kernel'
     return 'Unknown', 'unknown'
 
 
@@ -6676,12 +6700,12 @@ if __name__ == "__main__":
                 self.table.setItem(i, 0, domain_item)
 
                 algo1_combo = QtWidgets.QComboBox()
-                algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'string_theory', 'skip'])
+                algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory', 'skip'])
                 algo1_combo.setCurrentText('(use default)')
                 self.table.setCellWidget(i, 1, algo1_combo)
 
                 algo2_combo = QtWidgets.QComboBox()
-                algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'string_theory'])
+                algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
                 algo2_combo.setCurrentText('skip')
                 self.table.setCellWidget(i, 2, algo2_combo)
 
@@ -6726,7 +6750,7 @@ if __name__ == "__main__":
 
         def apply_to_all(self):
             """Apply same first pass algorithm to all domains"""
-            algorithms = ['(use default)', 'ant_colony', 'molecular_clock', 'string_theory', 'skip']
+            algorithms = ['(use default)', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory', 'skip']
             algo, ok = QtWidgets.QInputDialog.getItem(
                 self, 'Apply to All', 'Select first pass algorithm for all domains:', 
                 algorithms, 0, False
@@ -7117,6 +7141,11 @@ if __name__ == "__main__":
             mc_tab.setLayout(mc_form)
             tabs.addTab(mc_tab, "Molecular Clock")
 
+            gk_tab = QtWidgets.QWidget()
+            gk_form = QtWidgets.QFormLayout()
+            gk_tab.setLayout(gk_form)
+            tabs.addTab(gk_tab, "Gaussian Kernel")
+
             st_tab = QtWidgets.QWidget()
             st_form = QtWidgets.QFormLayout()
             st_tab.setLayout(st_form)
@@ -7217,10 +7246,10 @@ if __name__ == "__main__":
 
             # Algorithm selection
             self.algorithm_combo = QtWidgets.QComboBox()
-            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'string_theory'])
+            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
             
             self.second_pass_combo = QtWidgets.QComboBox()
-            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'string_theory'])
+            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
             self.second_pass_combo.setCurrentText('skip')
             
             def validate_algorithms():
@@ -7923,6 +7952,36 @@ if __name__ == "__main__":
             mc_form.addRow('Detect Multiple Events', self.mc_detect_multiple)
             mc_form.addRow('Interpolation Method', self.mc_interp_method)
 
+            # === GAUSSIAN KERNEL TAB ===
+            self.gk_bandwidth = dbl_spin(3.0, 0.001, 1_000_000.0, 0.1)
+            self.gk_bandwidth.setToolTip('Kernel bandwidth in grid blocks. Larger values smooth farther across the grid; smaller values stay local.')
+
+            self.gk_cutoff_sigma = dbl_spin(3.0, 0.5, 100.0, 0.1)
+            self.gk_cutoff_sigma.setToolTip('Search radius expressed as multiples of the bandwidth. Actual radius = bandwidth x cutoff sigma.')
+
+            self.gk_use_nearest_fallback = QtWidgets.QCheckBox()
+            self.gk_use_nearest_fallback.setChecked(True)
+            self.gk_use_nearest_fallback.setToolTip('If checked, uses the nearest compatible sample when no samples fall inside the kernel search radius.')
+
+            self.gk_fill_background = QtWidgets.QCheckBox()
+            self.gk_fill_background.setChecked(False)
+            self.gk_fill_background.setToolTip('If checked, cells with no usable kernel estimate are filled with the background value instead of being left unset.')
+
+            self.gk_background_value = dbl_spin(0.0, -1e9, 1e9, 1.0)
+            self.gk_background_value.setToolTip('Fallback value assigned only when Fill Background is enabled and no kernel estimate is available.')
+            self.gk_background_value.setEnabled(False)
+
+            def update_gk_background_ui(checked):
+                self.gk_background_value.setEnabled(checked)
+
+            self.gk_fill_background.toggled.connect(update_gk_background_ui)
+
+            gk_form.addRow('Bandwidth', self.gk_bandwidth)
+            gk_form.addRow('Cutoff Sigma', self.gk_cutoff_sigma)
+            gk_form.addRow('Use Nearest Fallback', self.gk_use_nearest_fallback)
+            gk_form.addRow('Fill Background', self.gk_fill_background)
+            gk_form.addRow('Background Value', self.gk_background_value)
+
             # === STRING THEORY TAB ===
             self.st_distance_threshold = dbl_spin(10.0, 0.1, 1000.0, 1.0)
             self.st_distance_threshold.setToolTip('Maximum distance to search for a connection (in blocks).')
@@ -8272,6 +8331,13 @@ if __name__ == "__main__":
                     'detect_multiple': self.mc_detect_multiple.isChecked(),
                     'interp_method': self.mc_interp_method.currentText()
                 },
+                'gaussian_kernel_params': {
+                    'bandwidth': self.gk_bandwidth.value(),
+                    'cutoff_sigma': self.gk_cutoff_sigma.value(),
+                    'use_nearest_fallback': self.gk_use_nearest_fallback.isChecked(),
+                    'fill_background': self.gk_fill_background.isChecked(),
+                    'background_value': self.gk_background_value.value(),
+                },
                 'string_theory_params': {
                     'interpolate_target': self.st_interpolate_target.currentText().strip().lower(),
                     'distance_threshold': self.st_distance_threshold.value(),
@@ -8408,6 +8474,15 @@ if __name__ == "__main__":
                     if 'max_samples' in mc: self.mc_max_samples.setValue(mc['max_samples'])
                     if 'detect_multiple' in mc: self.mc_detect_multiple.setChecked(mc['detect_multiple'])
                     if 'interp_method' in mc: self.mc_interp_method.setCurrentText(mc['interp_method'])
+                if 'gaussian_kernel_params' in config:
+                    gk = config['gaussian_kernel_params']
+                    if 'bandwidth' in gk: self.gk_bandwidth.setValue(gk['bandwidth'])
+                    if 'cutoff_sigma' in gk: self.gk_cutoff_sigma.setValue(gk['cutoff_sigma'])
+                    if 'use_nearest_fallback' in gk: self.gk_use_nearest_fallback.setChecked(bool(gk['use_nearest_fallback']))
+                    if 'fill_background' in gk:
+                        self.gk_fill_background.setChecked(bool(gk['fill_background']))
+                        self.gk_background_value.setEnabled(bool(gk['fill_background']))
+                    if 'background_value' in gk: self.gk_background_value.setValue(gk['background_value'])
                 if 'string_theory_params' in config:
                     st = config['string_theory_params']
                     if 'interpolate_target' in st:
