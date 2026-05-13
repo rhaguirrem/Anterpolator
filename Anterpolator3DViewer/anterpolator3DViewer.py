@@ -6681,6 +6681,9 @@ if __name__ == "__main__":
             self.apply_all_btn = QtWidgets.QPushButton('Apply First Pass to All')
             self.apply_all_btn.clicked.connect(self.apply_to_all)
             btn_layout.addWidget(self.apply_all_btn)
+            self.apply_second_pass_all_btn = QtWidgets.QPushButton('Apply Second Pass to All')
+            self.apply_second_pass_all_btn.clicked.connect(self.apply_second_pass_to_all)
+            btn_layout.addWidget(self.apply_second_pass_all_btn)
             btn_layout.addStretch()
             
             self.ok_btn = QtWidgets.QPushButton('OK')
@@ -6760,6 +6763,24 @@ if __name__ == "__main__":
                     combo = self.table.cellWidget(i, 1)
                     if combo:
                         combo.setCurrentText(algo)
+
+        def apply_second_pass_to_all(self):
+            """Apply same second pass algorithm to all eligible domains"""
+            algorithms = ['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory']
+            algo, ok = QtWidgets.QInputDialog.getItem(
+                self, 'Apply to All', 'Select second pass algorithm for all domains:',
+                algorithms, 0, False
+            )
+            if ok:
+                for i in range(self.table.rowCount()):
+                    algo1_combo = self.table.cellWidget(i, 1)
+                    algo2_combo = self.table.cellWidget(i, 2)
+                    if not algo1_combo or not algo2_combo:
+                        continue
+                    if algo1_combo.currentText() == 'skip':
+                        algo2_combo.setCurrentText('skip')
+                        continue
+                    algo2_combo.setCurrentText(algo)
         
         def get_domain_configs(self):
             """Get domain algorithm configurations"""
@@ -7243,32 +7264,6 @@ if __name__ == "__main__":
             block_eval_layout.addWidget(self.block_evaluated_samples_edit)
             block_eval_layout.addWidget(self.block_evaluated_samples_browse)
             files_form.addRow(self.block_evaluated_samples_enabled, block_eval_layout)
-
-            # Algorithm selection
-            self.algorithm_combo = QtWidgets.QComboBox()
-            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
-            
-            self.second_pass_combo = QtWidgets.QComboBox()
-            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
-            self.second_pass_combo.setCurrentText('skip')
-            
-            def validate_algorithms():
-                algo1 = self.algorithm_combo.currentText()
-                algo2 = self.second_pass_combo.currentText()
-                if algo2 != 'skip' and algo1 == algo2:
-                    QtWidgets.QMessageBox.warning(self, "Invalid Selection", 
-                        f"Second pass algorithm cannot be the same as the first pass ({algo1}).")
-                    self.second_pass_combo.setCurrentText('skip')
-
-            self.algorithm_combo.currentTextChanged.connect(validate_algorithms)
-            self.second_pass_combo.currentTextChanged.connect(validate_algorithms)
-            
-            algo_layout = QtWidgets.QHBoxLayout()
-            algo_layout.addWidget(self.algorithm_combo)
-            algo_layout.addWidget(QtWidgets.QLabel("Second Pass:"))
-            algo_layout.addWidget(self.second_pass_combo)
-            
-            files_form.addRow('First Pass', algo_layout)
 
             # Delimiter selectors
             delim_opts = [',',';','\t','|']
@@ -8084,10 +8079,41 @@ if __name__ == "__main__":
             self.blank_sample_domain_behavior.setCurrentText('Skip')
             self.blank_sample_domain_behavior.setToolTip('How to handle blank sample domains during domain-based interpolation or metrics.\nSkip: exclude blank-domain rows.\nInfer From Blocks: infer missing sample domains from the blocks model when possible.')
 
+            self.algorithm_combo = QtWidgets.QComboBox()
+            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
+
+            self.second_pass_combo = QtWidgets.QComboBox()
+            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
+            self.second_pass_combo.setCurrentText('skip')
+
+            def validate_algorithms():
+                algo1 = self.algorithm_combo.currentText()
+                algo2 = self.second_pass_combo.currentText()
+                if algo2 != 'skip' and algo1 == algo2:
+                    QtWidgets.QMessageBox.warning(self, "Invalid Selection",
+                        f"Second pass algorithm cannot be the same as the first pass ({algo1}).")
+                    self.second_pass_combo.setCurrentText('skip')
+
+            self.algorithm_combo.currentTextChanged.connect(validate_algorithms)
+            self.second_pass_combo.currentTextChanged.connect(validate_algorithms)
+
+            default_algo_layout = QtWidgets.QHBoxLayout()
+            default_algo_layout.addWidget(self.algorithm_combo)
+            default_algo_layout.addWidget(QtWidgets.QLabel("Second Pass:"))
+            default_algo_layout.addWidget(self.second_pass_combo)
+
             # === DISPLAY TAB ===
             self.taichi_sample_diameter = dbl_spin(1.0, 0.001, 1e6, 0.1)
             self.taichi_sample_diameter.setToolTip('Sample diameter in model units for the Taichi mesh viewer. Default is 1 unit.')
             display_form.addRow('Sample Diameter', self.taichi_sample_diameter)
+
+            advanced_form.addRow('Default Pass Algorithms', default_algo_layout)
+
+            # Domain Algorithm Mapping
+            self.domain_overrides = {}  # Store domain -> algorithm mapping
+            self.domain_mapping_btn = QtWidgets.QPushButton('Configure Domain Algorithms...')
+            self.domain_mapping_btn.clicked.connect(self.open_domain_mapping)
+            advanced_form.addRow('Domain-Specific Algorithms', self.domain_mapping_btn)
 
             advanced_form.addRow('Average With Blocks', self.average_with_blocks)
             advanced_form.addRow('Fill Unvisited (Domain-wise)', self.fill_unvisited_domainwise)
@@ -8095,12 +8121,6 @@ if __name__ == "__main__":
             advanced_form.addRow('Expand CSV Export to Sub-Blocks', self.expand_interpolation_exports_to_subblocks)
             advanced_form.addRow('Blank Sample Domains', self.blank_sample_domain_behavior)
             advanced_form.addRow('Verbose', self.verbose)
-
-            # Domain Algorithm Mapping
-            self.domain_overrides = {}  # Store domain -> algorithm mapping
-            self.domain_mapping_btn = QtWidgets.QPushButton('Configure Domain Algorithms...')
-            self.domain_mapping_btn.clicked.connect(self.open_domain_mapping)
-            advanced_form.addRow('Domain-Specific Algorithms', self.domain_mapping_btn)
 
             # Buttons at bottom of main layout
             btn_box = QtWidgets.QHBoxLayout()
