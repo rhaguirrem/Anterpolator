@@ -2146,6 +2146,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 
                 # Filter allowed_grid to this domain only
                 domain_allowed_grid = {pos for pos in allowed_grid if domain_mapping.get(pos) == domain}
+                domain_sample_mapping = {pos: domain for pos in domain_samples}
                 
                 # Check if we have any non-sample blocks in this domain (sparse vs dense definition)
                 # If the allowed grid is just the samples, we shouldn't enforce it as a constraint.
@@ -2164,7 +2165,8 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 
                 # Initialize with only this domain's samples
                 interp1.initialize_blocks(domain_samples, tuple(block_info['dims']),
-                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping)
+                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping,
+                                             sample_domain_mapping=domain_sample_mapping)
                 
                 if hasattr(interp1, 'create_ants'):
                     interp1.create_ants()
@@ -2188,7 +2190,8 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     
                     # Initialize with original samples (will be augmented later)
                     interp2.initialize_blocks(domain_samples, tuple(block_info['dims']),
-                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_2)
+                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_2,
+                                             sample_domain_mapping=domain_sample_mapping)
                     
                     if hasattr(interp2, 'create_ants'):
                         interp2.create_ants()
@@ -2425,6 +2428,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
 
                 # Majority vote
                 counts = {}
+
                 for ds in doms:
                     counts[ds] = counts.get(ds, 0) + 1
                 max_count = max(counts.values())
@@ -5756,6 +5760,85 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
             
         data.append(row)
 
+def _get_interpolator_run_profile(interpolator, dims, iterations):
+    algo_name = interpolator.get_algorithm_name()
+    if algo_name == 'Gaussian Kernel':
+        allowed_positions = getattr(interpolator, 'allowed_grid_override', None)
+        if allowed_positions is None:
+            position_count = int(dims[0]) * int(dims[1]) * int(dims[2])
+            scope_label = 'grid positions'
+        else:
+            position_count = len(allowed_positions)
+            scope_label = 'allowed positions'
+
+        sample_count = len(getattr(interpolator, 'sample_blocks', {}) or {})
+        bandwidth = float(getattr(interpolator, 'bandwidth', 0.0))
+        cutoff_sigma = float(getattr(interpolator, 'cutoff_sigma', 0.0))
+        search_radius = bandwidth * cutoff_sigma
+        message = (
+            f"Running {algo_name} single pass over {position_count:,} {scope_label} "
+            f"(samples={sample_count:,}, radius={search_radius:.1f} blocks)..."
+        )
+        return {
+            'single_pass': True,
+            'message': message,
+            'desc_suffix': 'single pass',
+            'total': position_count,
+            'unit': 'pos',
+        }
+
+    return {
+        'single_pass': False,
+        'message': f"Running {algo_name} for {iterations} iterations...",
+        'desc_suffix': None,
+        'total': max(int(iterations), 1),
+        'unit': 'iter',
+    }
+
+def _run_interpolator_with_progress(interpolator, dims, iterations, desc, on_first_iteration=None):
+    profile = _get_interpolator_run_profile(interpolator, dims, iterations)
+    print(profile['message'])
+
+    if profile['single_pass']:
+        pbar = tqdm(total=profile['total'], desc=f"{desc} ({profile['desc_suffix']})", unit=profile['unit'])
+        previous_callback = getattr(interpolator, 'progress_callback', None)
+
+        def update_progress(processed_positions, total_positions, interpolated_blocks):
+            pbar.total = max(int(total_positions), 1)
+            pbar.n = min(int(processed_positions), pbar.total)
+            pbar.set_postfix_str(f"interpolated={int(interpolated_blocks):,}")
+            pbar.refresh()
+
+        interpolator.progress_callback = update_progress
+        try:
+            should_continue = interpolator.run_iteration(dims)
+        finally:
+            interpolator.progress_callback = previous_callback
+        if on_first_iteration is not None:
+            on_first_iteration()
+        metadata = interpolator.get_metadata()
+        interpolated_blocks = metadata.get('interpolated_blocks')
+        if interpolated_blocks is not None:
+            pbar.set_postfix_str(f"interpolated={interpolated_blocks:,}")
+        pbar.n = pbar.total
+        pbar.set_description(f"{desc} (completed)")
+        pbar.close()
+        print("Completed single pass")
+        return should_continue
+
+    pbar = tqdm(range(profile['total']), desc=desc, unit=profile['unit'])
+    should_continue = True
+    for i in pbar:
+        should_continue = interpolator.run_iteration(dims)
+        if i == 0 and on_first_iteration is not None:
+            on_first_iteration()
+        if not should_continue or interpolator.is_converged():
+            pbar.set_description(f"{desc} (converged)")
+            print(f"Converged at iteration {i+1}")
+            break
+    pbar.close()
+    return should_continue
+
 def silent_interpolation(plotter, iterations, interpolation_file):
     blocks = plotter._blocks_data
     dims = tuple(blocks._block_info['dims'])
@@ -5777,18 +5860,14 @@ def silent_interpolation(plotter, iterations, interpolation_file):
             if hasattr(interp1, 'verbose'):
                 original_verbose = interp1.verbose
                 interp1.verbose = True
-            
-            pbar = tqdm(range(iterations), desc=f"Domain {domain} - Pass 1")
-            for i in pbar:
-                should_continue = interp1.run_iteration(dims)
-                
-                if i == 0 and hasattr(interp1, 'verbose'):
-                    interp1.verbose = original_verbose
-                
-                if not should_continue or interp1.is_converged():
-                    pbar.set_description(f"Domain {domain} - Pass 1 (converged)")
-                    print(f"Pass 1 converged at iteration {i+1}")
-                    break
+
+            _run_interpolator_with_progress(
+                interp1,
+                dims,
+                iterations,
+                f"Domain {domain} - Pass 1",
+                on_first_iteration=(lambda interp=interp1, verbose=original_verbose: setattr(interp, 'verbose', verbose)) if hasattr(interp1, 'verbose') else None,
+            )
             
             # Generate stats for Pass 1 if String Theory
             output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
@@ -5809,6 +5888,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                 # Re-initialize Pass 2 with merged samples
                 min_bounds = blocks._block_info['min_bounds']
                 block_size = blocks._block_info['block_size']
+                pass1_domain_mapping = {pos: domain for pos in pass1_values}
                 
                 # Determine if we should enforce domain mapping/grid restriction
                 use_mapping = False
@@ -5895,7 +5975,14 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                      if hasattr(interp2, 'allowed_grid_override') and interp2.allowed_grid_override is not None:
                          use_mapping = True
                      
-                     interp2.initialize_blocks(pass1_values, dims, min_bounds, block_size, use_domain_mapping=use_mapping)
+                     interp2.initialize_blocks(
+                         pass1_values,
+                         dims,
+                         min_bounds,
+                         block_size,
+                         use_domain_mapping=use_mapping,
+                         sample_domain_mapping=pass1_domain_mapping,
+                     )
                      
                      if hasattr(interp2, 'create_ants'):
                          interp2.create_ants()
@@ -5904,18 +5991,14 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                      if hasattr(interp2, 'verbose'):
                          original_verbose = interp2.verbose
                          interp2.verbose = True
-                    
-                     pbar = tqdm(range(iterations), desc=f"Domain {domain} - Pass 2")
-                     for i in pbar:
-                         should_continue = interp2.run_iteration(dims)
-                         
-                         if i == 0 and hasattr(interp2, 'verbose'):
-                             interp2.verbose = original_verbose
-                         
-                         if not should_continue or interp2.is_converged():
-                             pbar.set_description(f"Domain {domain} - Pass 2 (converged)")
-                             print(f"Pass 2 converged at iteration {i+1}")
-                             break
+
+                     _run_interpolator_with_progress(
+                         interp2,
+                         dims,
+                         iterations,
+                         f"Domain {domain} - Pass 2",
+                         on_first_iteration=(lambda interp=interp2, verbose=original_verbose: setattr(interp, 'verbose', verbose)) if hasattr(interp2, 'verbose') else None,
+                     )
                 
                 # Generate stats for Pass 2 if String Theory
                 output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
@@ -5932,14 +6015,12 @@ def silent_interpolation(plotter, iterations, interpolation_file):
         # Single interpolator
         interpolator = blocks._ant_colony
         algo_name = interpolator.get_algorithm_name()
-        print(f"Running {algo_name} for {iterations} iterations...")
-        
-        pbar = tqdm(range(iterations), desc=f"Interpolation ({algo_name})")
-        for i in pbar:
-            should_continue = interpolator.run_iteration(dims)
-            if not should_continue or interpolator.is_converged():
-                print(f"Converged at iteration {i+1}")
-                break
+        _run_interpolator_with_progress(
+            interpolator,
+            dims,
+            iterations,
+            f"Interpolation ({algo_name})",
+        )
         
         metadata = interpolator.get_metadata()
         print(f"\n=== Summary ===")
@@ -6058,6 +6139,10 @@ def load_lfc_colormap(lfc_file):
 
 
 def build_taichi_viewer_state_from_config(config):
+    interpolation_file = str(config.get('interpolation_file') or '').strip()
+    if config.get('_prefer_interpolation_file_for_viewer') and interpolation_file and os.path.isfile(interpolation_file):
+        return build_taichi_viewer_state_from_interpolation_file(config)
+
     taichi_runtime = _load_taichi_runtime_module()
 
     samples_file = config['samples_file']
@@ -6204,6 +6289,131 @@ def build_taichi_viewer_state_from_config(config):
         'sample_values': np.asarray(values, dtype=np.float32),
         'sample_domains': sample_domains,
         'blocks_data': blocks,
+        'block_size': config['block_size'],
+        'value_filter': config.get('value_filter', 0.0),
+        'lfc_colors': lfc_colors,
+        'lfc_bins': lfc_bins,
+        'lfc_tick_labels': tick_labels,
+        'config': config,
+        'window_title': 'Anterpolator Taichi Viewer',
+    }
+
+
+def build_taichi_viewer_state_from_interpolation_file(config):
+    taichi_runtime = _load_taichi_runtime_module()
+
+    samples_file = config['samples_file']
+    interpolation_file = str(config.get('interpolation_file') or '').strip()
+    print(f"Loading interpolation viewer state from {interpolation_file}...")
+
+    sample_filters = get_configured_sample_filters(config)
+    df_samples, _, explicit_sample_map = load_samples_dataframe(
+        samples_file,
+        samples_delimiter=config.get('samples_delimiter'),
+        samples_header_line=config.get('samples_header_line', 1),
+        sample_x_col=config.get('sample_x_col'),
+        sample_y_col=config.get('sample_y_col'),
+        sample_z_col=config.get('sample_z_col'),
+        sample_value_col=config.get('sample_value_col'),
+        sample_domain_col=config.get('sample_domain_col'),
+        sample_filters=sample_filters,
+        progress_label='Reading sample file',
+    )
+
+    if explicit_sample_map:
+        pass
+    elif config.get('sample_x_col') and config.get('sample_y_col') and config.get('sample_z_col') and config.get('sample_value_col'):
+        df_samples = df_samples.rename(columns={
+            config.get('sample_x_col'): 'x',
+            config.get('sample_y_col'): 'y',
+            config.get('sample_z_col'): 'z',
+            config.get('sample_value_col'): 'Value',
+        })
+
+    sample_coord_frame = df_samples[['x', 'y', 'z']].apply(pd.to_numeric, errors='coerce')
+    sample_values_series = pd.to_numeric(df_samples['Value'], errors='coerce')
+    sample_valid_mask = sample_coord_frame.notna().all(axis=1) & sample_values_series.notna()
+    sample_points = sample_coord_frame.loc[sample_valid_mask].to_numpy(dtype=np.float32, copy=False)
+    sample_values = sample_values_series.loc[sample_valid_mask].to_numpy(dtype=np.float32, copy=False)
+    sample_domains = None
+    if 'Domain' in df_samples.columns:
+        sample_domains = df_samples.loc[sample_valid_mask, 'Domain'].astype(str).to_numpy(dtype=object, copy=False)
+
+    df_blocks = read_autodetect_csv(
+        interpolation_file,
+        progress_label='Reading interpolation file',
+    )
+    required_columns = {'x', 'y', 'z', 'Value'}
+    missing_columns = [column for column in required_columns if column not in df_blocks.columns]
+    if missing_columns:
+        raise ValueError(
+            f"Interpolation file is missing required columns: {', '.join(missing_columns)}"
+        )
+
+    block_coord_frame = df_blocks[['x', 'y', 'z']].apply(pd.to_numeric, errors='coerce')
+    block_values_series = pd.to_numeric(df_blocks['Value'], errors='coerce')
+    block_valid_mask = block_coord_frame.notna().all(axis=1) & block_values_series.notna()
+    df_blocks = df_blocks.loc[block_valid_mask].copy()
+    block_points = block_coord_frame.loc[block_valid_mask].to_numpy(dtype=np.float32, copy=False)
+    block_values = block_values_series.loc[block_valid_mask].to_numpy(dtype=np.float32, copy=False)
+
+    sample_row_mask = np.zeros(len(df_blocks), dtype=bool)
+    if 'Is_Sample' in df_blocks.columns:
+        sample_tokens = df_blocks['Is_Sample'].astype(str).str.strip().str.lower()
+        sample_row_mask = sample_tokens.isin({'true', '1', 'yes'}).to_numpy(dtype=bool, copy=False)
+
+    block_positions = {
+        tuple(point.astype(np.float32)): float(value)
+        for point, value in zip(block_points, block_values)
+    }
+    block_domains = {}
+    if 'Domain' in df_blocks.columns:
+        for point, domain in zip(block_points, df_blocks['Domain'].fillna('Undomained').astype(str)):
+            block_domains[tuple(point.astype(np.float32))] = str(domain).strip() or 'Undomained'
+
+    sample_block_values = {
+        tuple(point.astype(np.float32)): float(value)
+        for point, value, is_sample in zip(block_points, block_values, sample_row_mask)
+        if is_sample
+    }
+
+    class SimpleBlocks:
+        pass
+
+    class StaticInterpolator:
+        def __init__(self, values, domains):
+            self._values = values
+            self.domain_mapping = domains
+            self.interpolation_target = 'value'
+
+        def get_interpolated_values(self):
+            return self._values
+
+        def run_iteration(self, dims):
+            return False
+
+        def is_converged(self):
+            return True
+
+    blocks_data = SimpleBlocks()
+    blocks_data._sample_blocks = sample_block_values
+    blocks_data._block_info = {
+        'min_bounds': np.min(block_points, axis=0) if len(block_points) else (np.min(sample_points, axis=0) if len(sample_points) else np.zeros(3, dtype=np.float32)),
+        'block_size': list(config['block_size']),
+        'domain_mapping': block_domains,
+        'positions_are_world': True,
+    }
+    blocks_data._ant_colony = StaticInterpolator(block_positions, block_domains)
+
+    lfc_colormap, lfc_bins, lfc_labels = load_lfc_colormap(config.get('color_file'))
+    lfc_colors = [tuple(map(float, color)) for color in getattr(lfc_colormap, 'colors', [])]
+    tick_labels = lfc_labels or taichi_runtime.build_lfc_tick_labels(lfc_colors, lfc_bins)
+
+    return {
+        'sample_points': np.asarray(sample_points, dtype=np.float32),
+        'sample_values': np.asarray(sample_values, dtype=np.float32),
+        'sample_domains': None if sample_domains is None else np.asarray(sample_domains, dtype=object),
+        'blocks_data': blocks_data,
         'block_size': config['block_size'],
         'value_filter': config.get('value_filter', 0.0),
         'lfc_colors': lfc_colors,
@@ -7104,6 +7314,7 @@ if __name__ == "__main__":
             super().__init__()
             self.should_visualize = True
             self.viewer_backend = 'taichi'
+            self._prefer_interpolation_file_for_viewer = False
             self._domain_catalog_cache = None
             self._viewer_process = None
             self._viewer_config_path = None
@@ -8388,6 +8599,8 @@ if __name__ == "__main__":
                     'signature': dict(self._domain_catalog_cache.get('signature', {})),
                     'domains': list(self._domain_catalog_cache.get('domains', [])),
                 }
+            if include_runtime_state:
+                config['_prefer_interpolation_file_for_viewer'] = bool(self._prefer_interpolation_file_for_viewer)
             return config
 
         def from_dict(self, config):
@@ -9594,14 +9807,13 @@ if __name__ == "__main__":
                         interp1 = interpolator_list[0]
                         algo_name1 = interp1.get_algorithm_name()
                         print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 1 ({algo_name1}) ===")
-                        
-                        print(f"Running {algo_name1} for {iterations} iterations...")
-                        pbar = tqdm(range(iterations), desc=f"Domain {domain} - Pass 1")
-                        for i in pbar:
-                            should_continue = interp1.run_iteration(dims)
-                            if not should_continue or interp1.is_converged():
-                                print(f"Pass 1 converged at iteration {i+1}")
-                                break
+
+                        _run_interpolator_with_progress(
+                            interp1,
+                            dims,
+                            iterations,
+                            f"Domain {domain} - Pass 1",
+                        )
                         
                         # Generate stats for Pass 1 if String Theory
                         output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
@@ -9621,24 +9833,31 @@ if __name__ == "__main__":
                             # Re-initialize Pass 2 with merged samples
                             min_bounds = blocks._block_info['min_bounds']
                             block_size = blocks._block_info['block_size']
+                            pass1_domain_mapping = {pos: domain for pos in pass1_values}
                             
                             # Determine if we should enforce domain mapping/grid restriction
                             use_mapping = False
                             if hasattr(interp2, 'allowed_grid_override') and interp2.allowed_grid_override is not None:
                                 use_mapping = True
                             
-                            interp2.initialize_blocks(pass1_values, dims, min_bounds, block_size, use_domain_mapping=use_mapping)
+                            interp2.initialize_blocks(
+                                pass1_values,
+                                dims,
+                                min_bounds,
+                                block_size,
+                                use_domain_mapping=use_mapping,
+                                sample_domain_mapping=pass1_domain_mapping,
+                            )
                             
                             if hasattr(interp2, 'create_ants'):
                                 interp2.create_ants()
-                            
-                            print(f"Running {algo_name2} for {iterations} iterations...")
-                            pbar = tqdm(range(iterations), desc=f"Domain {domain} - Pass 2")
-                            for i in pbar:
-                                should_continue = interp2.run_iteration(dims)
-                                if not should_continue or interp2.is_converged():
-                                    print(f"Pass 2 converged at iteration {i+1}")
-                                    break
+
+                            _run_interpolator_with_progress(
+                                interp2,
+                                dims,
+                                iterations,
+                                f"Domain {domain} - Pass 2",
+                            )
                             
                             # Generate stats for Pass 2 if String Theory
                             output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
@@ -9656,14 +9875,13 @@ if __name__ == "__main__":
                     # Single interpolator case
                     interpolator = blocks._ant_colony
                     algo_name = interpolator.get_algorithm_name()
-                    print(f"Running {algo_name} for {iterations} iterations...")
-                    
-                    pbar = tqdm(range(iterations), desc=f"Interpolation ({algo_name})")
-                    for i in pbar:
-                        should_continue = interpolator.run_iteration(dims)
-                        if not should_continue or interpolator.is_converged():
-                            print(f"Converged at iteration {i+1}")
-                            break
+
+                    _run_interpolator_with_progress(
+                        interpolator,
+                        dims,
+                        iterations,
+                        f"Interpolation ({algo_name})",
+                    )
                     
                     metadata = interpolator.get_metadata()
                     print(f"\n=== Summary ===")
@@ -9683,6 +9901,7 @@ if __name__ == "__main__":
                 if block_evaluated_samples_file:
                     print(f"Block-evaluated samples saved to:\n  {block_evaluated_samples_file}")
                 print("=" * 60)
+                self._prefer_interpolation_file_for_viewer = True
                 
                 success_lines = [f"Interpolation complete!\nResults saved to:\n{interpolation_file}"]
                 if block_evaluated_samples_file:

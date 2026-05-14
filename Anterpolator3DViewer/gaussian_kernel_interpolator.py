@@ -33,6 +33,8 @@ class GaussianKernelInterpolator(InterpolatorBase):
         self.sample_values = None
         self.sample_domains: Dict[Tuple[int, int, int], str] = {}
         self.sample_tree: cKDTree | None = None
+        self.progress_callback = None
+        self.progress_update_stride = 512
         self._ran = False
 
     def get_algorithm_name(self) -> str:
@@ -102,20 +104,27 @@ class GaussianKernelInterpolator(InterpolatorBase):
 
         search_radius = self.bandwidth * self.cutoff_sigma
         domain_mapping = getattr(self, 'domain_mapping', None) or {}
+        total_positions = self._count_positions(positions)
+        processed_positions = 0
+        last_reported = 0
 
         for pos in positions:
+            processed_positions += 1
             if pos in self.blocks:
+                last_reported = self._maybe_report_progress(processed_positions, total_positions, last_reported)
                 continue
 
             target_domain = None
             if self.use_domain_mapping:
                 target_domain = str(domain_mapping.get(pos, '')).strip() or None
                 if target_domain is None and not self.fill_background:
+                    last_reported = self._maybe_report_progress(processed_positions, total_positions, last_reported)
                     continue
 
             value = self._interpolate_position(pos, search_radius, target_domain)
             if value is None:
                 if not self.fill_background or self.background_value is None:
+                    last_reported = self._maybe_report_progress(processed_positions, total_positions, last_reported)
                     continue
                 value = self.background_value
 
@@ -127,8 +136,29 @@ class GaussianKernelInterpolator(InterpolatorBase):
             if target_domain is not None:
                 block_data['domain'] = target_domain
             self.blocks[pos] = block_data
+            last_reported = self._maybe_report_progress(processed_positions, total_positions, last_reported)
+
+        self._report_progress(total_positions, total_positions)
 
         return False
+
+    def _count_positions(self, positions) -> int:
+        if hasattr(positions, '__len__'):
+            return len(positions)
+        return int(self.dims[0]) * int(self.dims[1]) * int(self.dims[2])
+
+    def _maybe_report_progress(self, processed_positions: int, total_positions: int, last_reported: int) -> int:
+        stride = max(int(getattr(self, 'progress_update_stride', 512) or 512), 1)
+        if processed_positions >= total_positions or (processed_positions - last_reported) >= stride:
+            self._report_progress(processed_positions, total_positions)
+            return processed_positions
+        return last_reported
+
+    def _report_progress(self, processed_positions: int, total_positions: int) -> None:
+        callback = getattr(self, 'progress_callback', None)
+        if callback is None:
+            return
+        callback(processed_positions, total_positions, max(len(self.blocks) - len(self.sample_blocks), 0))
 
     def _interpolate_position(self, pos: Tuple[int, int, int], search_radius: float, target_domain: str | None) -> float | None:
         if self.sample_tree is None:
