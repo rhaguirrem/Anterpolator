@@ -1254,20 +1254,24 @@ def _collect_same_level_vectors(points, max_points=4096, max_points_per_level=25
 
     points = np.asarray(points, dtype=float)
 
-    if len(points) > max_points:
-        sample_indices = np.linspace(0, len(points) - 1, num=max_points, dtype=int)
-        sampled = points[sample_indices]
-    else:
-        sampled = points
-
-    z_keys = np.round(sampled[:, 2], decimals=6)
-    _, inverse = np.unique(z_keys, return_inverse=True)
+    z_keys = np.round(points[:, 2], decimals=6)
+    unique_levels, inverse = np.unique(z_keys, return_inverse=True)
     vectors = []
 
-    for level_idx in range(inverse.max() + 1 if len(inverse) else 0):
-        level_points = sampled[inverse == level_idx]
+    max_levels = max(1, max_points // max_points_per_level)
+    if len(unique_levels) <= max_levels:
+        selected_level_indices = np.arange(len(unique_levels), dtype=int)
+    else:
+        selected_level_indices = np.linspace(0, len(unique_levels) - 1, num=max_levels, dtype=int)
+        selected_level_indices = np.unique(selected_level_indices)
+
+    for level_idx in selected_level_indices:
+        level_points = points[inverse == level_idx]
         if len(level_points) < 2:
             continue
+
+        order = np.lexsort((level_points[:, 1], level_points[:, 0]))
+        level_points = level_points[order]
 
         if len(level_points) > max_points_per_level:
             level_points = level_points[:max_points_per_level]
@@ -1353,6 +1357,12 @@ def detect_grid_rotation(points, block_size_hint=None, sample_size=50000):
         hist, bin_edges = np.histogram(norms, bins=50)
         peak_idx = np.argmax(hist)
         auto_length = (bin_edges[peak_idx] + bin_edges[peak_idx+1]) / 2
+        if target_length and auto_length > (target_length * 1.5):
+            print(
+                "Auto-detected fallback length is much larger than the provided block size hint; "
+                "treating rotation estimate as unreliable and skipping rotation correction."
+            )
+            return np.eye(3), np.zeros(3), False
         valid_mask = np.abs(norms - auto_length) < (auto_length * 0.1)
         grid_vectors = vectors[valid_mask]
         print(f"Fallback auto-detected length: {auto_length}")
@@ -1381,15 +1391,19 @@ def detect_grid_rotation(points, block_size_hint=None, sample_size=50000):
     
     # Determine actual Azimuth
     candidates = [grid_offset, grid_offset+90, grid_offset+180, grid_offset+270]
+    axis_match_tolerance_deg = 5.0
     
     best_y_angle = None
     
     for cand in candidates:
         cand_norm = cand % 360
-        # Count vectors close to this angle
+        # Count vectors close to this axis in either direction.
         diff = np.abs(angles_deg - cand_norm)
         diff = np.minimum(diff, 360 - diff)
-        count = np.sum(diff < 5.0) # within 5 degrees
+        opposite_angle = (cand_norm + 180) % 360
+        diff_opposite = np.abs(angles_deg - opposite_angle)
+        diff_opposite = np.minimum(diff_opposite, 360 - diff_opposite)
+        count = np.sum((diff < axis_match_tolerance_deg) | (diff_opposite < axis_match_tolerance_deg))
         
         dist_to_north = abs(cand_norm - 90)
         if dist_to_north > 180: dist_to_north = 360 - dist_to_north
@@ -1424,9 +1438,22 @@ def detect_grid_rotation(points, block_size_hint=None, sample_size=50000):
     z_axis = np.array([0, 0, 1])
     
     rotation_matrix = np.vstack([x_axis, y_axis, z_axis])
+
+    aligned_diff = np.abs(angles_deg - best_y_angle)
+    aligned_diff = np.minimum(aligned_diff, 360 - aligned_diff)
+    opposite_aligned_diff = np.abs(angles_deg - ((best_y_angle + 180) % 360))
+    opposite_aligned_diff = np.minimum(opposite_aligned_diff, 360 - opposite_aligned_diff)
+    aligned_count = np.sum((aligned_diff < axis_match_tolerance_deg) | (opposite_aligned_diff < axis_match_tolerance_deg))
+    alignment_ratio = aligned_count / float(len(grid_vectors))
+
+    normalized_theta = ((theta_deg + 180.0) % 360.0) - 180.0
+    min_significant_rotation_deg = 3.0
+    min_axis_alignment_ratio = 0.10
     
     # Check significance
-    if abs(theta_deg % 360) < 1.0 or abs(theta_deg % 360) > 359.0:
+    if abs(normalized_theta) < min_significant_rotation_deg:
+        return np.eye(3), np.zeros(3), False
+    if alignment_ratio < min_axis_alignment_ratio:
         return np.eye(3), np.zeros(3), False
         
     center = np.mean(points, axis=0)
@@ -5454,6 +5481,15 @@ def _build_base_block_export_dataframe(block_rows):
     return pd.DataFrame([{k: v for k, v in row.items() if k != '_Grid_Index'} for row in block_rows])
 
 
+def _build_export_block_row_lookup(block_rows):
+    export_columns = list(_build_base_block_export_dataframe(block_rows).columns)
+    export_lookup = {}
+    for row in block_rows:
+        grid_index = tuple(row['_Grid_Index'])
+        export_lookup[grid_index] = {k: v for k, v in row.items() if k != '_Grid_Index'}
+    return export_lookup, export_columns
+
+
 def _expand_export_block_rows_to_source_rows(block_rows, source_blocks_df, block_x_col, block_y_col, block_z_col,
                                              min_bounds, block_size, rotation_matrix=None, rotation_center=None):
     export_df = _build_base_block_export_dataframe(block_rows)
@@ -5479,6 +5515,140 @@ def _expand_export_block_rows_to_source_rows(block_rows, source_blocks_df, block
     expanded_df['z'] = source_blocks_df[block_z_col].to_numpy(copy=False)
 
     return expanded_df.drop(columns=['_Grid_Index'])
+
+
+def _expand_export_chunk_rows_to_source_rows(source_blocks_df, export_lookup, export_columns,
+                                             block_x_col, block_y_col, block_z_col,
+                                             min_bounds, block_size,
+                                             rotation_matrix=None, rotation_center=None):
+    expanded_records = [{} for _ in range(len(source_blocks_df))]
+
+    coord_frame = source_blocks_df[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
+    valid_mask = coord_frame.notna().all(axis=1)
+    valid_positions = np.flatnonzero(valid_mask.to_numpy())
+
+    if len(valid_positions):
+        valid_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
+        if rotation_matrix is not None and rotation_center is not None:
+            valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
+        block_indices = np.floor(
+            (valid_coords - np.asarray(min_bounds, dtype=float)) / np.asarray(block_size, dtype=float) + 1e-6
+        ).astype(int)
+        for row_position, block_index in zip(valid_positions, block_indices):
+            expanded_records[row_position] = export_lookup.get(tuple(int(v) for v in block_index), {})
+
+    expanded_df = pd.DataFrame.from_records(expanded_records, columns=export_columns)
+    expanded_df['x'] = source_blocks_df[block_x_col].to_numpy(copy=False)
+    expanded_df['y'] = source_blocks_df[block_y_col].to_numpy(copy=False)
+    expanded_df['z'] = source_blocks_df[block_z_col].to_numpy(copy=False)
+    return expanded_df
+
+
+def _iter_expanded_export_block_chunks(block_rows, source_blocks_file, blocks_delimiter=None,
+                                       blocks_header_line=1, block_filters=None,
+                                       block_x_col=None, block_y_col=None, block_z_col=None,
+                                       min_bounds=None, block_size=None,
+                                       rotation_matrix=None, rotation_center=None,
+                                       progress_label='Reading source blocks for export expansion',
+                                       chunksize=250_000):
+    delimiter = blocks_delimiter or detect_csv_delimiter(source_blocks_file)
+    header_line = max(int(blocks_header_line or 1), 1)
+    headers = parse_header_line(source_blocks_file, delimiter, header_line)
+    final_names = build_unique_column_names(headers)
+    block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
+        final_names,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+    )
+    selected_columns = list(dict.fromkeys([
+        block_x_col,
+        block_y_col,
+        block_z_col,
+        *collect_filter_fields(block_filters or []),
+    ]))
+    read_kwargs = dict(
+        delimiter=delimiter,
+        header=None,
+        names=final_names,
+        skiprows=header_line,
+        comment='#',
+        usecols=selected_columns,
+        chunksize=chunksize,
+    )
+    export_lookup, export_columns = _build_export_block_row_lookup(block_rows)
+
+    for chunk_number, chunk in enumerate(
+        iterate_csv_with_progress(source_blocks_file, progress_label, **read_kwargs),
+        start=1,
+    ):
+        chunk = strip_leading_non_data_rows(chunk)
+        if block_filters:
+            chunk, _ = apply_dataframe_filters(
+                chunk,
+                filters=block_filters,
+                filter_subject='block',
+                source_label=f'blocks file chunk {chunk_number:,}',
+                emit_logs=False,
+            )
+        if chunk.empty:
+            continue
+        yield _expand_export_chunk_rows_to_source_rows(
+            chunk,
+            export_lookup,
+            export_columns,
+            block_x_col,
+            block_y_col,
+            block_z_col,
+            min_bounds,
+            block_size,
+            rotation_matrix=rotation_matrix,
+            rotation_center=rotation_center,
+        )
+
+
+def _write_expanded_export_blocks_to_csv(block_rows, block_info, filepath):
+    source_blocks_file = str(block_info.get('source_blocks_file') or '').strip()
+    total_rows_written = 0
+    wrote_header = False
+
+    print(f"Streaming expanded export rows from {os.path.basename(source_blocks_file)}...")
+
+    for chunk_number, expanded_chunk in enumerate(
+        _iter_expanded_export_block_chunks(
+            block_rows,
+            source_blocks_file,
+            blocks_delimiter=block_info.get('source_blocks_delimiter'),
+            blocks_header_line=block_info.get('source_blocks_header_line', 1),
+            block_filters=block_info.get('source_block_filters'),
+            block_x_col=block_info.get('source_block_x_col'),
+            block_y_col=block_info.get('source_block_y_col'),
+            block_z_col=block_info.get('source_block_z_col'),
+            min_bounds=block_info['min_bounds'],
+            block_size=block_info['block_size'],
+            rotation_matrix=block_info.get('rotation_matrix'),
+            rotation_center=block_info.get('rotation_center'),
+        ),
+        start=1,
+    ):
+        expanded_chunk.to_csv(filepath, index=False, mode='w' if not wrote_header else 'a', header=not wrote_header)
+        wrote_header = True
+        total_rows_written += len(expanded_chunk)
+        if chunk_number == 1 or chunk_number % 10 == 0:
+            print(
+                f"Expanded export chunk {chunk_number:,}: wrote {len(expanded_chunk):,} rows "
+                f"({total_rows_written:,} total)."
+            )
+
+    if not wrote_header:
+        empty_columns = list(_build_base_block_export_dataframe(block_rows).columns)
+        pd.DataFrame(columns=empty_columns).to_csv(filepath, index=False)
+
+    print(
+        f"Expanded {len(block_rows):,} base-block export rows to {total_rows_written:,} source block rows "
+        f"from {os.path.basename(source_blocks_file)}."
+    )
+    return total_rows_written
 
 
 def _build_export_blocks_dataframe(blocks, block_rows):
@@ -5536,6 +5706,21 @@ def export_blocks_to_csv(blocks, filepath):
 
     print(f"Exporting blocks to {filepath}...")
     data = _collect_export_block_data(blocks)
+    block_info = getattr(blocks, '_block_info', {}) or {}
+    source_blocks_file = str(block_info.get('source_blocks_file') or '').strip()
+    should_stream_expanded_export = (
+        bool(data)
+        and block_info.get('expand_interpolation_exports_to_subblocks', False)
+        and source_blocks_file
+        and os.path.isfile(source_blocks_file)
+        and os.path.getsize(source_blocks_file) >= LARGE_BLOCK_FILE_THRESHOLD
+    )
+
+    if should_stream_expanded_export:
+        rows_written = _write_expanded_export_blocks_to_csv(data, block_info, filepath)
+        print(f"Exported {rows_written:,} rows to {filepath}")
+        return
+
     df = _build_export_blocks_dataframe(blocks, data)
     df.to_csv(filepath, index=False)
     print(f"Exported {len(df):,} rows to {filepath}")
@@ -7537,8 +7722,20 @@ if __name__ == "__main__":
             self.block_x = QtWidgets.QSpinBox(); self.block_x.setRange(1, 10000); self.block_x.setValue(10)
             self.block_y = QtWidgets.QSpinBox(); self.block_y.setRange(1, 10000); self.block_y.setValue(10)
             self.block_z = QtWidgets.QSpinBox(); self.block_z.setRange(1, 10000); self.block_z.setValue(10)
+            block_size_tooltip = (
+                'Set base block dimensions (x, y, z).\n'
+                'You can change these values to override the implicit\n'
+                'resolution in the source blocks file, or to\n'
+                'explicitly confirm the base-block resolution\n'
+                'defined by that file.'
+            )
+            self.block_x.setToolTip(block_size_tooltip)
+            self.block_y.setToolTip(block_size_tooltip)
+            self.block_z.setToolTip(block_size_tooltip)
             bx_layout = QtWidgets.QHBoxLayout(); bx_layout.addWidget(self.block_x); bx_layout.addWidget(self.block_y); bx_layout.addWidget(self.block_z)
-            files_form.addRow('Block Size (x,y,z)', bx_layout)
+            block_size_label = QtWidgets.QLabel('Block Size (x,y,z)')
+            block_size_label.setToolTip(block_size_tooltip)
+            files_form.addRow(block_size_label, bx_layout)
 
             def refresh_sample_columns():
                 path = self.samples_edit.text().strip()

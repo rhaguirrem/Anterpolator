@@ -21,6 +21,7 @@ from anterpolator3DViewer import (
     create_blocks,
     detect_grid_rotation,
     ensure_sample_domains_for_domain_operations,
+    export_blocks_to_csv,
     export_block_volume_weighted_average,
     export_block_domain_sample_metrics,
     export_domain_interpolation_confidence_metrics,
@@ -932,6 +933,157 @@ def test_build_export_blocks_dataframe_keeps_empty_interpolation_export_empty():
         assert list(output_df.columns) == []
 
 
+def test_export_blocks_to_csv_streams_large_subblock_expansion(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        output_path = os.path.join(td, "expanded.csv")
+        pd.DataFrame(
+            [
+                {"x": 2.5, "y": 5.0, "z": 5.0},
+                {"x": 7.5, "y": 5.0, "z": 5.0},
+                {"x": 12.5, "y": 5.0, "z": 5.0},
+                {"x": 17.5, "y": 5.0, "z": 5.0},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        progress_labels = []
+
+        def _fake_iterate_csv_with_progress(path, progress_label, progress_callback=None, **read_csv_kwargs):
+            progress_labels.append(progress_label)
+            yield from pd.read_csv(path, **read_csv_kwargs)
+
+        monkeypatch.setattr(viewer_module, "iterate_csv_with_progress", _fake_iterate_csv_with_progress)
+        monkeypatch.setattr(viewer_module, "LARGE_BLOCK_FILE_THRESHOLD", 1)
+
+        class FakeBlocks:
+            pass
+
+        fake_blocks = FakeBlocks()
+        fake_blocks._block_info = {
+            "min_bounds": [0.0, 0.0, 0.0],
+            "block_size": [10.0, 10.0, 10.0],
+            "rotation_matrix": None,
+            "rotation_center": None,
+            "source_blocks_file": blocks_path,
+            "source_blocks_delimiter": ",",
+            "source_blocks_header_line": 1,
+            "source_block_x_col": "x",
+            "source_block_y_col": "y",
+            "source_block_z_col": "z",
+            "source_block_filters": [],
+            "expand_interpolation_exports_to_subblocks": True,
+        }
+        fake_blocks._ant_colony = type("FakeInterpolator", (), {"blocks": {}})()
+
+        original_collect = viewer_module._collect_export_block_data
+        monkeypatch.setattr(
+            viewer_module,
+            "_collect_export_block_data",
+            lambda blocks: [
+                {
+                    "_Grid_Index": (0, 0, 0),
+                    "x": 0.0,
+                    "y": 5.0,
+                    "z": 5.0,
+                    "Value": 10.0,
+                    "Domain": "A",
+                    "Source": "First Pass",
+                },
+                {
+                    "_Grid_Index": (1, 0, 0),
+                    "x": 10.0,
+                    "y": 5.0,
+                    "z": 5.0,
+                    "Value": 20.0,
+                    "Domain": "B",
+                    "Source": "First Pass",
+                },
+            ],
+        )
+
+        try:
+            export_blocks_to_csv(fake_blocks, output_path)
+        finally:
+            monkeypatch.setattr(viewer_module, "_collect_export_block_data", original_collect)
+
+        output_df = pd.read_csv(output_path)
+
+        assert progress_labels == ["Reading source blocks for export expansion"]
+        assert len(output_df) == 4
+        assert output_df["x"].tolist() == [2.5, 7.5, 12.5, 17.5]
+        assert output_df["Value"].tolist() == [10.0, 10.0, 20.0, 20.0]
+        assert output_df["Domain"].tolist() == ["A", "A", "B", "B"]
+
+
+def test_export_blocks_to_csv_streaming_leaves_unmatched_rows_blank(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        output_path = os.path.join(td, "expanded.csv")
+        pd.DataFrame(
+            [
+                {"x": 2.5, "y": 5.0, "z": 5.0},
+                {"x": 7.5, "y": 5.0, "z": 5.0},
+                {"x": 45.0, "y": 5.0, "z": 5.0},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        def _fake_iterate_csv_with_progress(path, progress_label, progress_callback=None, **read_csv_kwargs):
+            yield from pd.read_csv(path, **read_csv_kwargs)
+
+        monkeypatch.setattr(viewer_module, "iterate_csv_with_progress", _fake_iterate_csv_with_progress)
+        monkeypatch.setattr(viewer_module, "LARGE_BLOCK_FILE_THRESHOLD", 1)
+
+        class FakeBlocks:
+            pass
+
+        fake_blocks = FakeBlocks()
+        fake_blocks._block_info = {
+            "min_bounds": [0.0, 0.0, 0.0],
+            "block_size": [10.0, 10.0, 10.0],
+            "rotation_matrix": None,
+            "rotation_center": None,
+            "source_blocks_file": blocks_path,
+            "source_blocks_delimiter": ",",
+            "source_blocks_header_line": 1,
+            "source_block_x_col": "x",
+            "source_block_y_col": "y",
+            "source_block_z_col": "z",
+            "source_block_filters": [],
+            "expand_interpolation_exports_to_subblocks": True,
+        }
+        fake_blocks._ant_colony = type("FakeInterpolator", (), {"blocks": {}})()
+
+        original_collect = viewer_module._collect_export_block_data
+        monkeypatch.setattr(
+            viewer_module,
+            "_collect_export_block_data",
+            lambda blocks: [
+                {
+                    "_Grid_Index": (0, 0, 0),
+                    "x": 0.0,
+                    "y": 5.0,
+                    "z": 5.0,
+                    "Value": 10.0,
+                    "Domain": "A",
+                    "Source": "First Pass",
+                },
+            ],
+        )
+
+        try:
+            export_blocks_to_csv(fake_blocks, output_path)
+        finally:
+            monkeypatch.setattr(viewer_module, "_collect_export_block_data", original_collect)
+
+        output_df = pd.read_csv(output_path)
+
+        assert len(output_df) == 3
+        assert output_df["x"].tolist() == [2.5, 7.5, 45.0]
+        assert output_df["Value"].tolist()[:2] == [10.0, 10.0]
+        assert pd.isna(output_df.loc[2, "Value"])
+        assert pd.isna(output_df.loc[2, "Domain"])
+
+
 def test_export_block_volume_weighted_average_can_compute_domain_sensitive_summaries():
     with tempfile.TemporaryDirectory() as td:
         blocks_path = os.path.join(td, "blocks.csv")
@@ -1092,6 +1244,62 @@ def test_detect_grid_rotation_accepts_integer_points():
         [20, 0, 0],
         [20, 10, 0],
     ]
+
+    rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(points, block_size_hint=(10, 10, 10))
+
+    assert rotation_matrix.shape == (3, 3)
+    assert rotation_center.shape == (3,)
+    assert bool(is_rotated) is False
+
+
+def test_detect_grid_rotation_ignores_small_jitter_on_axis_aligned_grid():
+    rng = np.random.default_rng(2)
+    xs = np.arange(0, 16) * 10.0
+    ys = np.arange(0, 16) * 10.0
+    zs = np.array([0.0, 10.0])
+    points = np.array([(x, y, z) for z in zs for y in ys for x in xs], dtype=float)
+    points[:, :2] += rng.normal(0.0, 0.6, size=points[:, :2].shape)
+
+    rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(points, block_size_hint=(10, 10, 10))
+
+    assert rotation_matrix.shape == (3, 3)
+    assert rotation_center.shape == (3,)
+    assert bool(is_rotated) is False
+
+
+def test_detect_grid_rotation_detects_clear_rotation_with_noise():
+    rng = np.random.default_rng(7)
+    xs = np.arange(0, 16) * 10.0
+    ys = np.arange(0, 16) * 10.0
+    zs = np.array([0.0, 10.0])
+    points = np.array([(x, y, z) for z in zs for y in ys for x in xs], dtype=float)
+
+    angle_deg = 8.0
+    theta = np.radians(angle_deg)
+    rotation = np.array(
+        [
+            [np.cos(theta), -np.sin(theta)],
+            [np.sin(theta), np.cos(theta)],
+        ],
+        dtype=float,
+    )
+    center_xy = points[:, :2].mean(axis=0)
+    points[:, :2] = (points[:, :2] - center_xy) @ rotation.T + center_xy
+    points[:, :2] += rng.normal(0.0, 0.35, size=points[:, :2].shape)
+
+    rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(points, block_size_hint=(10, 10, 10))
+
+    assert rotation_matrix.shape == (3, 3)
+    assert rotation_center.shape == (3,)
+    assert bool(is_rotated) is True
+
+
+def test_detect_grid_rotation_large_unrotated_grid_does_not_trust_oversized_fallback_length():
+    nx, ny, nz = 100, 100, 25
+    xs = np.arange(nx, dtype=float) * 10.0
+    ys = np.arange(ny, dtype=float) * 10.0
+    zs = np.arange(nz, dtype=float) * 10.0
+    points = np.array([(x, y, z) for z in zs for y in ys for x in xs], dtype=float)
 
     rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(points, block_size_hint=(10, 10, 10))
 

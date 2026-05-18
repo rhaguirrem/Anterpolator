@@ -1,0 +1,34 @@
+{
+  "input_csv": "tmp_tbms_grid.csv",
+  "output_bmf": "tmp_tbms_grid.bmf",
+  "backend": "tbms-experimental",
+  "rows": 4,
+  "value_columns": [
+    "grade",
+    "domain"
+  ],
+  "grid": {
+    "origin": [
+      0.0,
+      0.0,
+      4.5
+    ],
+    "cell_size": [
+      10.0,
+      10.0,
+      1.0
+    ],
+    "dimensions": [
+      2,
+      2,
+      1
+    ],
+    "extents": [
+      20.0,
+      20.0,
+      1.0
+    ],
+    "duplicate_grid_rows": 0,
+    "max_index_error": 0.0
+  }
+}
