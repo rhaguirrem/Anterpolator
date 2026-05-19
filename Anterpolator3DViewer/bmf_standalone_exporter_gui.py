@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone GUI for experimental BMF export and browsing."""
+"""Standalone GUI for BMF export and browsing."""
 
 from __future__ import annotations
 
@@ -144,8 +144,8 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         options_group = QtWidgets.QGroupBox("Export Options")
         options_form = QtWidgets.QFormLayout(options_group)
         self.backend_combo = QtWidgets.QComboBox()
-        self.backend_combo.addItems(["tbms-experimental", "vulcan"])
-        self.backend_combo.setCurrentText("tbms-experimental")
+        self.backend_combo.addItems(["tbms-config-text", "tbms-experimental", "vulcan"])
+        self.backend_combo.setCurrentText("tbms-config-text")
         self.x_col_edit = QtWidgets.QLineEdit("x")
         self.y_col_edit = QtWidgets.QLineEdit("y")
         self.z_col_edit = QtWidgets.QLineEdit("z")
@@ -400,6 +400,8 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Recognized TBMS binary-page variant")
         elif result.get("reader_mode") == "tbms-binary-flat-roots":
             self.statusBar().showMessage("Loaded TBMS flat-root binary pages")
+        elif result.get("reader_mode") == "tbms-string-pages":
+            self.statusBar().showMessage("Loaded TBMS text-assignment pages")
         else:
             self.statusBar().showMessage("BMF loaded")
 

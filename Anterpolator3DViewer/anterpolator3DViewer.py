@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import csv
+import ast
 import atexit
 import signal
 from collections import Counter
@@ -13,6 +14,7 @@ import subprocess
 import traceback
 import warnings
 import math
+import re
 from decimal import Decimal, InvalidOperation
 from tqdm import tqdm
 import sys
@@ -26,9 +28,11 @@ sys.path.append("C:/Projects/Anterpolator")
 
 pv = None
 taichi_runtime_module = None
+bmf_tools_module = None
 LARGE_BLOCK_FILE_THRESHOLD = 512 * 1024 * 1024
 INITIAL_BLOCK_RENDER_THRESHOLD = 5000
 INVALID_FILENAME_CHARS = str.maketrans({ch: '_' for ch in '<>:"/\\|?*'})
+_LOGGED_LEAPFROG_METADATA_SIGNATURES = set()
 
 
 def _require_pyvista():
@@ -53,6 +57,32 @@ def _load_taichi_runtime_module():
     spec.loader.exec_module(module)
     taichi_runtime_module = module
     return taichi_runtime_module
+
+
+def _get_bmf_tools_module():
+    global bmf_tools_module
+    if bmf_tools_module is None:
+        import bmf_standalone_exporter as _bmf_tools
+
+        bmf_tools_module = _bmf_tools
+    return bmf_tools_module
+
+
+def is_bmf_file(path):
+    return str(path or '').strip().lower().endswith('.bmf')
+
+
+def _load_bmf_dataframe(path, row_limit=None, progress_label=None, progress_callback=None):
+    label = str(progress_label or 'Reading BMF file').strip()
+    if progress_callback is not None:
+        progress_callback(0, 100, f'{label}...')
+    result = _get_bmf_tools_module().load_bmf_table(path, row_limit=row_limit)
+    df = result.get('dataframe', pd.DataFrame()).copy()
+    df._detected_delimiter = 'bmf'
+    df.attrs['bmf_result'] = result
+    if progress_callback is not None:
+        progress_callback(100, 100, f'{label} complete.')
+    return df, result
 
 
 def _normalize_viewer_backend(viewer_backend):
@@ -240,6 +270,12 @@ def parse_header_line(path, delimiter, line_number):
         raise ValueError(f"File not found: {path}")
     if line_number < 1:
         raise ValueError("Header line number must be >= 1")
+    if is_bmf_file(path):
+        df, _ = _load_bmf_dataframe(path, row_limit=1)
+        tokens = [str(column).strip() for column in df.columns if str(column).strip()]
+        if not tokens:
+            raise ValueError(f"BMF file '{os.path.basename(path)}' produced no columns.")
+        return tokens
     try:
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             for current, line in enumerate(f, start=1):
@@ -253,6 +289,231 @@ def parse_header_line(path, delimiter, line_number):
         raise ValueError(f"Header line {line_number} exceeds total lines in file '{os.path.basename(path)}'.")
     except UnicodeDecodeError:
         raise ValueError(f"Could not decode file '{path}' with utf-8 encoding.")
+
+
+def resolve_effective_csv_header_line(path, configured_line=1):
+    if is_bmf_file(path):
+        return 1
+    line_number = max(int(configured_line or 1), 1)
+    if not os.path.isfile(path):
+        raise ValueError(f"File not found: {path}")
+    with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
+        for current_line_number, line_text in enumerate(handle, start=1):
+            if current_line_number < line_number:
+                continue
+            stripped = line_text.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            if current_line_number != line_number:
+                print(
+                    f"Header line {line_number} in '{os.path.basename(path)}' is metadata/comment; "
+                    f"using first data header line {current_line_number}."
+                )
+            return current_line_number
+    raise ValueError(f"Could not find a non-comment CSV header line in '{os.path.basename(path)}'.")
+
+
+def parse_effective_header_line(path, delimiter, line_number):
+    metadata = parse_leapfrog_block_metadata(path)
+    log_leapfrog_metadata_summary(path, metadata, context='header scan')
+    return parse_header_line(path, delimiter, resolve_effective_csv_header_line(path, line_number))
+
+
+def _parse_metadata_numeric_values(text, numeric_type=float, stop_at_equals=False):
+    value_text = str(text or '')
+    if stop_at_equals:
+        value_text = value_text.split('=', 1)[0]
+    values = re.findall(r'[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?', value_text)
+    return [numeric_type(value) for value in values]
+
+
+def parse_leapfrog_block_metadata(path, max_lines=100):
+    if not path or is_bmf_file(path) or not os.path.isfile(path):
+        return {}
+
+    metadata = {}
+    raw_lines = []
+    with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
+        for line_number, line_text in enumerate(handle, start=1):
+            if line_number > max_lines:
+                break
+            stripped = line_text.strip()
+            if not stripped:
+                continue
+            if not stripped.startswith('#'):
+                break
+
+            content = stripped.lstrip('#').strip()
+            raw_lines.append(content)
+            if ':' not in content:
+                if 'title' not in metadata and content:
+                    metadata['title'] = content
+                continue
+
+            key, raw_value = content.split(':', 1)
+            normalized_key = re.sub(r'[^a-z0-9]+', '_', key.strip().lower()).strip('_')
+            value = raw_value.strip()
+
+            if normalized_key == 'encoding':
+                metadata['encoding'] = value
+            elif normalized_key == 'rotation_type':
+                metadata['rotation_type'] = value
+            elif normalized_key in {'azimuth', 'dip', 'pitch'}:
+                numbers = _parse_metadata_numeric_values(value)
+                if numbers:
+                    metadata[f'{normalized_key}_degrees'] = float(numbers[0])
+            elif normalized_key == 'parent_block_size':
+                numbers = _parse_metadata_numeric_values(value)
+                if len(numbers) >= 3:
+                    metadata['parent_block_size'] = [float(number) for number in numbers[:3]]
+            elif normalized_key == 'size_in_parent_blocks':
+                numbers = _parse_metadata_numeric_values(value, numeric_type=int, stop_at_equals=True)
+                if len(numbers) >= 3:
+                    metadata['size_in_parent_blocks'] = [int(number) for number in numbers[:3]]
+                total_values = _parse_metadata_numeric_values(value.split('=', 1)[1], numeric_type=int) if '=' in value else []
+                if total_values:
+                    metadata['parent_block_count'] = int(total_values[0])
+            elif normalized_key in {'minimum_parent_centroid', 'maximum_parent_centroid', 'minimum_corner', 'maximum_corner'}:
+                numbers = _parse_metadata_numeric_values(value)
+                if len(numbers) >= 3:
+                    metadata[normalized_key] = [float(number) for number in numbers[:3]]
+            elif normalized_key in {'sub_blocks', 'subblocks'}:
+                parts = value.split()
+                if parts:
+                    metadata['subblock_scheme'] = parts[0]
+                numbers = _parse_metadata_numeric_values(value, numeric_type=int)
+                if len(numbers) >= 3:
+                    metadata['subblock_factors'] = [int(number) for number in numbers[:3]]
+
+    if raw_lines:
+        metadata['raw_lines'] = raw_lines
+    return metadata
+
+
+def _format_metadata_vector(metadata, key):
+    values = metadata.get(key)
+    if not values:
+        return None
+    return '(' + ', '.join(f'{float(value):g}' for value in values) + ')'
+
+
+def log_leapfrog_metadata_summary(path, metadata, context=''):
+    if not metadata:
+        return
+
+    recognized_fields = [
+        key for key in (
+            'rotation_type',
+            'azimuth_degrees',
+            'dip_degrees',
+            'pitch_degrees',
+            'parent_block_size',
+            'size_in_parent_blocks',
+            'minimum_parent_centroid',
+            'maximum_parent_centroid',
+            'minimum_corner',
+            'maximum_corner',
+            'subblock_scheme',
+            'subblock_factors',
+        )
+        if key in metadata
+    ]
+    if not recognized_fields:
+        return
+
+    signature = (os.path.abspath(path), str(context or 'default'), tuple(recognized_fields))
+    if signature in _LOGGED_LEAPFROG_METADATA_SIGNATURES:
+        return
+    _LOGGED_LEAPFROG_METADATA_SIGNATURES.add(signature)
+
+    summary_parts = []
+    parent_size = _format_metadata_vector(metadata, 'parent_block_size')
+    if parent_size:
+        summary_parts.append(f'parent block size={parent_size}')
+    grid_size = metadata.get('size_in_parent_blocks')
+    if grid_size:
+        summary_parts.append(f'parent grid={tuple(int(value) for value in grid_size)}')
+    min_corner = _format_metadata_vector(metadata, 'minimum_corner')
+    if min_corner:
+        summary_parts.append(f'minimum corner={min_corner}')
+    min_centroid = _format_metadata_vector(metadata, 'minimum_parent_centroid')
+    if min_centroid:
+        summary_parts.append(f'minimum parent centroid={min_centroid}')
+    if any(key in metadata for key in ('azimuth_degrees', 'dip_degrees', 'pitch_degrees')):
+        summary_parts.append(
+            'rotation=(azimuth {azimuth:g}, dip {dip:g}, pitch {pitch:g})'.format(
+                azimuth=float(metadata.get('azimuth_degrees', 0.0) or 0.0),
+                dip=float(metadata.get('dip_degrees', 0.0) or 0.0),
+                pitch=float(metadata.get('pitch_degrees', 0.0) or 0.0),
+            )
+        )
+    subblock_factors = metadata.get('subblock_factors')
+    if subblock_factors:
+        scheme = metadata.get('subblock_scheme') or 'sub-blocks'
+        summary_parts.append(f'{scheme}={tuple(int(value) for value in subblock_factors)}')
+
+    label = f' ({context})' if context else ''
+    print(f"Recognized Leapfrog block metadata{label} in '{os.path.basename(path)}': " + '; '.join(summary_parts))
+
+
+def warn_leapfrog_metadata_mismatch(path, message):
+    warning_text = f"Leapfrog metadata mismatch in '{os.path.basename(path)}': {message}"
+    print(f"WARNING: {warning_text}")
+    warnings.warn(warning_text, RuntimeWarning, stacklevel=2)
+
+
+def validate_leapfrog_metadata_against_block_data(path, metadata, observed_min_bounds, observed_max_bounds,
+                                                   unified_dims, min_grid_index=None, max_grid_index=None):
+    if not metadata:
+        return
+
+    tolerance = 1e-6
+    observed_min_bounds = np.asarray(observed_min_bounds, dtype=float)
+    observed_max_bounds = np.asarray(observed_max_bounds, dtype=float)
+    unified_dims = np.asarray(unified_dims, dtype=float)
+
+    minimum_corner = np.asarray(metadata.get('minimum_corner', []), dtype=float)
+    maximum_corner = np.asarray(metadata.get('maximum_corner', []), dtype=float)
+    size_in_parent_blocks = np.asarray(metadata.get('size_in_parent_blocks', []), dtype=int)
+    minimum_parent_centroid = np.asarray(metadata.get('minimum_parent_centroid', []), dtype=float)
+
+    if minimum_corner.shape == (3,) and np.any(observed_min_bounds < minimum_corner - tolerance):
+        warn_leapfrog_metadata_mismatch(
+            path,
+            f"block coordinates extend below metadata minimum corner; data min={observed_min_bounds.tolist()}, "
+            f"metadata minimum corner={minimum_corner.tolist()}.",
+        )
+    if maximum_corner.shape == (3,) and np.any(observed_max_bounds > maximum_corner + tolerance):
+        warn_leapfrog_metadata_mismatch(
+            path,
+            f"block coordinates extend above metadata maximum corner; data max={observed_max_bounds.tolist()}, "
+            f"metadata maximum corner={maximum_corner.tolist()}.",
+        )
+    if minimum_corner.shape == (3,) and maximum_corner.shape == (3,) and size_in_parent_blocks.shape == (3,):
+        expected_maximum_corner = minimum_corner + size_in_parent_blocks.astype(float) * unified_dims
+        if not np.allclose(expected_maximum_corner, maximum_corner, atol=1e-6, rtol=0.0):
+            warn_leapfrog_metadata_mismatch(
+                path,
+                f"metadata maximum corner does not match minimum corner + parent grid size * block size; "
+                f"expected {expected_maximum_corner.tolist()}, metadata has {maximum_corner.tolist()}.",
+            )
+    if minimum_corner.shape == (3,) and minimum_parent_centroid.shape == (3,):
+        expected_minimum_centroid = minimum_corner + unified_dims / 2.0
+        if not np.allclose(expected_minimum_centroid, minimum_parent_centroid, atol=1e-6, rtol=0.0):
+            warn_leapfrog_metadata_mismatch(
+                path,
+                f"metadata minimum parent centroid does not match minimum corner + half block size; "
+                f"expected {expected_minimum_centroid.tolist()}, metadata has {minimum_parent_centroid.tolist()}.",
+            )
+    if size_in_parent_blocks.shape == (3,) and min_grid_index is not None and max_grid_index is not None:
+        min_grid_index = np.asarray(min_grid_index, dtype=int)
+        max_grid_index = np.asarray(max_grid_index, dtype=int)
+        if np.any(min_grid_index < 0) or np.any(max_grid_index >= size_in_parent_blocks):
+            warn_leapfrog_metadata_mismatch(
+                path,
+                f"block coordinates map outside metadata parent grid; observed index range "
+                f"{min_grid_index.tolist()} to {max_grid_index.tolist()}, metadata grid size={size_in_parent_blocks.tolist()}.",
+            )
 
 def prepare_csv_read_kwargs(source, **read_csv_kwargs):
     prepared = dict(read_csv_kwargs)
@@ -474,16 +735,22 @@ def build_unique_column_names(headers):
 
 def read_selected_columns_with_header(path, delimiter, header_line, selected_columns, progress_label=None,
                                       progress_callback=None):
-    headers = parse_header_line(path, delimiter, header_line)
+    effective_header_line = resolve_effective_csv_header_line(path, header_line)
+    headers = parse_header_line(path, delimiter, effective_header_line)
     final_names = build_unique_column_names(headers)
     missing = [col for col in selected_columns if col not in final_names]
     if missing:
         raise ValueError(f"Selected columns not found in file '{os.path.basename(path)}': {missing}")
+    if is_bmf_file(path):
+        df, _ = _load_bmf_dataframe(path, progress_label=progress_label, progress_callback=progress_callback)
+        df = df[selected_columns].copy()
+        df._detected_delimiter = 'bmf'
+        return df, final_names
     read_kwargs = dict(
         delimiter=delimiter,
         header=None,
         names=final_names,
-        skiprows=header_line,
+        skiprows=effective_header_line,
         comment='#',
         usecols=selected_columns,
     )
@@ -613,7 +880,7 @@ def _compute_sample_block_indices_from_metadata(coords, block_metadata):
         rotation_matrix = block_metadata['rotation_matrix']
         coords_for_mapping = (coords_for_mapping - rotation_center) @ rotation_matrix.T
 
-    all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
+    all_min_bounds = np.asarray(block_metadata.get('grid_index_origin', block_metadata['all_min_bounds']), dtype=float)
     unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
     return np.floor((coords_for_mapping - all_min_bounds) / unified_dims + 1e-6).astype(int)
 
@@ -654,7 +921,8 @@ def _normalize_block_transfer_columns(block_value_cols, block_x_col=None, block_
 def _detect_block_transfer_column_modes(blocks_file, delimiter, header_line, block_value_cols,
                                         block_x_col=None, block_y_col=None, block_z_col=None,
                                         block_filters=None, progress_callback=None):
-    headers = parse_header_line(blocks_file, delimiter, header_line)
+    effective_header_line = resolve_effective_csv_header_line(blocks_file, header_line)
+    headers = parse_header_line(blocks_file, delimiter, effective_header_line)
     final_names = build_unique_column_names(headers)
     filter_fields = collect_filter_fields(block_filters or [])
     selected_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
@@ -669,7 +937,7 @@ def _detect_block_transfer_column_modes(blocks_file, delimiter, header_line, blo
         delimiter=delimiter,
         header=None,
         names=final_names,
-        skiprows=header_line,
+        skiprows=effective_header_line,
         comment='#',
         usecols=selected_columns,
         chunksize=250_000,
@@ -757,7 +1025,8 @@ def load_block_value_mappings(blocks_file, delimiter, header_line, block_size, b
         progress_callback=_make_scaled_progress_callback(progress_callback, 0, 100, 'Scanning block transfer columns...'),
     )
 
-    headers = parse_header_line(blocks_file, delimiter, header_line)
+    effective_header_line = resolve_effective_csv_header_line(blocks_file, header_line)
+    headers = parse_header_line(blocks_file, delimiter, effective_header_line)
     final_names = build_unique_column_names(headers)
     filter_fields = collect_filter_fields(block_filters or [])
     selected_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
@@ -772,7 +1041,7 @@ def load_block_value_mappings(blocks_file, delimiter, header_line, block_size, b
         delimiter=delimiter,
         header=None,
         names=final_names,
-        skiprows=header_line,
+        skiprows=effective_header_line,
         comment='#',
         usecols=selected_columns,
         chunksize=250_000,
@@ -1029,7 +1298,8 @@ def build_domain_catalog_cache_signature(blocks_file, delimiter, header_line, do
 
 def load_block_domain_catalog(blocks_file, delimiter, header_line, domain_col,
                               block_filters=None, chunksize=250_000, progress_callback=None):
-    headers = parse_header_line(blocks_file, delimiter, header_line)
+    effective_header_line = resolve_effective_csv_header_line(blocks_file, header_line)
+    headers = parse_header_line(blocks_file, delimiter, effective_header_line)
     final_names = build_unique_column_names(headers)
     if domain_col not in final_names:
         raise ValueError(f'Domain column "{domain_col}" not found in blocks file.')
@@ -1045,7 +1315,7 @@ def load_block_domain_catalog(blocks_file, delimiter, header_line, domain_col,
         df, _ = read_selected_columns_with_header(
             blocks_file,
             delimiter,
-            header_line,
+            effective_header_line,
             selected_columns,
         )
         if block_filters:
@@ -1069,7 +1339,7 @@ def load_block_domain_catalog(blocks_file, delimiter, header_line, domain_col,
         delimiter=delimiter,
         header=None,
         names=final_names,
-        skiprows=header_line,
+        skiprows=effective_header_line,
         comment='#',
         usecols=selected_columns,
         chunksize=chunksize,
@@ -1079,7 +1349,7 @@ def load_block_domain_catalog(blocks_file, delimiter, header_line, domain_col,
         blocks_file,
         'Reading domain column',
         progress_callback=progress_callback,
-        header_line=header_line,
+        header_line=effective_header_line,
         **read_kwargs,
     ):
         if block_filters:
@@ -1108,13 +1378,21 @@ def read_csv_with_selected_header(path, delimiter, header_line, expected_min_col
     """Read CSV using a specific header line (1-based). Returns DataFrame.
     Uses manual header parsing to build names and then pandas read_csv with skiprows.
     """
-    headers = parse_header_line(path, delimiter, header_line)
+    if is_bmf_file(path):
+        df, _ = _load_bmf_dataframe(path, progress_label=progress_label, progress_callback=progress_callback)
+        if df.shape[1] < expected_min_cols:
+            raise ValueError(f"File '{path}' has fewer than {expected_min_cols} non-empty columns after cleanup.")
+        df._detected_delimiter = 'bmf'
+        return df, list(df.columns)
+
+    effective_header_line = resolve_effective_csv_header_line(path, header_line)
+    headers = parse_header_line(path, delimiter, effective_header_line)
     final_names = build_unique_column_names(headers)
     read_kwargs = dict(
         delimiter=delimiter,
         header=None,
         names=final_names,
-        skiprows=header_line-1,
+        skiprows=effective_header_line - 1,
         comment='#'
     )
     if progress_label:
@@ -1135,6 +1413,8 @@ def read_csv_with_selected_header(path, delimiter, header_line, expected_min_col
     return df, final_names
 
 def detect_csv_delimiter(path):
+    if is_bmf_file(path):
+        return ','
     if not os.path.isfile(path):
         return ','  # default
     try:
@@ -1162,6 +1442,12 @@ def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=
     Drops empty columns. Returns DataFrame."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"File not found: {path}")
+    if is_bmf_file(path):
+        df, _ = _load_bmf_dataframe(path, progress_label=progress_label, progress_callback=progress_callback)
+        if df.shape[1] < min_cols:
+            raise ValueError(f"File '{path}' has fewer than {min_cols} non-empty columns after cleanup.")
+        df._detected_delimiter = 'bmf'
+        return df
     delim = forced_delimiter if forced_delimiter else detect_csv_delimiter(path)
 
     def base_read(delimiter):
@@ -1559,7 +1845,29 @@ def normalize_block_chunk(chunk, rename_map, domain_copy_source=None, extra_keep
 def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, points,
                                block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
                                block_filters=None, config=None, progress_callback=None):
-    headers = parse_header_line(blocks_file, delimiter, header_line)
+    leapfrog_metadata = parse_leapfrog_block_metadata(blocks_file)
+    if leapfrog_metadata:
+        recognized_keys = sorted(key for key in leapfrog_metadata if key != 'raw_lines')
+        print(f"Detected Leapfrog block metadata: {recognized_keys}")
+        log_leapfrog_metadata_summary(blocks_file, leapfrog_metadata, context='streaming loader')
+
+    if leapfrog_metadata.get('parent_block_size'):
+        metadata_block_size = np.asarray(leapfrog_metadata['parent_block_size'], dtype=float)
+        if block_size is not None:
+            configured_block_size = np.asarray(
+                block_size if isinstance(block_size, (list, tuple, np.ndarray)) else [block_size, block_size, block_size],
+                dtype=float,
+            )
+            if configured_block_size.shape == (3,) and not np.allclose(configured_block_size, metadata_block_size):
+                warn_leapfrog_metadata_mismatch(
+                    blocks_file,
+                    f"configured block size {configured_block_size.tolist()} differs from metadata parent block size "
+                    f"{metadata_block_size.tolist()}; using metadata value.",
+                )
+        block_size = metadata_block_size.tolist()
+
+    effective_header_line = resolve_effective_csv_header_line(blocks_file, header_line)
+    headers = parse_header_line(blocks_file, delimiter, effective_header_line)
     final_names = build_unique_column_names(headers)
     effective_block_filters = [dict(entry) for entry in (block_filters or get_configured_block_filters(config))]
     filter_fields = collect_filter_fields(effective_block_filters)
@@ -1590,43 +1898,55 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         delimiter=delimiter,
         header=None,
         names=final_names,
-        skiprows=header_line,
+        skiprows=effective_header_line,
         comment='#',
         usecols=selected_columns,
         chunksize=chunksize,
     )
 
-    rotation_sample_target = 10_000
-    rotation_samples = []
-    print("Reading grid file (rotation sample)")
-    rotation_progress = _make_scaled_progress_callback(progress_callback, 0, 20, 'Reading grid file (rotation sample)')
-    for chunk in iterate_csv_with_progress(
-        blocks_file,
-        "Reading grid file (rotation sample)",
-        progress_callback=rotation_progress,
-        **base_read_kwargs,
-    ):
-        if effective_block_filters:
-            chunk, _ = apply_dataframe_filters(
-                chunk,
-                filters=effective_block_filters,
-                filter_subject='block',
-                source_label='blocks file chunk',
-                emit_logs=False,
-            )
-        chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source, extra_keep_columns=filter_fields)
-        if len(chunk) == 0:
-            continue
-        rotation_samples.append(chunk[['x', 'y', 'z']].to_numpy())
-        if sum(len(arr) for arr in rotation_samples) >= rotation_sample_target:
-            break
+    metadata_angles = [
+        float(leapfrog_metadata.get(name, 0.0) or 0.0)
+        for name in ('azimuth_degrees', 'dip_degrees', 'pitch_degrees')
+    ]
+    has_rotation_metadata = any(name in leapfrog_metadata for name in ('azimuth_degrees', 'dip_degrees', 'pitch_degrees'))
+    if has_rotation_metadata and all(abs(angle) < 1e-9 for angle in metadata_angles):
+        print("Leapfrog metadata reports zero azimuth/dip/pitch; skipping rotation sampling.")
+        rotation_matrix = np.eye(3)
+        rotation_center = np.zeros(3)
+        is_rotated = False
+        _emit_progress(progress_callback, 22, 100, 'Using Leapfrog rotation metadata...')
+    else:
+        rotation_sample_target = 10_000
+        rotation_samples = []
+        print("Reading grid file (rotation sample)")
+        rotation_progress = _make_scaled_progress_callback(progress_callback, 0, 20, 'Reading grid file (rotation sample)')
+        for chunk in iterate_csv_with_progress(
+            blocks_file,
+            "Reading grid file (rotation sample)",
+            progress_callback=rotation_progress,
+            **base_read_kwargs,
+        ):
+            if effective_block_filters:
+                chunk, _ = apply_dataframe_filters(
+                    chunk,
+                    filters=effective_block_filters,
+                    filter_subject='block',
+                    source_label='blocks file chunk',
+                    emit_logs=False,
+                )
+            chunk, dropped = normalize_block_chunk(chunk, rename_map, domain_copy_source, extra_keep_columns=filter_fields)
+            if len(chunk) == 0:
+                continue
+            rotation_samples.append(chunk[['x', 'y', 'z']].to_numpy())
+            if sum(len(array) for array in rotation_samples) >= rotation_sample_target:
+                break
 
-    if not rotation_samples:
-        raise ValueError("Blocks file had no valid coordinate rows to sample for rotation detection.")
+        if not rotation_samples:
+            raise ValueError("Blocks file had no valid coordinate rows to sample for rotation detection.")
 
-    sample_points = np.concatenate(rotation_samples, axis=0)
-    _emit_progress(progress_callback, 22, 100, 'Detecting grid rotation...')
-    rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(sample_points, block_size_hint=block_size)
+        sample_points = np.concatenate(rotation_samples, axis=0)
+        _emit_progress(progress_callback, 22, 100, 'Detecting grid rotation...')
+        rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(sample_points, block_size_hint=block_size)
 
     if block_size is not None:
         if isinstance(block_size, (list, tuple, np.ndarray)):
@@ -1636,6 +1956,14 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         print(f"Using configured block size: {unified_dims}")
     else:
         raise ValueError("Block size must be specified when streaming large blocks files.")
+
+    metadata_grid_origin = None
+    if leapfrog_metadata.get('minimum_corner'):
+        metadata_grid_origin = np.asarray(leapfrog_metadata['minimum_corner'], dtype=float)
+        if metadata_grid_origin.shape == (3,):
+            print(f"Using Leapfrog minimum corner as parent-grid origin: {metadata_grid_origin.tolist()}")
+        else:
+            metadata_grid_origin = None
 
     print("Building bounds and domain mapping...")
     all_min_bounds = None
@@ -1685,7 +2013,10 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
             all_min_bounds = np.minimum(all_min_bounds, chunk_min)
             all_max_bounds = np.maximum(all_max_bounds, chunk_max)
 
-        absolute_grid_indices = np.floor(coords / unified_dims + 1e-6).astype(int)
+        if metadata_grid_origin is not None and not is_rotated:
+            absolute_grid_indices = np.floor((coords - metadata_grid_origin) / unified_dims + 1e-6).astype(int)
+        else:
+            absolute_grid_indices = np.floor(coords / unified_dims + 1e-6).astype(int)
         chunk_min_idx = absolute_grid_indices.min(axis=0)
         chunk_max_idx = absolute_grid_indices.max(axis=0)
         if min_quantized_idx is None:
@@ -1728,8 +2059,27 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         raise ValueError('Could not determine grid bounds from blocks file.')
 
     _emit_progress(progress_callback, 92, 100, 'Calculating grid dimensions...')
-    dims_grid = (max_quantized_idx - min_quantized_idx + 1).astype(int)
-    all_min_bounds = min_quantized_idx.astype(float) * unified_dims
+    observed_min_bounds = np.array(all_min_bounds, copy=True)
+    observed_max_bounds = np.array(all_max_bounds, copy=True)
+    validate_leapfrog_metadata_against_block_data(
+        blocks_file,
+        leapfrog_metadata,
+        observed_min_bounds,
+        observed_max_bounds,
+        unified_dims,
+        min_grid_index=min_quantized_idx if metadata_grid_origin is not None and not is_rotated else None,
+        max_grid_index=max_quantized_idx if metadata_grid_origin is not None and not is_rotated else None,
+    )
+    if metadata_grid_origin is not None and not is_rotated:
+        if leapfrog_metadata.get('size_in_parent_blocks'):
+            dims_grid = np.asarray(leapfrog_metadata['size_in_parent_blocks'], dtype=int)
+        else:
+            dims_grid = (max_quantized_idx - min_quantized_idx + 1).astype(int)
+        all_min_bounds = metadata_grid_origin.astype(float)
+        min_quantized_idx = np.zeros(3, dtype=int)
+    else:
+        dims_grid = (max_quantized_idx - min_quantized_idx + 1).astype(int)
+        all_min_bounds = min_quantized_idx.astype(float) * unified_dims
     all_max_bounds = all_min_bounds + dims_grid * unified_dims
     print('Calculated grid dimensions:', dims_grid)
     print("Finalizing domain mapping...")
@@ -1778,6 +2128,9 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
         'is_rotated': is_rotated,
         'grid_reference': np.array(all_min_bounds, copy=True),
         'min_quantized_idx': np.array(min_quantized_idx, copy=True),
+        'grid_index_origin': np.array(metadata_grid_origin if metadata_grid_origin is not None and not is_rotated else all_min_bounds, copy=True),
+        'leapfrog_metadata': leapfrog_metadata,
+        'source_blocks_header_line': effective_header_line,
     }
 
 def create_blocks(points, values, block_size=10, verbose=False, range_size=10, max_pheromone=150,
@@ -1805,7 +2158,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         load_pbar = tqdm(total=7, desc="Blocks loading phases", unit="phase")
         load_pbar.set_postfix_str("reading blocks file")
         block_filters = get_configured_block_filters(config)
-        use_streaming_blocks = os.path.getsize(blocks_file) >= LARGE_BLOCK_FILE_THRESHOLD
+        use_streaming_blocks = (not is_bmf_file(blocks_file)) and os.path.getsize(blocks_file) >= LARGE_BLOCK_FILE_THRESHOLD
         if use_streaming_blocks:
             if not blocks_delimiter:
                 blocks_delimiter = detect_csv_delimiter(blocks_file)
@@ -1830,11 +2183,13 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             rotation_matrix = metadata['rotation_matrix']
             rotation_center = metadata['rotation_center']
             is_rotated = metadata['is_rotated']
+            grid_index_origin = metadata.get('grid_index_origin', all_min_bounds)
+            source_blocks_header_line = metadata.get('source_blocks_header_line', blocks_header_line)
             if is_rotated:
                 points = (np.asarray(points, dtype=float) - rotation_center) @ rotation_matrix.T
                 print("Applied rotation to sample points.")
             load_pbar.update(4)
-        elif blocks_header_line and blocks_header_line != 1 and blocks_delimiter:
+        elif (not is_bmf_file(blocks_file)) and blocks_header_line and blocks_header_line != 1 and blocks_delimiter:
             # Use custom header line parsing
             df_blocks, parsed_cols = read_csv_with_selected_header(
                 blocks_file,
@@ -1908,7 +2263,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                         df_blocks = df_blocks.rename(columns=mapping)
                         print(f"Blocks header auto-mapped: {mapping}")
                 cols = df_blocks.columns.tolist()
-                if len(cols) >= 4:
+                if len(cols) >= 4 and not all(name in df_blocks.columns for name in ['x', 'y', 'z']):
                     positional_targets = ['x', 'y', 'z', 'Domain']
                     if any(cols[i] != positional_targets[i] for i in range(4)):
                         pos_map = {cols[i]: positional_targets[i] for i in range(4)}
@@ -2007,6 +2362,8 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 domains,
                 policy=subblock_domain_policy,
             )
+            grid_index_origin = all_min_bounds
+            source_blocks_header_line = blocks_header_line
 
             print(
                 f"Resolved {len(domains):,} sub-block rows into {len(domain_mapping):,} base blocks "
@@ -2041,7 +2398,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         # Compute all block indices at once
         points_array = np.array(points)
         values_array = np.array(values)
-        block_indices = np.floor((points_array - all_min_bounds) / unified_dims + 1e-6).astype(int)
+        block_indices = np.floor((points_array - np.asarray(grid_index_origin, dtype=float)) / unified_dims + 1e-6).astype(int)
         allowed_mask = np.array([tuple(idx) in allowed_grid for idx in block_indices], dtype=bool)
         assigned_mask = compute_domain_sensitive_assignment_mask(
             block_indices,
@@ -2100,6 +2457,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'min_bounds': all_min_bounds,
             'dims': np.ceil((all_max_bounds - all_min_bounds) / unified_dims).astype(int),
             'block_size': unified_dims.tolist(),
+            'grid_index_origin': np.asarray(grid_index_origin, dtype=float).tolist(),
             'allowed_grid': list(allowed_grid),
             'rotation_matrix': rotation_matrix if is_rotated else None,
             'rotation_center': rotation_center if is_rotated else None,
@@ -2108,7 +2466,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'mixed_domain_blocks': mixed_domain_blocks,
             'source_blocks_file': blocks_file,
             'source_blocks_delimiter': blocks_delimiter,
-            'source_blocks_header_line': blocks_header_line,
+            'source_blocks_header_line': source_blocks_header_line,
             'source_block_x_col': block_x_col,
             'source_block_y_col': block_y_col,
             'source_block_z_col': block_z_col,
@@ -2984,6 +3342,16 @@ def resolve_block_evaluated_samples_export_path(enabled, configured_path=None, i
     return os.path.join(output_dir, f"{base_name}_block_evaluated_samples.csv")
 
 
+def resolve_interpolation_csv_export_path(interpolation_file):
+    path = str(interpolation_file or '').strip()
+    if not path:
+        return 'interpolation.csv'
+    root, ext = os.path.splitext(path)
+    if ext.lower() == '.bmf':
+        return f"{root}.csv" if root else 'interpolation.csv'
+    return path
+
+
 def _sanitize_filename_fragment(value, fallback='Domain'):
     text = str(value or '').strip()
     if not text or text == '(None)':
@@ -3123,14 +3491,15 @@ def load_samples_preview_dataframe(samples_file, samples_delimiter=None, samples
     preview_rows = max(int(max_rows or 0), 1)
 
     if samples_header_line and samples_header_line != 1:
-        headers = parse_header_line(samples_file, delimiter, samples_header_line)
+        effective_header_line = resolve_effective_csv_header_line(samples_file, samples_header_line)
+        headers = parse_header_line(samples_file, delimiter, effective_header_line)
         final_names = build_unique_column_names(headers)
         read_kwargs = prepare_csv_read_kwargs(
             samples_file,
             delimiter=delimiter,
             header=None,
             names=final_names,
-            skiprows=max(int(samples_header_line) - 1, 0),
+            skiprows=max(int(effective_header_line) - 1, 0),
             comment='#',
             nrows=preview_rows + 1,
         )
@@ -3524,6 +3893,20 @@ def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_he
 
 def load_full_blocks_dataframe(blocks_file, blocks_delimiter=None, blocks_header_line=1,
                                block_filters=None, progress_label=None, progress_callback=None):
+    if is_bmf_file(blocks_file):
+        df = read_autodetect_csv(
+            blocks_file,
+            progress_label=progress_label,
+            progress_callback=progress_callback,
+        )
+        if block_filters:
+            print(
+                f"Finished reading {len(df):,} rows from {os.path.basename(blocks_file)}. "
+                "Preparing block filters..."
+            )
+            df, _ = apply_dataframe_filters(df, filters=block_filters, filter_subject='block', source_label='blocks file')
+        return df, ','
+
     delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
     if blocks_header_line and blocks_header_line != 1:
         df, _ = read_csv_with_selected_header(
@@ -3576,6 +3959,7 @@ class FilterDataSource:
             if not os.path.isfile(self._path):
                 raise ValueError(f'Filter data source file not found: {self._path}')
             self._delimiter = delimiter or detect_csv_delimiter(self._path)
+            self._header_line = resolve_effective_csv_header_line(self._path, self._header_line)
             headers = parse_header_line(self._path, self._delimiter, self._header_line)
             self._columns = build_unique_column_names(headers)
             self._column_positions = {column: index for index, column in enumerate(self._columns)}
@@ -4439,7 +4823,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
             rotation_matrix = block_metadata['rotation_matrix']
             sample_coords_for_mapping = (sample_coords_for_mapping - rotation_center) @ rotation_matrix.T
 
-        all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
+        all_min_bounds = np.asarray(block_metadata.get('grid_index_origin', block_metadata['all_min_bounds']), dtype=float)
         unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
         sample_block_indices = np.floor((sample_coords_for_mapping - all_min_bounds) / unified_dims + 1e-6).astype(int)
         domain_mapping = block_metadata['domain_mapping']
@@ -4788,7 +5172,7 @@ def export_domain_interpolation_confidence_metrics(samples_file, blocks_file, ou
             rotation_matrix = block_metadata['rotation_matrix']
             sample_coords_for_mapping = (sample_coords_for_mapping - rotation_center) @ rotation_matrix.T
 
-        all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
+        all_min_bounds = np.asarray(block_metadata.get('grid_index_origin', block_metadata['all_min_bounds']), dtype=float)
         unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
         sample_block_indices = np.floor((sample_coords_for_mapping - all_min_bounds) / unified_dims + 1e-6).astype(int)
         domain_mapping = block_metadata['domain_mapping']
@@ -5209,7 +5593,7 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
         rotation_matrix = block_metadata['rotation_matrix']
         valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
 
-    all_min_bounds = np.asarray(block_metadata['all_min_bounds'], dtype=float)
+    all_min_bounds = np.asarray(block_metadata.get('grid_index_origin', block_metadata['all_min_bounds']), dtype=float)
     unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
     block_indices = np.floor((valid_coords - all_min_bounds) / unified_dims + 1e-6).astype(int)
     domain_mapping = block_metadata['domain_mapping']
@@ -5491,7 +5875,8 @@ def _build_export_block_row_lookup(block_rows):
 
 
 def _expand_export_block_rows_to_source_rows(block_rows, source_blocks_df, block_x_col, block_y_col, block_z_col,
-                                             min_bounds, block_size, rotation_matrix=None, rotation_center=None):
+                                             min_bounds, block_size, rotation_matrix=None, rotation_center=None,
+                                             grid_index_origin=None):
     export_df = _build_base_block_export_dataframe(block_rows)
     export_df['_Grid_Index'] = [tuple(row['_Grid_Index']) for row in block_rows]
 
@@ -5504,7 +5889,8 @@ def _expand_export_block_rows_to_source_rows(block_rows, source_blocks_df, block
         valid_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
         if rotation_matrix is not None and rotation_center is not None:
             valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
-        block_indices = np.floor((valid_coords - np.asarray(min_bounds, dtype=float)) / np.asarray(block_size, dtype=float) + 1e-6).astype(int)
+        index_origin = np.asarray(grid_index_origin if grid_index_origin is not None else min_bounds, dtype=float)
+        block_indices = np.floor((valid_coords - index_origin) / np.asarray(block_size, dtype=float) + 1e-6).astype(int)
         expanded_index_df.loc[valid_mask, '_Grid_Index'] = [tuple(int(v) for v in idx) for idx in block_indices]
 
     expanded_df = expanded_index_df.merge(export_df, on='_Grid_Index', how='left')
@@ -5520,7 +5906,8 @@ def _expand_export_block_rows_to_source_rows(block_rows, source_blocks_df, block
 def _expand_export_chunk_rows_to_source_rows(source_blocks_df, export_lookup, export_columns,
                                              block_x_col, block_y_col, block_z_col,
                                              min_bounds, block_size,
-                                             rotation_matrix=None, rotation_center=None):
+                                             rotation_matrix=None, rotation_center=None,
+                                             grid_index_origin=None):
     expanded_records = [{} for _ in range(len(source_blocks_df))]
 
     coord_frame = source_blocks_df[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
@@ -5531,9 +5918,8 @@ def _expand_export_chunk_rows_to_source_rows(source_blocks_df, export_lookup, ex
         valid_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
         if rotation_matrix is not None and rotation_center is not None:
             valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
-        block_indices = np.floor(
-            (valid_coords - np.asarray(min_bounds, dtype=float)) / np.asarray(block_size, dtype=float) + 1e-6
-        ).astype(int)
+        index_origin = np.asarray(grid_index_origin if grid_index_origin is not None else min_bounds, dtype=float)
+        block_indices = np.floor((valid_coords - index_origin) / np.asarray(block_size, dtype=float) + 1e-6).astype(int)
         for row_position, block_index in zip(valid_positions, block_indices):
             expanded_records[row_position] = export_lookup.get(tuple(int(v) for v in block_index), {})
 
@@ -5549,10 +5935,11 @@ def _iter_expanded_export_block_chunks(block_rows, source_blocks_file, blocks_de
                                        block_x_col=None, block_y_col=None, block_z_col=None,
                                        min_bounds=None, block_size=None,
                                        rotation_matrix=None, rotation_center=None,
+                                       grid_index_origin=None,
                                        progress_label='Reading source blocks for export expansion',
                                        chunksize=250_000):
     delimiter = blocks_delimiter or detect_csv_delimiter(source_blocks_file)
-    header_line = max(int(blocks_header_line or 1), 1)
+    header_line = resolve_effective_csv_header_line(source_blocks_file, blocks_header_line)
     headers = parse_header_line(source_blocks_file, delimiter, header_line)
     final_names = build_unique_column_names(headers)
     block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
@@ -5604,6 +5991,7 @@ def _iter_expanded_export_block_chunks(block_rows, source_blocks_file, blocks_de
             block_size,
             rotation_matrix=rotation_matrix,
             rotation_center=rotation_center,
+            grid_index_origin=grid_index_origin,
         )
 
 
@@ -5628,6 +6016,7 @@ def _write_expanded_export_blocks_to_csv(block_rows, block_info, filepath):
             block_size=block_info['block_size'],
             rotation_matrix=block_info.get('rotation_matrix'),
             rotation_center=block_info.get('rotation_center'),
+            grid_index_origin=block_info.get('grid_index_origin'),
         ),
         start=1,
     ):
@@ -5689,6 +6078,7 @@ def _build_export_blocks_dataframe(blocks, block_rows):
             block_info['block_size'],
             rotation_matrix=block_info.get('rotation_matrix'),
             rotation_center=block_info.get('rotation_center'),
+            grid_index_origin=block_info.get('grid_index_origin'),
         )
         print(
             f"Expanded {len(block_rows):,} base-block export rows to {len(expanded_df):,} source block rows "
@@ -5724,6 +6114,172 @@ def export_blocks_to_csv(blocks, filepath):
     df = _build_export_blocks_dataframe(blocks, data)
     df.to_csv(filepath, index=False)
     print(f"Exported {len(df):,} rows to {filepath}")
+
+
+def export_dataframe_to_bmf(df, filepath, backend='tbms-config-text'):
+    output_dir = os.path.dirname(filepath) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+
+    if not {'x', 'y', 'z'}.issubset(df.columns):
+        missing = sorted({'x', 'y', 'z'} - set(df.columns))
+        raise ValueError(f"BMF export requires columns x, y, z. Missing: {missing}")
+
+    value_cols = [
+        column_name
+        for column_name in df.columns
+        if column_name not in {'x', 'y', 'z', 'grid_i', 'grid_j', 'grid_k'}
+    ]
+    with tempfile.NamedTemporaryFile('w', suffix='.csv', prefix='anterpolator_bmf_', delete=False, encoding='utf-8', newline='') as handle:
+        temp_csv_path = handle.name
+    try:
+        df.to_csv(temp_csv_path, index=False)
+        return _get_bmf_tools_module().export_bmf(
+            temp_csv_path,
+            filepath,
+            backend=backend,
+            x_col='x',
+            y_col='y',
+            z_col='z',
+            value_cols=value_cols,
+            dry_run=False,
+        )
+    finally:
+        try:
+            os.remove(temp_csv_path)
+        except OSError:
+            pass
+
+
+def export_blocks_to_file(blocks, filepath, bmf_backend='tbms-config-text'):
+    output_path = resolve_interpolation_csv_export_path(filepath)
+    if output_path != str(filepath or '').strip():
+        print(f"Interpolation BMF output is disabled; writing CSV instead: {output_path}")
+    export_blocks_to_csv(blocks, output_path)
+    return output_path
+
+
+def parse_bmf_export_column_types(text):
+    overrides = {}
+    raw_text = str(text or '').strip()
+    if not raw_text:
+        return overrides
+
+    for token in raw_text.split(','):
+        entry = token.strip()
+        if not entry:
+            continue
+        if '=' not in entry:
+            raise ValueError(
+                'Column type overrides must use the format column=type, separated by commas. '
+                'Example: grade=double, domain=string'
+            )
+        column_name, field_type = entry.split('=', 1)
+        column_name = column_name.strip()
+        field_type = field_type.strip()
+        if not column_name or not field_type:
+            raise ValueError(
+                'Column type overrides must use the format column=type, separated by commas. '
+                'Example: grade=double, domain=string'
+            )
+        overrides[column_name] = normalize_bmf_export_field_type_name(field_type)
+    return overrides
+
+
+def normalize_bmf_export_field_type_name(field_type):
+    normalized = str(field_type or '').strip().lower()
+    alias_map = {
+        '': '',
+        'auto': '',
+        'boolean': 'boolean',
+        'bool': 'boolean',
+        'int': 'int',
+        'integer': 'int',
+        'double': 'double',
+        'float': 'double',
+        'real': 'double',
+        'string': 'string',
+        'text': 'string',
+        'namedshort': 'string',
+    }
+    if normalized not in alias_map:
+        raise ValueError(
+            'Unsupported BMF export field type. Use one of: auto, boolean, int, double, string.'
+        )
+    return alias_map[normalized]
+
+
+def infer_bmf_export_field_types_from_preview(df, candidate_columns, delimiter=None):
+    inferred = {}
+    truthy = {'1', 'true', 't', 'yes', 'y'}
+    falsy = {'0', 'false', 'f', 'no', 'n', ''}
+
+    for column_name in candidate_columns or []:
+        if column_name not in df.columns:
+            continue
+
+        series = df[column_name]
+        non_null = series.dropna()
+        if len(non_null) == 0:
+            inferred[str(column_name)] = ''
+            continue
+
+        if pd.api.types.is_bool_dtype(series):
+            inferred[str(column_name)] = 'boolean'
+            continue
+
+        normalized_text = non_null.astype(str).str.strip().str.lower()
+        normalized_text = normalized_text[normalized_text != '']
+        if len(normalized_text) > 0 and normalized_text.isin(truthy | falsy).all():
+            inferred[str(column_name)] = 'boolean'
+            continue
+
+        numeric_series = coerce_numeric_series(series, delimiter=delimiter)
+        numeric_compatible = bool((numeric_series.notna() | series.isna() | (series.astype(str).str.strip() == '')).all())
+        if numeric_compatible:
+            finite = numeric_series.dropna().to_numpy(dtype=float)
+            if finite.size == 0:
+                inferred[str(column_name)] = 'double'
+                continue
+            integer_like = np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0)
+            inferred[str(column_name)] = 'int' if integer_like else 'double'
+            continue
+
+        inferred[str(column_name)] = 'string'
+
+    return inferred
+
+
+def export_csv_grid_to_bmf(input_csv, output_bmf, x_col='x', y_col='y', z_col='z',
+                           value_cols=None, backend='tbms-config-text', delimiter=None,
+                           header_line=1, column_types=None, value_exceptions=None, cell_size=None,
+                           origin=None, null_float=-99.0, index_tolerance=1e-3,
+                           regularize_to_base_block=False, summary_json=None, progress_callback=None):
+    if progress_callback is not None:
+        progress_callback(0, 100, 'Preparing BMF export...')
+    result = _get_bmf_tools_module().export_bmf(
+        input_csv=input_csv,
+        output_bmf=output_bmf,
+        backend=backend,
+        x_col=x_col,
+        y_col=y_col,
+        z_col=z_col,
+        delimiter=delimiter,
+        header_line=header_line,
+        cell_size=cell_size,
+        origin=origin,
+        value_cols=value_cols,
+        column_types=column_types,
+        value_exceptions=value_exceptions,
+        null_float=null_float,
+        index_tolerance=index_tolerance,
+        regularize_to_base_block=regularize_to_base_block,
+        dry_run=False,
+        summary_json=summary_json,
+        progress_callback=progress_callback,
+    )
+    if progress_callback is not None:
+        progress_callback(100, 100, 'BMF export complete.')
+    return result
 
 
 def export_block_evaluated_samples_to_csv(blocks, filepath):
@@ -6218,7 +6774,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
             interpolator.generate_statistics(output_dir, domain_name="Global")
     
     # Export results (handles both single and multiple interpolators)
-    export_blocks_to_csv(blocks, interpolation_file)
+    interpolation_file = export_blocks_to_file(blocks, interpolation_file)
     if block_evaluated_samples_file:
         export_block_evaluated_samples_to_csv(blocks, block_evaluated_samples_file)
 
@@ -7618,10 +8174,10 @@ if __name__ == "__main__":
             
             add_file_row('Samples File', self.samples_edit, 'CSV Files (*.csv)', files_form, extra_button=self.configure_block_domain_metrics_filters_btn)
             files_form.addRow('', self.block_domain_metrics_filters_summary)
-            add_file_row('Blocks File', self.blocks_edit, 'CSV Files (*.csv)', files_form, extra_button=self.configure_block_volume_weighted_filters_btn)
+            add_file_row('Blocks File', self.blocks_edit, 'CSV Files (*.csv);;BMF Files (*.bmf);;All Files (*.*)', files_form, extra_button=self.configure_block_volume_weighted_filters_btn)
             files_form.addRow('', self.block_volume_weighted_filters_summary)
             add_file_row('Color File', self.color_edit, 'LFC Files (*.lfc);;All Files (*.*)', files_form)
-            add_file_row('Interpolation File', self.interp_edit, 'CSV Files (*.csv)', files_form)
+            add_file_row('Interpolation File', self.interp_edit, 'CSV Files (*.csv);;All Files (*.*)', files_form)
 
             self.block_evaluated_samples_enabled = QtWidgets.QCheckBox('Block Evaluated Samples File')
             self.block_evaluated_samples_edit = QtWidgets.QLineEdit('')
@@ -7751,7 +8307,7 @@ if __name__ == "__main__":
                 if not os.path.isfile(path):
                     return
                 try:
-                    cols = parse_header_line(path, delim, header_line)
+                    cols = parse_effective_header_line(path, delim, header_line)
                     for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col]:
                         cb.addItems(cols)
                     for cb in self.block_domain_metrics_id_cols:
@@ -7795,7 +8351,7 @@ if __name__ == "__main__":
                 if not os.path.isfile(path):
                     return
                 try:
-                    cols = parse_header_line(path, delim, header_line)
+                    cols = parse_effective_header_line(path, delim, header_line)
                     for cb in [self.block_x_col, self.block_y_col, self.block_z_col, self.block_domain_col, self.block_value_metric_col, self.block_weight_metric_col]:
                         for c in cols:
                             cb.addItem(c)
@@ -7886,6 +8442,23 @@ if __name__ == "__main__":
                     domain_col=self.sample_domain_col.currentText(),
                 )
 
+            def suggested_bmf_export_input_path():
+                interpolation_path = self.interp_edit.text().strip()
+                blocks_path = self.blocks_edit.text().strip()
+                candidates = [interpolation_path, blocks_path]
+                for candidate in candidates:
+                    if candidate and not is_bmf_file(candidate):
+                        return candidate
+                return interpolation_path or blocks_path
+
+            def suggested_bmf_export_output_path():
+                input_path = self.bmf_export_input_edit.text().strip() if hasattr(self, 'bmf_export_input_edit') else ''
+                if not input_path:
+                    input_path = suggested_bmf_export_input_path()
+                base_name = os.path.splitext(os.path.basename(input_path))[0] if input_path else 'grid'
+                output_dir = os.path.dirname(input_path) if input_path else '.'
+                return os.path.join(output_dir or '.', f"{base_name}.bmf")
+
             self.domain_samples_output_edit = QtWidgets.QLineEdit('')
             self.domain_samples_browse = QtWidgets.QPushButton('Browse')
             self.start_domaining_btn = QtWidgets.QPushButton('Start Domaining')
@@ -7907,6 +8480,65 @@ if __name__ == "__main__":
             self.block_volume_weighted_output_edit = QtWidgets.QLineEdit('')
             self.block_volume_weighted_browse = QtWidgets.QPushButton('Browse')
             self.start_block_volume_weighted_btn = QtWidgets.QPushButton('Export Volume Weighted Average')
+            self.bmf_export_input_edit = QtWidgets.QLineEdit('')
+            self.bmf_export_input_browse = QtWidgets.QPushButton('Browse')
+            self.bmf_export_output_edit = QtWidgets.QLineEdit('')
+            self.bmf_export_output_browse = QtWidgets.QPushButton('Browse')
+            self.bmf_export_delim = QtWidgets.QComboBox()
+            self.bmf_export_delim.addItems(delim_opts)
+            self.bmf_export_header_line = QtWidgets.QSpinBox()
+            self.bmf_export_header_line.setRange(1, 1_000_000)
+            self.bmf_export_header_line.setValue(1)
+            self.bmf_export_backend_combo = QtWidgets.QComboBox()
+            self.bmf_export_backend_combo.addItems(['tbms-config-text', 'tbms-experimental', 'vulcan'])
+            self.bmf_export_cell_x = QtWidgets.QDoubleSpinBox()
+            self.bmf_export_cell_y = QtWidgets.QDoubleSpinBox()
+            self.bmf_export_cell_z = QtWidgets.QDoubleSpinBox()
+            for spin in [self.bmf_export_cell_x, self.bmf_export_cell_y, self.bmf_export_cell_z]:
+                spin.setRange(0.0, 1_000_000_000.0)
+                spin.setDecimals(6)
+                spin.setSingleStep(1.0)
+                spin.setValue(0.0)
+                spin.setSpecialValueText('Auto')
+            self.bmf_export_regularize_base_blocks = QtWidgets.QCheckBox('Regularize to base block size')
+            self.bmf_export_regularize_base_blocks.setChecked(True)
+            self.bmf_export_regularize_warning = QtWidgets.QLabel(
+                'Warning: if unchecked, sub-blocked CSVs may fail with grid alignment errors or oversized dense-grid memory errors.'
+            )
+            self.bmf_export_regularize_warning.setWordWrap(True)
+            self.bmf_export_regularize_warning.setStyleSheet('color: #b36b00;')
+            self.bmf_export_x_col = QtWidgets.QComboBox()
+            self.bmf_export_y_col = QtWidgets.QComboBox()
+            self.bmf_export_z_col = QtWidgets.QComboBox()
+            for cb in [self.bmf_export_x_col, self.bmf_export_y_col, self.bmf_export_z_col]:
+                configure_column_combo(cb)
+            self.bmf_export_value_cols = QtWidgets.QTableWidget(0, 2)
+            self.bmf_export_value_cols.setHorizontalHeaderLabels(['Field', 'Type'])
+            self.bmf_export_value_cols.verticalHeader().setVisible(False)
+            self.bmf_export_value_cols.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+            self.bmf_export_value_cols.setMinimumHeight(160)
+            self.bmf_export_value_cols.horizontalHeader().setStretchLastSection(False)
+            self.bmf_export_value_cols.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+            self.bmf_export_value_cols.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+            self.bmf_export_select_all_btn = QtWidgets.QPushButton('Select All')
+            self.bmf_export_clear_btn = QtWidgets.QPushButton('Clear')
+            self.bmf_export_value_summary = QtWidgets.QLabel('No export value columns loaded.')
+            self.bmf_export_value_summary.setWordWrap(True)
+            self.bmf_export_value_exceptions = {}
+            self.bmf_export_exception_table = QtWidgets.QTableWidget(0, 4)
+            self.bmf_export_exception_table.setHorizontalHeaderLabels(['Field', 'CSV Value', 'Replacement', 'Use In Regularization'])
+            self.bmf_export_exception_table.verticalHeader().setVisible(False)
+            self.bmf_export_exception_table.setMinimumHeight(120)
+            self.bmf_export_exception_table.horizontalHeader().setStretchLastSection(False)
+            self.bmf_export_exception_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+            self.bmf_export_exception_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+            self.bmf_export_exception_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+            self.bmf_export_exception_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+            self.bmf_export_exception_add_btn = QtWidgets.QPushButton('Add Exception')
+            self.bmf_export_exception_remove_btn = QtWidgets.QPushButton('Remove Selected')
+            self.bmf_export_exception_summary = QtWidgets.QLabel('No BMF value exceptions configured.')
+            self.bmf_export_exception_summary.setWordWrap(True)
+            self.start_bmf_export_btn = QtWidgets.QPushButton('Export CSV To BMF')
             self.equation_finder_output_edit = QtWidgets.QLineEdit('')
             self.equation_finder_browse = QtWidgets.QPushButton('Browse')
             self.start_equation_finder_btn = QtWidgets.QPushButton('Find Equations')
@@ -7915,8 +8547,14 @@ if __name__ == "__main__":
             self._block_domain_metrics_auto_path = ''
             self._domain_interpolation_confidence_auto_path = ''
             self._block_volume_weighted_auto_path = ''
+            self._bmf_export_input_auto_path = ''
+            self._bmf_export_output_auto_path = ''
             self._equation_finder_auto_path = ''
             self._pending_block_value_transfer_cols = []
+            self._pending_bmf_export_value_cols = None
+            self._pending_bmf_export_column_types = None
+            self._bmf_export_value_cols_initialized = False
+            self._bmf_export_columns_source_path = ''
 
             def refresh_domain_samples_output_path(force=False):
                 suggested = suggested_domain_samples_path()
@@ -7954,6 +8592,28 @@ if __name__ == "__main__":
                 if force or not current or current == self._block_volume_weighted_auto_path:
                     self.block_volume_weighted_output_edit.setText(suggested)
                 self._block_volume_weighted_auto_path = suggested
+
+            def refresh_bmf_export_input_path(force=False):
+                suggested = suggested_bmf_export_input_path()
+                current = self.bmf_export_input_edit.text().strip()
+                if force or not current or current == self._bmf_export_input_auto_path:
+                    self.bmf_export_input_edit.setText(suggested)
+                self._bmf_export_input_auto_path = suggested
+
+            def refresh_bmf_export_output_path(force=False):
+                suggested = suggested_bmf_export_output_path()
+                current = self.bmf_export_output_edit.text().strip()
+                if force or not current or current == self._bmf_export_output_auto_path:
+                    self.bmf_export_output_edit.setText(suggested)
+                self._bmf_export_output_auto_path = suggested
+
+            def sync_bmf_export_input_settings():
+                path = self.bmf_export_input_edit.text().strip()
+                if not path or not os.path.isfile(path):
+                    return
+                detected = detect_csv_delimiter(path)
+                if detected in delim_opts and self.bmf_export_delim.currentText() != detected:
+                    self.bmf_export_delim.setCurrentText(detected)
 
             def refresh_equation_finder_output_path(force=False):
                 suggested = suggested_equation_finder_path()
@@ -8017,6 +8677,28 @@ if __name__ == "__main__":
                 if path:
                     self.block_volume_weighted_output_edit.setText(path)
 
+            def browse_bmf_export_input():
+                initial_path = self.bmf_export_input_edit.text().strip() or suggested_bmf_export_input_path()
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self,
+                    'CSV Grid Input File',
+                    initial_path,
+                    'CSV Files (*.csv);;All Files (*.*)'
+                )
+                if path:
+                    self.bmf_export_input_edit.setText(path)
+
+            def browse_bmf_export_output():
+                initial_path = self.bmf_export_output_edit.text().strip() or suggested_bmf_export_output_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'BMF Output File',
+                    initial_path,
+                    'BMF Files (*.bmf);;All Files (*.*)'
+                )
+                if path:
+                    self.bmf_export_output_edit.setText(path)
+
             def browse_equation_finder_output():
                 initial_path = self.equation_finder_output_edit.text().strip() or suggested_equation_finder_path()
                 path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -8028,12 +8710,57 @@ if __name__ == "__main__":
                 if path:
                     self.equation_finder_output_edit.setText(path)
 
-            domain_samples_group = QtWidgets.QGroupBox('Domain Samples')
-            domain_samples_group.setToolTip(
-                'Assign a domain to each sample row from the blocks model and export the domained samples to a new CSV.'
+            def create_collapsible_operation_section(title, tooltip=''):
+                section_widget = QtWidgets.QWidget()
+                section_layout = QtWidgets.QVBoxLayout(section_widget)
+                section_layout.setContentsMargins(0, 0, 0, 0)
+                section_layout.setSpacing(4)
+
+                header_widget = QtWidgets.QWidget()
+                header_layout = QtWidgets.QHBoxLayout(header_widget)
+                header_layout.setContentsMargins(0, 0, 0, 0)
+                header_layout.setSpacing(6)
+
+                toggle_button = QtWidgets.QToolButton()
+                toggle_button.setText('+')
+                toggle_button.setCheckable(True)
+                toggle_button.setChecked(False)
+                toggle_button.setFixedSize(20, 20)
+                toggle_button.setToolTip(tooltip)
+
+                title_label = QtWidgets.QLabel(title)
+                title_font = title_label.font()
+                title_font.setBold(True)
+                title_label.setFont(title_font)
+                title_label.setToolTip(tooltip)
+
+                header_layout.addWidget(toggle_button)
+                header_layout.addWidget(title_label)
+                header_layout.addStretch(1)
+
+                content_widget = QtWidgets.QWidget()
+                content_widget.setToolTip(tooltip)
+                content_layout = QtWidgets.QFormLayout()
+                content_layout.setContentsMargins(28, 0, 0, 0)
+                content_widget.setLayout(content_layout)
+                content_widget.setVisible(False)
+
+                def set_expanded(expanded):
+                    toggle_button.setText('-' if expanded else '+')
+                    content_widget.setVisible(bool(expanded))
+
+                toggle_button.toggled.connect(set_expanded)
+                set_expanded(False)
+
+                section_widget.setToolTip(tooltip)
+                section_layout.addWidget(header_widget)
+                section_layout.addWidget(content_widget)
+                return section_widget, content_layout
+
+            domain_samples_group, domain_samples_form = create_collapsible_operation_section(
+                'Domain Samples',
+                'Assign a domain to each sample row from the blocks model and export the domained samples to a new CSV.',
             )
-            domain_samples_form = QtWidgets.QFormLayout()
-            domain_samples_group.setLayout(domain_samples_form)
             domain_output_layout = QtWidgets.QHBoxLayout()
             domain_output_layout.addWidget(self.domain_samples_output_edit)
             domain_output_layout.addWidget(self.domain_samples_browse)
@@ -8044,12 +8771,10 @@ if __name__ == "__main__":
             domain_samples_form.addRow('', self.start_domaining_btn)
             operations_form.addRow(domain_samples_group)
 
-            block_value_transfer_group = QtWidgets.QGroupBox('Assign Block Columns To Samples')
-            block_value_transfer_group.setToolTip(
-                'Copy selected block columns onto sample rows by matching each sample to its containing block.'
+            block_value_transfer_group, block_value_transfer_form = create_collapsible_operation_section(
+                'Assign Block Columns To Samples',
+                'Copy selected block columns onto sample rows by matching each sample to its containing block.',
             )
-            block_value_transfer_form = QtWidgets.QFormLayout()
-            block_value_transfer_group.setLayout(block_value_transfer_form)
             block_value_transfer_output_layout = QtWidgets.QHBoxLayout()
             block_value_transfer_output_layout.addWidget(self.block_value_transfer_output_edit)
             block_value_transfer_output_layout.addWidget(self.block_value_transfer_browse)
@@ -8066,12 +8791,10 @@ if __name__ == "__main__":
             block_value_transfer_form.addRow('', self.start_block_value_transfer_btn)
             operations_form.addRow(block_value_transfer_group)
 
-            block_metrics_group = QtWidgets.QGroupBox('Block Domain Sample Metrics')
-            block_metrics_group.setToolTip(
-                'Export per-block nearest distance, average block-to-sample distance, closest sample ID, and optional distance-band sample counts within each domain.'
+            block_metrics_group, block_metrics_form = create_collapsible_operation_section(
+                'Block Domain Sample Metrics',
+                'Export per-block nearest distance, average block-to-sample distance, closest sample ID, and optional distance-band sample counts within each domain.',
             )
-            block_metrics_form = QtWidgets.QFormLayout()
-            block_metrics_group.setLayout(block_metrics_form)
             block_metrics_output_layout = QtWidgets.QHBoxLayout()
             block_metrics_output_layout.addWidget(self.block_domain_metrics_output_edit)
             block_metrics_output_layout.addWidget(self.block_domain_metrics_browse)
@@ -8107,12 +8830,10 @@ if __name__ == "__main__":
             block_metrics_form.addRow('', self.start_block_domain_metrics_btn)
             operations_form.addRow(block_metrics_group)
 
-            domain_confidence_group = QtWidgets.QGroupBox('Domain Interpolation Confidence')
-            domain_confidence_group.setToolTip(
-                'Summarize each domain with average sample spacing, average distance from blocks to samples, and their ratio.'
+            domain_confidence_group, domain_confidence_form = create_collapsible_operation_section(
+                'Domain Interpolation Confidence',
+                'Summarize each domain with average sample spacing, average distance from blocks to samples, and their ratio.',
             )
-            domain_confidence_form = QtWidgets.QFormLayout()
-            domain_confidence_group.setLayout(domain_confidence_form)
             domain_confidence_output_layout = QtWidgets.QHBoxLayout()
             domain_confidence_output_layout.addWidget(self.domain_interpolation_confidence_output_edit)
             domain_confidence_output_layout.addWidget(self.domain_interpolation_confidence_browse)
@@ -8123,12 +8844,10 @@ if __name__ == "__main__":
             domain_confidence_form.addRow('', self.start_domain_interpolation_confidence_btn)
             operations_form.addRow(domain_confidence_group)
 
-            block_volume_group = QtWidgets.QGroupBox('Block Volume Weighted Average')
-            block_volume_group.setToolTip(
-                'Infer per-row block volumes when needed and export a volume-weighted average for the selected blocks column.'
+            block_volume_group, block_volume_form = create_collapsible_operation_section(
+                'Block Volume Weighted Average',
+                'Infer per-row block volumes when needed and export a volume-weighted average for the selected blocks column.',
             )
-            block_volume_form = QtWidgets.QFormLayout()
-            block_volume_group.setLayout(block_volume_form)
             block_volume_output_layout = QtWidgets.QHBoxLayout()
             block_volume_output_layout.addWidget(self.block_volume_weighted_output_edit)
             block_volume_output_layout.addWidget(self.block_volume_weighted_browse)
@@ -8141,12 +8860,57 @@ if __name__ == "__main__":
             block_volume_form.addRow('', self.start_block_volume_weighted_btn)
             operations_form.addRow(block_volume_group)
 
-            equation_finder_group = QtWidgets.QGroupBox('Equation Finder By Domain')
-            equation_finder_group.setToolTip(
-                'Run symbolic regression independently on each domain to search for equations that explain the selected target from the chosen predictors.'
+            bmf_export_group, bmf_export_form = create_collapsible_operation_section(
+                'CSV Grid To BMF',
+                'Convert a regular CSV grid into the experimental TBMS2.0 BMF writer backend used by the standalone exporter.',
             )
-            equation_finder_form = QtWidgets.QFormLayout()
-            equation_finder_group.setLayout(equation_finder_form)
+            bmf_export_input_layout = QtWidgets.QHBoxLayout()
+            bmf_export_input_layout.addWidget(self.bmf_export_input_edit)
+            bmf_export_input_layout.addWidget(self.bmf_export_input_browse)
+            bmf_export_form.addRow('Input CSV', bmf_export_input_layout)
+            bmf_export_output_layout = QtWidgets.QHBoxLayout()
+            bmf_export_output_layout.addWidget(self.bmf_export_output_edit)
+            bmf_export_output_layout.addWidget(self.bmf_export_output_browse)
+            bmf_export_form.addRow('Output BMF', bmf_export_output_layout)
+            bmf_export_form.addRow('Input Delimiter', self.bmf_export_delim)
+            bmf_export_form.addRow('Input Header Line', self.bmf_export_header_line)
+            bmf_export_form.addRow('Backend', self.bmf_export_backend_combo)
+            bmf_export_cell_layout = QtWidgets.QHBoxLayout()
+            bmf_export_cell_layout.addWidget(self.bmf_export_cell_x)
+            bmf_export_cell_layout.addWidget(self.bmf_export_cell_y)
+            bmf_export_cell_layout.addWidget(self.bmf_export_cell_z)
+            bmf_export_form.addRow('Cell Size X / Y / Z', bmf_export_cell_layout)
+            bmf_export_regularize_layout = QtWidgets.QVBoxLayout()
+            bmf_export_regularize_layout.addWidget(self.bmf_export_regularize_base_blocks)
+            bmf_export_regularize_layout.addWidget(self.bmf_export_regularize_warning)
+            bmf_export_form.addRow('', bmf_export_regularize_layout)
+            bmf_export_coords_layout = QtWidgets.QHBoxLayout()
+            bmf_export_coords_layout.addWidget(self.bmf_export_x_col)
+            bmf_export_coords_layout.addWidget(self.bmf_export_y_col)
+            bmf_export_coords_layout.addWidget(self.bmf_export_z_col)
+            bmf_export_form.addRow('X / Y / Z Columns', bmf_export_coords_layout)
+            bmf_export_form.addRow('Value Columns', self.bmf_export_value_cols)
+            bmf_export_value_buttons = QtWidgets.QHBoxLayout()
+            bmf_export_value_buttons.addWidget(self.bmf_export_select_all_btn)
+            bmf_export_value_buttons.addWidget(self.bmf_export_clear_btn)
+            bmf_export_form.addRow('', bmf_export_value_buttons)
+            bmf_export_form.addRow('', self.bmf_export_value_summary)
+            bmf_export_form.addRow('Value Exceptions', self.bmf_export_exception_table)
+            bmf_export_exception_buttons = QtWidgets.QHBoxLayout()
+            bmf_export_exception_buttons.addWidget(self.bmf_export_exception_add_btn)
+            bmf_export_exception_buttons.addWidget(self.bmf_export_exception_remove_btn)
+            bmf_export_form.addRow('', bmf_export_exception_buttons)
+            bmf_export_form.addRow('', self.bmf_export_exception_summary)
+            self.start_bmf_export_btn.setToolTip(
+                'Export the selected CSV grid to BMF using the standalone reverse-engineered backend.'
+            )
+            bmf_export_form.addRow('', self.start_bmf_export_btn)
+            operations_form.addRow(bmf_export_group)
+
+            equation_finder_group, equation_finder_form = create_collapsible_operation_section(
+                'Equation Finder By Domain',
+                'Run symbolic regression independently on each domain to search for equations that explain the selected target from the chosen predictors.',
+            )
             equation_output_layout = QtWidgets.QHBoxLayout()
             equation_output_layout.addWidget(self.equation_finder_output_edit)
             equation_output_layout.addWidget(self.equation_finder_browse)
@@ -8226,6 +8990,17 @@ if __name__ == "__main__":
             self.block_volume_weighted_browse.clicked.connect(browse_block_volume_weighted_output)
             self.configure_block_volume_weighted_filters_btn.clicked.connect(self.configure_block_volume_weighted_filters)
             self.start_block_volume_weighted_btn.clicked.connect(self.run_block_volume_weighted_average_only)
+            self.bmf_export_input_browse.clicked.connect(browse_bmf_export_input)
+            self.bmf_export_output_browse.clicked.connect(browse_bmf_export_output)
+            self.bmf_export_select_all_btn.clicked.connect(lambda: self._set_all_bmf_export_value_columns_checked(True))
+            self.bmf_export_clear_btn.clicked.connect(lambda: self._set_all_bmf_export_value_columns_checked(False))
+            self.bmf_export_value_cols.itemChanged.connect(self._update_bmf_export_value_summary)
+            self.bmf_export_exception_add_btn.clicked.connect(self._add_bmf_export_exception_row)
+            self.bmf_export_exception_remove_btn.clicked.connect(self._remove_selected_bmf_export_exception_rows)
+            self.bmf_export_exception_table.itemChanged.connect(lambda _item: self._update_bmf_export_exception_summary())
+            self.start_bmf_export_btn.clicked.connect(self.run_csv_to_bmf_export_only)
+            self.bmf_export_regularize_base_blocks.toggled.connect(self._update_bmf_export_regularize_warning)
+            self._update_bmf_export_regularize_warning()
             self.equation_finder_browse.clicked.connect(browse_equation_finder_output)
             self.start_equation_finder_btn.clicked.connect(self.run_equation_finder_only)
             self.equation_refresh_predictors_btn.clicked.connect(self._refresh_equation_finder_predictor_columns)
@@ -8239,6 +9014,16 @@ if __name__ == "__main__":
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_domain_interpolation_confidence_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_volume_weighted_output_path())
+            self.interp_edit.textChanged.connect(lambda _: refresh_bmf_export_input_path())
+            self.blocks_edit.textChanged.connect(lambda _: refresh_bmf_export_input_path())
+            self.bmf_export_input_edit.textChanged.connect(lambda _: sync_bmf_export_input_settings())
+            self.bmf_export_input_edit.textChanged.connect(lambda _: self._refresh_bmf_export_columns())
+            self.bmf_export_input_edit.textChanged.connect(lambda _: refresh_bmf_export_output_path())
+            self.bmf_export_delim.currentIndexChanged.connect(self._refresh_bmf_export_columns)
+            self.bmf_export_header_line.valueChanged.connect(lambda _: self._refresh_bmf_export_columns())
+            self.bmf_export_x_col.currentTextChanged.connect(lambda _: self._refresh_bmf_export_columns())
+            self.bmf_export_y_col.currentTextChanged.connect(lambda _: self._refresh_bmf_export_columns())
+            self.bmf_export_z_col.currentTextChanged.connect(lambda _: self._refresh_bmf_export_columns())
             self.samples_edit.textChanged.connect(lambda _: refresh_equation_finder_output_path())
             self.block_domain_col.currentTextChanged.connect(lambda _: refresh_domain_samples_output_path())
             self.block_domain_col.currentTextChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
@@ -8260,6 +9045,10 @@ if __name__ == "__main__":
             refresh_block_domain_metrics_output_path(force=True)
             refresh_domain_interpolation_confidence_output_path(force=True)
             refresh_block_volume_weighted_output_path(force=True)
+            refresh_bmf_export_input_path(force=True)
+            sync_bmf_export_input_settings()
+            self._refresh_bmf_export_columns()
+            refresh_bmf_export_output_path(force=True)
             refresh_equation_finder_output_path(force=True)
             self._refresh_equation_finder_predictor_columns()
             self._update_block_domain_metrics_filters_summary()
@@ -8697,7 +9486,7 @@ if __name__ == "__main__":
                 'samples_file': self.samples_edit.text(),
                 'blocks_file': self.blocks_edit.text(),
                 'color_file': self.color_edit.text(),
-                'interpolation_file': self.interp_edit.text(),
+                'interpolation_file': resolve_interpolation_csv_export_path(self.interp_edit.text()),
                 'export_block_evaluated_samples': self.block_evaluated_samples_enabled.isChecked(),
                 'block_evaluated_samples_file': self.block_evaluated_samples_edit.text(),
                 'domain_samples_file': self.domain_samples_output_edit.text(),
@@ -8706,6 +9495,19 @@ if __name__ == "__main__":
                 'block_domain_metrics_file': self.block_domain_metrics_output_edit.text(),
                 'domain_interpolation_confidence_file': self.domain_interpolation_confidence_output_edit.text(),
                 'block_volume_weighted_file': self.block_volume_weighted_output_edit.text(),
+                'bmf_export_input_file': self.bmf_export_input_edit.text(),
+                'bmf_export_output_file': self.bmf_export_output_edit.text(),
+                'bmf_export_delimiter': self.bmf_export_delim.currentText(),
+                'bmf_export_header_line': self.bmf_export_header_line.value(),
+                'bmf_export_backend': self.bmf_export_backend_combo.currentText(),
+                'bmf_export_cell_size': self._get_bmf_export_cell_size(),
+                'bmf_export_regularize_to_base_block': self.bmf_export_regularize_base_blocks.isChecked(),
+                'bmf_export_x_col': self.bmf_export_x_col.currentText(),
+                'bmf_export_y_col': self.bmf_export_y_col.currentText(),
+                'bmf_export_z_col': self.bmf_export_z_col.currentText(),
+                'bmf_export_value_cols': self._get_selected_bmf_export_value_columns(),
+                'bmf_export_column_types': self._get_bmf_export_column_type_overrides(include_unselected=True),
+                'bmf_export_value_exceptions': self._get_bmf_export_value_exceptions(),
                 'equation_finder_file': self.equation_finder_output_edit.text(),
                 'block_domain_metrics_closest_sample_id_cols': [cb.currentText() for cb in self.block_domain_metrics_id_cols],
                 'block_domain_metrics_distance_counts_enabled': self.block_domain_metrics_distance_counts_enabled.isChecked(),
@@ -8811,7 +9613,7 @@ if __name__ == "__main__":
                 if 'samples_file' in config: self.samples_edit.setText(config['samples_file'])
                 if 'blocks_file' in config: self.blocks_edit.setText(config['blocks_file'])
                 if 'color_file' in config: self.color_edit.setText(config['color_file'])
-                if 'interpolation_file' in config: self.interp_edit.setText(config['interpolation_file'])
+                if 'interpolation_file' in config: self.interp_edit.setText(resolve_interpolation_csv_export_path(config['interpolation_file']))
                 if 'export_block_evaluated_samples' in config: self.block_evaluated_samples_enabled.setChecked(bool(config['export_block_evaluated_samples']))
                 if 'block_evaluated_samples_file' in config: self.block_evaluated_samples_edit.setText(config['block_evaluated_samples_file'])
                 self.block_domain_metrics_output_edit.setText('')
@@ -8836,6 +9638,61 @@ if __name__ == "__main__":
                 if 'block_domain_metrics_file' in config: self.block_domain_metrics_output_edit.setText(config['block_domain_metrics_file'])
                 if 'domain_interpolation_confidence_file' in config: self.domain_interpolation_confidence_output_edit.setText(config['domain_interpolation_confidence_file'])
                 if 'block_volume_weighted_file' in config: self.block_volume_weighted_output_edit.setText(config['block_volume_weighted_file'])
+                if 'bmf_export_input_file' in config: self.bmf_export_input_edit.setText(config['bmf_export_input_file'])
+                if 'bmf_export_output_file' in config: self.bmf_export_output_edit.setText(config['bmf_export_output_file'])
+                if 'bmf_export_delimiter' in config: self.bmf_export_delim.setCurrentText(config['bmf_export_delimiter'])
+                if 'bmf_export_header_line' in config: self.bmf_export_header_line.setValue(int(config['bmf_export_header_line']))
+                if 'bmf_export_backend' in config: self.bmf_export_backend_combo.setCurrentText(config['bmf_export_backend'])
+                if 'bmf_export_cell_size' in config: self._set_bmf_export_cell_size(config.get('bmf_export_cell_size'))
+                if 'bmf_export_regularize_to_base_block' in config:
+                    self.bmf_export_regularize_base_blocks.setChecked(bool(config.get('bmf_export_regularize_to_base_block')))
+                self._update_bmf_export_regularize_warning()
+                if 'bmf_export_value_exceptions' in config:
+                    self._set_bmf_export_value_exceptions(config.get('bmf_export_value_exceptions'))
+                else:
+                    self._set_bmf_export_value_exceptions({})
+                pending_bmf_x_col = str(config.get('bmf_export_x_col') or '').strip()
+                pending_bmf_y_col = str(config.get('bmf_export_y_col') or '').strip()
+                pending_bmf_z_col = str(config.get('bmf_export_z_col') or '').strip()
+                pending_bmf_value_cols = None
+                pending_bmf_column_types = {}
+                if 'bmf_export_value_cols' in config:
+                    raw_bmf_value_cols = config['bmf_export_value_cols']
+                    if isinstance(raw_bmf_value_cols, str):
+                        pending_bmf_value_cols = [
+                            token.strip()
+                            for token in raw_bmf_value_cols.split(',')
+                            if token.strip()
+                        ]
+                    else:
+                        pending_bmf_value_cols = [
+                            str(token).strip()
+                            for token in (raw_bmf_value_cols or [])
+                            if str(token).strip()
+                        ]
+                raw_bmf_column_types = config.get('bmf_export_column_types')
+                if isinstance(raw_bmf_column_types, dict):
+                    pending_bmf_column_types = {
+                        str(column_name).strip(): normalize_bmf_export_field_type_name(field_type)
+                        for column_name, field_type in raw_bmf_column_types.items()
+                        if str(column_name).strip()
+                    }
+                elif raw_bmf_column_types not in (None, ''):
+                    pending_bmf_column_types = parse_bmf_export_column_types(raw_bmf_column_types)
+                if hasattr(self, '_refresh_bmf_export_columns'):
+                    self._pending_bmf_export_value_cols = pending_bmf_value_cols
+                    self._pending_bmf_export_column_types = pending_bmf_column_types
+                    self._bmf_export_value_cols_initialized = False
+                    self._refresh_bmf_export_columns()
+                    if pending_bmf_x_col:
+                        self.bmf_export_x_col.setCurrentText(pending_bmf_x_col)
+                    if pending_bmf_y_col:
+                        self.bmf_export_y_col.setCurrentText(pending_bmf_y_col)
+                    if pending_bmf_z_col:
+                        self.bmf_export_z_col.setCurrentText(pending_bmf_z_col)
+                    self._pending_bmf_export_value_cols = pending_bmf_value_cols
+                    self._pending_bmf_export_column_types = pending_bmf_column_types
+                    self._refresh_bmf_export_columns()
                 if 'equation_finder_file' in config: self.equation_finder_output_edit.setText(config['equation_finder_file'])
                 self._pending_block_value_transfer_cols = list(config.get('block_value_transfer_cols', []))
                 if hasattr(self, '_refresh_block_value_transfer_columns'):
@@ -9123,7 +9980,7 @@ if __name__ == "__main__":
                 return
 
             try:
-                cols = parse_header_line(path, self.blocks_delim.currentText(), self.blocks_header_line.value())
+                cols = parse_effective_header_line(path, self.blocks_delim.currentText(), self.blocks_header_line.value())
                 excluded = {
                     str(self.block_x_col.currentText() or '').strip(),
                     str(self.block_y_col.currentText() or '').strip(),
@@ -9144,6 +10001,494 @@ if __name__ == "__main__":
             refresher = getattr(self, '_refresh_block_value_transfer_output_path', None)
             if callable(refresher):
                 refresher()
+
+        def _get_bmf_export_cell_size(self):
+            if not all(hasattr(self, name) for name in ['bmf_export_cell_x', 'bmf_export_cell_y', 'bmf_export_cell_z']):
+                return None
+            values = [
+                float(self.bmf_export_cell_x.value()),
+                float(self.bmf_export_cell_y.value()),
+                float(self.bmf_export_cell_z.value()),
+            ]
+            positive = [value for value in values if value > 0]
+            if not positive:
+                return None
+            if len(positive) != 3:
+                raise ValueError('BMF cell size must be set for X, Y, and Z, or left as Auto for all three axes.')
+            return values
+
+        def _set_bmf_export_cell_size(self, cell_size):
+            if not all(hasattr(self, name) for name in ['bmf_export_cell_x', 'bmf_export_cell_y', 'bmf_export_cell_z']):
+                return
+            spins = [self.bmf_export_cell_x, self.bmf_export_cell_y, self.bmf_export_cell_z]
+            if not cell_size:
+                for spin in spins:
+                    spin.setValue(0.0)
+                return
+            try:
+                values = [float(value) for value in cell_size]
+            except Exception:
+                values = []
+            if len(values) != 3 or any(value <= 0 for value in values):
+                for spin in spins:
+                    spin.setValue(0.0)
+                return
+            for spin, value in zip(spins, values):
+                spin.setValue(value)
+
+        def _update_bmf_export_regularize_warning(self):
+            if not hasattr(self, 'bmf_export_regularize_warning') or not hasattr(self, 'bmf_export_regularize_base_blocks'):
+                return
+            self.bmf_export_regularize_warning.setVisible(not self.bmf_export_regularize_base_blocks.isChecked())
+
+        def _get_selected_bmf_export_value_columns(self):
+            if not hasattr(self, 'bmf_export_value_cols'):
+                return []
+            selected = []
+            for row_index in range(self.bmf_export_value_cols.rowCount()):
+                item = self.bmf_export_value_cols.item(row_index, 0)
+                if item is not None and item.checkState() == QtCore.Qt.Checked:
+                    selected.append(item.text())
+            return selected
+
+        def _normalize_bmf_export_value_exceptions(self, raw_exceptions):
+            normalized = {}
+            if isinstance(raw_exceptions, list):
+                for entry in raw_exceptions:
+                    if not isinstance(entry, dict):
+                        continue
+                    column_name = str(entry.get('column') or '').strip()
+                    bad_value = str(entry.get('value') or '')
+                    replacement = '' if entry.get('replacement') is None else str(entry.get('replacement'))
+                    include_in_regularization = self._coerce_bmf_exception_include_flag(
+                        entry.get('include_in_regularization', entry.get('include_regularization', False))
+                    )
+                    if column_name and bad_value:
+                        normalized.setdefault(column_name, {})[bad_value] = {
+                            'replacement': replacement,
+                            'include_in_regularization': include_in_regularization,
+                        }
+                return normalized
+            for raw_column, raw_rules in dict(raw_exceptions or {}).items():
+                column_name = str(raw_column or '').strip()
+                if not column_name or not isinstance(raw_rules, dict):
+                    continue
+                for raw_value, raw_rule in raw_rules.items():
+                    bad_value = str(raw_value)
+                    if not bad_value:
+                        continue
+                    if isinstance(raw_rule, dict):
+                        replacement = raw_rule.get('replacement', '')
+                        include_in_regularization = self._coerce_bmf_exception_include_flag(
+                            raw_rule.get('include_in_regularization', raw_rule.get('include_regularization', False))
+                        )
+                    else:
+                        replacement = raw_rule
+                        include_in_regularization = False
+                    normalized.setdefault(column_name, {})[bad_value] = {
+                        'replacement': '' if replacement is None else str(replacement),
+                        'include_in_regularization': include_in_regularization,
+                    }
+            return normalized
+
+        def _coerce_bmf_exception_include_flag(self, value):
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return False
+            text = str(value).strip().lower()
+            return text in {'1', 'true', 'yes', 'y', 'on', 'checked'}
+
+        def _make_bmf_exception_include_item(self, include_in_regularization=False):
+            item = QtWidgets.QTableWidgetItem('')
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked if include_in_regularization else QtCore.Qt.Unchecked)
+            item.setToolTip('When checked, the replacement is applied before base-block regularization and can contribute to numeric averages.')
+            return item
+
+        def _extract_bmf_exception_rule_fields(self, raw_rule):
+            if isinstance(raw_rule, dict):
+                replacement = raw_rule.get('replacement', '')
+                include_in_regularization = self._coerce_bmf_exception_include_flag(
+                    raw_rule.get('include_in_regularization', raw_rule.get('include_regularization', False))
+                )
+            else:
+                replacement = raw_rule
+                include_in_regularization = False
+            return '' if replacement is None else str(replacement), include_in_regularization
+
+        def _get_bmf_export_value_exceptions(self):
+            if not hasattr(self, 'bmf_export_exception_table'):
+                return {}
+            rules = {}
+            for row_index in range(self.bmf_export_exception_table.rowCount()):
+                column_item = self.bmf_export_exception_table.item(row_index, 0)
+                value_item = self.bmf_export_exception_table.item(row_index, 1)
+                replacement_item = self.bmf_export_exception_table.item(row_index, 2)
+                include_item = self.bmf_export_exception_table.item(row_index, 3)
+                column_name = str(column_item.text() if column_item is not None else '').strip()
+                bad_value = str(value_item.text() if value_item is not None else '')
+                replacement = str(replacement_item.text() if replacement_item is not None else '')
+                include_in_regularization = bool(
+                    include_item is not None and include_item.checkState() == QtCore.Qt.Checked
+                )
+                if column_name and bad_value:
+                    if include_in_regularization:
+                        rules.setdefault(column_name, {})[bad_value] = {
+                            'replacement': replacement,
+                            'include_in_regularization': True,
+                        }
+                    else:
+                        rules.setdefault(column_name, {})[bad_value] = replacement
+            return rules
+
+        def _set_bmf_export_value_exceptions(self, raw_exceptions):
+            if not hasattr(self, 'bmf_export_exception_table'):
+                return
+            rules = self._normalize_bmf_export_value_exceptions(raw_exceptions)
+            blocker = QtCore.QSignalBlocker(self.bmf_export_exception_table)
+            try:
+                rows = []
+                for column_name, column_rules in rules.items():
+                    for bad_value, raw_rule in column_rules.items():
+                        replacement, include_in_regularization = self._extract_bmf_exception_rule_fields(raw_rule)
+                        rows.append((column_name, bad_value, replacement, include_in_regularization))
+                self.bmf_export_exception_table.setRowCount(len(rows))
+                for row_index, (column_name, bad_value, replacement, include_in_regularization) in enumerate(rows):
+                    self.bmf_export_exception_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(column_name))
+                    self.bmf_export_exception_table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(bad_value))
+                    self.bmf_export_exception_table.setItem(row_index, 2, QtWidgets.QTableWidgetItem(replacement))
+                    self.bmf_export_exception_table.setItem(
+                        row_index,
+                        3,
+                        self._make_bmf_exception_include_item(include_in_regularization),
+                    )
+            finally:
+                del blocker
+            self.bmf_export_value_exceptions = rules
+            self._update_bmf_export_exception_summary()
+
+        def _add_bmf_export_exception_row(self, column_name='', bad_value='', replacement='', include_in_regularization=False):
+            if not hasattr(self, 'bmf_export_exception_table'):
+                return
+            if not column_name:
+                selected_columns = self._get_selected_bmf_export_value_columns()
+                column_name = selected_columns[0] if selected_columns else ''
+            row_index = self.bmf_export_exception_table.rowCount()
+            self.bmf_export_exception_table.insertRow(row_index)
+            self.bmf_export_exception_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(str(column_name or '')))
+            self.bmf_export_exception_table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(str(bad_value or '')))
+            self.bmf_export_exception_table.setItem(row_index, 2, QtWidgets.QTableWidgetItem('' if replacement is None else str(replacement)))
+            self.bmf_export_exception_table.setItem(row_index, 3, self._make_bmf_exception_include_item(include_in_regularization))
+            self.bmf_export_exception_table.setCurrentCell(row_index, 1)
+            self._update_bmf_export_exception_summary()
+
+        def _remove_selected_bmf_export_exception_rows(self):
+            if not hasattr(self, 'bmf_export_exception_table'):
+                return
+            rows = sorted({index.row() for index in self.bmf_export_exception_table.selectedIndexes()}, reverse=True)
+            if not rows and self.bmf_export_exception_table.currentRow() >= 0:
+                rows = [self.bmf_export_exception_table.currentRow()]
+            for row_index in rows:
+                self.bmf_export_exception_table.removeRow(row_index)
+            self._update_bmf_export_exception_summary()
+
+        def _update_bmf_export_exception_summary(self):
+            if not hasattr(self, 'bmf_export_exception_summary'):
+                return
+            rules = self._get_bmf_export_value_exceptions()
+            self.bmf_export_value_exceptions = rules
+            count = sum(len(column_rules) for column_rules in rules.values())
+            if count == 0:
+                self.bmf_export_exception_summary.setText('No BMF value exceptions configured.')
+                return
+            self.bmf_export_exception_summary.setText(
+                f'{count} BMF value exception rule(s) configured. Checked rules are applied before regularization; blank replacements are exported as null/default values.'
+            )
+
+        def _parse_bmf_numeric_type_error(self, error_text):
+            text = str(error_text or '')
+            match = re.search(
+                r"Column (?P<column>.+?) cannot be exported as (?P<field_type>int|double).*?Invalid values include: (?P<values>\[[^\]]*\])",
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not match:
+                return None
+            try:
+                values = ast.literal_eval(match.group('values'))
+            except Exception:
+                values = []
+            if not values:
+                return None
+            column_name = str(match.group('column')).strip().strip('"\'')
+            return {
+                'column': column_name,
+                'field_type': match.group('field_type').lower(),
+                'value': str(values[0]),
+                'values': [str(value) for value in values],
+            }
+
+        def _prompt_bmf_value_exception(self, column_name, bad_value, field_type='double'):
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle('BMF Value Exception')
+            layout = QtWidgets.QVBoxLayout(dialog)
+            label = QtWidgets.QLabel(
+                f"Column '{column_name}' is being exported as {field_type}, but value '{bad_value}' is not numeric."
+            )
+            label.setWordWrap(True)
+            layout.addWidget(label)
+            replacement_edit = QtWidgets.QLineEdit()
+            replacement_edit.setPlaceholderText('Numeric replacement')
+            blank_check = QtWidgets.QCheckBox('Replace with blank/null')
+            blank_check.setChecked(True)
+            replacement_edit.setEnabled(False)
+
+            def sync_replacement_enabled(checked):
+                replacement_edit.setEnabled(not checked)
+
+            blank_check.toggled.connect(sync_replacement_enabled)
+            layout.addWidget(blank_check)
+            layout.addWidget(replacement_edit)
+            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                return None
+            if blank_check.isChecked():
+                return ''
+            replacement = replacement_edit.text().strip()
+            if not replacement:
+                return ''
+            try:
+                float(replacement)
+            except ValueError:
+                QtWidgets.QMessageBox.warning(self, 'Invalid Replacement', 'Replacement must be numeric or blank.')
+                return self._prompt_bmf_value_exception(column_name, bad_value, field_type=field_type)
+            return replacement
+
+        def _set_selected_bmf_export_value_columns(self, column_names):
+            if not hasattr(self, 'bmf_export_value_cols'):
+                return
+            desired = {str(name or '').strip() for name in (column_names or []) if str(name or '').strip()}
+            blocker = QtCore.QSignalBlocker(self.bmf_export_value_cols)
+            try:
+                for row_index in range(self.bmf_export_value_cols.rowCount()):
+                    item = self.bmf_export_value_cols.item(row_index, 0)
+                    if item is not None:
+                        item.setCheckState(QtCore.Qt.Checked if item.text() in desired else QtCore.Qt.Unchecked)
+            finally:
+                del blocker
+            self._update_bmf_export_value_summary()
+
+        def _set_all_bmf_export_value_columns_checked(self, checked):
+            if not hasattr(self, 'bmf_export_value_cols'):
+                return
+            blocker = QtCore.QSignalBlocker(self.bmf_export_value_cols)
+            try:
+                for row_index in range(self.bmf_export_value_cols.rowCount()):
+                    item = self.bmf_export_value_cols.item(row_index, 0)
+                    if item is not None:
+                        item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+            finally:
+                del blocker
+            self._update_bmf_export_value_summary()
+
+        def _get_bmf_export_column_type_overrides(self, include_unselected=False):
+            if not hasattr(self, 'bmf_export_value_cols'):
+                return {}
+            overrides = {}
+            for row_index in range(self.bmf_export_value_cols.rowCount()):
+                item = self.bmf_export_value_cols.item(row_index, 0)
+                combo = self.bmf_export_value_cols.cellWidget(row_index, 1)
+                if item is None or combo is None:
+                    continue
+                if not include_unselected and item.checkState() != QtCore.Qt.Checked:
+                    continue
+                field_type = normalize_bmf_export_field_type_name(combo.currentData() or combo.currentText())
+                inferred_type = normalize_bmf_export_field_type_name(combo.property('bmf_inferred_type') or '')
+                is_explicit = bool(combo.property('bmf_type_is_explicit'))
+                if field_type and inferred_type == field_type and not is_explicit:
+                    continue
+                if field_type:
+                    overrides[item.text()] = field_type
+            return overrides
+
+        def _set_bmf_export_column_type_overrides(self, column_types, include_unselected=True):
+            if not hasattr(self, 'bmf_export_value_cols'):
+                return
+            normalized_types = {
+                str(column_name).strip(): normalize_bmf_export_field_type_name(field_type)
+                for column_name, field_type in dict(column_types or {}).items()
+                if str(column_name).strip()
+            }
+            for row_index in range(self.bmf_export_value_cols.rowCount()):
+                item = self.bmf_export_value_cols.item(row_index, 0)
+                combo = self.bmf_export_value_cols.cellWidget(row_index, 1)
+                if item is None or combo is None:
+                    continue
+                if not include_unselected and item.checkState() != QtCore.Qt.Checked:
+                    continue
+                combo.setProperty('bmf_type_is_explicit', True)
+                combo.setCurrentIndex(max(combo.findData(normalized_types.get(item.text(), '')), 0))
+
+        def _update_bmf_export_value_summary(self):
+            if not hasattr(self, 'bmf_export_value_summary'):
+                return
+            total = self.bmf_export_value_cols.rowCount() if hasattr(self, 'bmf_export_value_cols') else 0
+            selected = len(self._get_selected_bmf_export_value_columns())
+            if total == 0:
+                self.bmf_export_value_summary.setText('No export value columns loaded.')
+                return
+            if selected == 0:
+                self.bmf_export_value_summary.setText(
+                    f'0 of {total} value columns selected. Select one or more columns to export.'
+                )
+                return
+            self.bmf_export_value_summary.setText(
+                f'{selected} of {total} eligible non-coordinate columns selected for export.'
+            )
+
+        def _refresh_bmf_export_columns(self):
+            if not all(hasattr(self, name) for name in [
+                'bmf_export_input_edit',
+                'bmf_export_x_col',
+                'bmf_export_y_col',
+                'bmf_export_z_col',
+                'bmf_export_value_cols',
+            ]):
+                return
+
+            path = self.bmf_export_input_edit.text().strip()
+            delimiter = self.bmf_export_delim.currentText() if hasattr(self, 'bmf_export_delim') else ','
+            header_line = self.bmf_export_header_line.value() if hasattr(self, 'bmf_export_header_line') else 1
+            pending_selection = getattr(self, '_pending_bmf_export_value_cols', None)
+            pending_column_types = getattr(self, '_pending_bmf_export_column_types', None)
+            current_selection = set(self._get_selected_bmf_export_value_columns())
+            current_column_types = self._get_bmf_export_column_type_overrides(include_unselected=True)
+            source_path = getattr(self, '_bmf_export_columns_source_path', '')
+            path_changed = path != source_path
+            if path_changed and pending_selection is None:
+                current_selection = set()
+                current_column_types = {}
+                self._bmf_export_value_cols_initialized = False
+
+            current_x = self.bmf_export_x_col.currentText()
+            current_y = self.bmf_export_y_col.currentText()
+            current_z = self.bmf_export_z_col.currentText()
+
+            blockers = [
+                QtCore.QSignalBlocker(self.bmf_export_x_col),
+                QtCore.QSignalBlocker(self.bmf_export_y_col),
+                QtCore.QSignalBlocker(self.bmf_export_z_col),
+                QtCore.QSignalBlocker(self.bmf_export_value_cols),
+            ]
+            try:
+                for cb in [self.bmf_export_x_col, self.bmf_export_y_col, self.bmf_export_z_col]:
+                    cb.clear()
+                self.bmf_export_value_cols.setRowCount(0)
+
+                if not path or not os.path.isfile(path):
+                    self._bmf_export_columns_source_path = path
+                    self._update_bmf_export_value_summary()
+                    return
+
+                try:
+                    cols = parse_effective_header_line(path, delimiter, header_line)
+                except Exception:
+                    self._bmf_export_columns_source_path = path
+                    self._update_bmf_export_value_summary()
+                    return
+
+                for cb in [self.bmf_export_x_col, self.bmf_export_y_col, self.bmf_export_z_col]:
+                    cb.addItems(cols)
+
+                def restore_or_suggest(cb, current_value, keywords):
+                    if current_value:
+                        idx = cb.findText(current_value)
+                        if idx >= 0:
+                            cb.setCurrentIndex(idx)
+                            return
+                    for keyword in keywords:
+                        for idx in range(cb.count()):
+                            if cb.itemText(idx).lower() == keyword:
+                                cb.setCurrentIndex(idx)
+                                return
+                    if cb.count() > 0 and cb.currentIndex() < 0:
+                        cb.setCurrentIndex(0)
+
+                restore_or_suggest(self.bmf_export_x_col, current_x, ['x', 'easting'])
+                restore_or_suggest(self.bmf_export_y_col, current_y, ['y', 'northing'])
+                restore_or_suggest(self.bmf_export_z_col, current_z, ['z', 'elevation', 'rl'])
+
+                excluded = {
+                    str(self.bmf_export_x_col.currentText() or '').strip(),
+                    str(self.bmf_export_y_col.currentText() or '').strip(),
+                    str(self.bmf_export_z_col.currentText() or '').strip(),
+                }
+                excluded = {value for value in excluded if value}
+                eligible_columns = [column_name for column_name in cols if column_name not in excluded]
+
+                desired_selection = set(pending_selection) if pending_selection is not None else current_selection
+                desired_column_types = dict(pending_column_types) if pending_column_types is not None else current_column_types
+                inferred_column_types = {}
+                try:
+                    preview_df, _ = load_samples_preview_dataframe(
+                        path,
+                        samples_delimiter=delimiter,
+                        samples_header_line=header_line,
+                        max_rows=1000,
+                    )
+                    inferred_column_types = infer_bmf_export_field_types_from_preview(
+                        preview_df,
+                        eligible_columns,
+                        delimiter=delimiter,
+                    )
+                except Exception:
+                    inferred_column_types = {}
+                desired_selection = {name for name in desired_selection if name in eligible_columns}
+                if not desired_selection and not getattr(self, '_bmf_export_value_cols_initialized', False):
+                    desired_selection = set(eligible_columns)
+
+                type_options = [
+                    ('Auto', ''),
+                    ('Boolean', 'boolean'),
+                    ('Integer', 'int'),
+                    ('Double', 'double'),
+                    ('String', 'string'),
+                ]
+                self.bmf_export_value_cols.setRowCount(len(eligible_columns))
+                for row_index, column_name in enumerate(eligible_columns):
+                    item = QtWidgets.QTableWidgetItem(column_name)
+                    item.setFlags(
+                        QtCore.Qt.ItemIsEnabled
+                        | QtCore.Qt.ItemIsSelectable
+                        | QtCore.Qt.ItemIsUserCheckable
+                    )
+                    item.setCheckState(QtCore.Qt.Checked if column_name in desired_selection else QtCore.Qt.Unchecked)
+                    self.bmf_export_value_cols.setItem(row_index, 0, item)
+
+                    combo = QtWidgets.QComboBox()
+                    for label, value in type_options:
+                        combo.addItem(label, value)
+                    has_explicit_type = column_name in desired_column_types
+                    inferred_type = inferred_column_types.get(column_name, '')
+                    default_type = desired_column_types.get(column_name, inferred_type)
+                    combo.setCurrentIndex(max(combo.findData(default_type), 0))
+                    combo.setProperty('bmf_inferred_type', inferred_type if not has_explicit_type else '')
+                    combo.setProperty('bmf_type_is_explicit', has_explicit_type)
+                    combo.activated.connect(lambda _index, cb=combo: cb.setProperty('bmf_type_is_explicit', True))
+                    self.bmf_export_value_cols.setCellWidget(row_index, 1, combo)
+
+                self._pending_bmf_export_value_cols = None
+                self._pending_bmf_export_column_types = None
+                self._bmf_export_value_cols_initialized = True
+                self._bmf_export_columns_source_path = path
+            finally:
+                del blockers
+
+            self._update_bmf_export_value_summary()
 
         def _get_selected_equation_predictor_columns(self):
             if not hasattr(self, 'equation_predictor_list'):
@@ -9184,7 +10529,7 @@ if __name__ == "__main__":
                 return
 
             try:
-                available_columns = parse_header_line(
+                available_columns = parse_effective_header_line(
                     samples_file,
                     self.samples_delim.currentText(),
                     self.samples_header_line.value(),
@@ -9245,10 +10590,11 @@ if __name__ == "__main__":
             self.start_block_domain_metrics_btn.setEnabled(enabled)
             self.start_domain_interpolation_confidence_btn.setEnabled(enabled)
             self.start_block_volume_weighted_btn.setEnabled(enabled)
+            self.start_bmf_export_btn.setEnabled(enabled)
             self.start_equation_finder_btn.setEnabled(enabled)
 
         def _run_operation_with_progress(self, title, initial_message, operation, kwargs,
-                                         success_handler, error_context):
+                                         success_handler, error_context, failure_handler=None):
             active_thread = getattr(self, '_active_operation_thread', None)
             if active_thread is not None and active_thread.isRunning():
                 QtWidgets.QMessageBox.warning(self, 'Operation Running', 'Another long-running operation is already in progress.')
@@ -9301,6 +10647,8 @@ if __name__ == "__main__":
                 print(f"{error_context}: {error_text}")
                 print(stack_text)
                 cleanup()
+                if callable(failure_handler) and failure_handler(error_text, stack_text):
+                    return
                 QtWidgets.QMessageBox.critical(self, 'Error', f'{error_context}:\n{error_text}')
 
             worker.progress.connect(handle_progress, QtCore.Qt.QueuedConnection)
@@ -9742,6 +11090,126 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block volume export:\n{str(e)}')
 
+        def run_csv_to_bmf_export_only(self):
+            """Export a CSV grid to BMF using the standalone reverse-engineered backend."""
+            try:
+                cfg = self.to_dict()
+                input_csv = str(cfg.get('bmf_export_input_file') or '').strip()
+                output_bmf = str(cfg.get('bmf_export_output_file') or '').strip()
+                if not input_csv or not os.path.isfile(input_csv):
+                    raise ValueError('Please select a valid input CSV file.')
+                if not output_bmf:
+                    raise ValueError('Please select an output BMF file.')
+                if not output_bmf.lower().endswith('.bmf'):
+                    output_bmf = f"{output_bmf}.bmf"
+                    self.bmf_export_output_edit.setText(output_bmf)
+
+                value_cols = [
+                    str(token).strip()
+                    for token in (cfg.get('bmf_export_value_cols') or [])
+                    if str(token).strip()
+                ]
+                if not value_cols:
+                    raise ValueError('Please select at least one value column to export.')
+                column_types = self._get_bmf_export_column_type_overrides(include_unselected=False)
+                unknown_typed_columns = [column_name for column_name in column_types if column_name not in value_cols]
+                if unknown_typed_columns:
+                    raise ValueError(
+                        'Column type overrides must refer only to selected value columns. '
+                        f'Unknown or unselected columns: {unknown_typed_columns}'
+                    )
+                regularize_to_base_block = bool(cfg.get('bmf_export_regularize_to_base_block', True))
+                bmf_cell_size = cfg.get('bmf_export_cell_size')
+                if regularize_to_base_block and not bmf_cell_size:
+                    block_size = cfg.get('block_size')
+                    try:
+                        block_size_values = [float(value) for value in block_size]
+                    except Exception:
+                        block_size_values = []
+                    if len(block_size_values) == 3 and all(value > 0 for value in block_size_values):
+                        bmf_cell_size = block_size_values
+                    else:
+                        raise ValueError(
+                            'Regularize to base block size requires Cell Size X/Y/Z values or valid configured block dimensions.'
+                        )
+                print("=" * 60)
+                print("Exporting CSV grid to BMF...")
+                print("=" * 60)
+
+                def handle_success(result):
+                    summary = result.get('summary', {}) or {}
+                    grid = summary.get('grid', {}) or {}
+                    value_text = ', '.join(summary.get('value_columns') or []) or 'Auto-detected non-coordinate columns'
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"BMF export complete!\nResults saved to:\n{summary.get('output_bmf', output_bmf)}\n\n"
+                            f"Backend: {summary.get('backend', cfg.get('bmf_export_backend'))}\n"
+                            f"Rows exported: {summary.get('rows', 0):,}\n"
+                            f"Grid dimensions: {tuple(grid.get('dimensions', []))}\n"
+                            f"Cell size: {tuple(grid.get('cell_size', []))}\n"
+                            f"Value columns: {value_text}"
+                        ),
+                    )
+
+                def make_export_kwargs():
+                    return {
+                        'input_csv': input_csv,
+                        'output_bmf': output_bmf,
+                        'x_col': str(cfg.get('bmf_export_x_col') or 'x').strip() or 'x',
+                        'y_col': str(cfg.get('bmf_export_y_col') or 'y').strip() or 'y',
+                        'z_col': str(cfg.get('bmf_export_z_col') or 'z').strip() or 'z',
+                        'value_cols': value_cols,
+                        'column_types': column_types,
+                        'value_exceptions': self._get_bmf_export_value_exceptions(),
+                        'backend': cfg.get('bmf_export_backend') or 'tbms-config-text',
+                        'delimiter': cfg.get('bmf_export_delimiter'),
+                        'header_line': cfg.get('bmf_export_header_line', 1),
+                        'cell_size': bmf_cell_size,
+                        'regularize_to_base_block': regularize_to_base_block,
+                    }
+
+                def handle_failure(error_text, _stack_text):
+                    parsed = self._parse_bmf_numeric_type_error(error_text)
+                    if not parsed:
+                        return False
+                    column_name = parsed['column']
+                    bad_value = parsed['value']
+                    replacement = self._prompt_bmf_value_exception(
+                        column_name,
+                        bad_value,
+                        field_type=parsed.get('field_type', 'double'),
+                    )
+                    if replacement is None:
+                        return False
+                    current_rules = self._get_bmf_export_value_exceptions()
+                    current_rules.setdefault(column_name, {})[bad_value] = replacement
+                    self._set_bmf_export_value_exceptions(current_rules)
+                    print(
+                        f"Added BMF value exception: column={column_name!r}, value={bad_value!r}, "
+                        f"replacement={replacement!r}. Retrying export..."
+                    )
+                    QtCore.QTimer.singleShot(0, start_export)
+                    return True
+
+                def start_export():
+                    self._run_operation_with_progress(
+                        'CSV To BMF Export',
+                        'Preparing BMF export...',
+                        export_csv_grid_to_bmf,
+                        make_export_kwargs(),
+                        handle_success,
+                        'An error occurred during CSV to BMF export',
+                        failure_handler=handle_failure,
+                    )
+
+                start_export()
+            except Exception as e:
+                print(f"Error during CSV to BMF export: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during CSV to BMF export:\n{str(e)}')
+
         def run_equation_finder_only(self):
             """Run domain-wise symbolic regression on the configured samples file."""
             try:
@@ -9843,7 +11311,8 @@ if __name__ == "__main__":
             """Run interpolation without visualization"""
             try:
                 cfg = self.to_dict(include_runtime_state=True)
-                interpolation_file = cfg['interpolation_file']
+                interpolation_file = resolve_interpolation_csv_export_path(cfg['interpolation_file'])
+                cfg['interpolation_file'] = interpolation_file
                 block_evaluated_samples_file = resolve_block_evaluated_samples_export_path(
                     cfg.get('export_block_evaluated_samples', False),
                     cfg.get('block_evaluated_samples_file'),
@@ -10091,7 +11560,9 @@ if __name__ == "__main__":
                         interpolator.generate_statistics(output_dir, domain_name="Global")
                 
                 # Export results (handles both single and multiple interpolators)
-                export_blocks_to_csv(blocks, interpolation_file)
+                interpolation_file = export_blocks_to_file(blocks, interpolation_file)
+                cfg['interpolation_file'] = interpolation_file
+                self.interp_edit.setText(interpolation_file)
                 if block_evaluated_samples_file:
                     export_block_evaluated_samples_to_csv(blocks, block_evaluated_samples_file)
                 print(f"Interpolation complete! Results saved to:\n  {interpolation_file}")

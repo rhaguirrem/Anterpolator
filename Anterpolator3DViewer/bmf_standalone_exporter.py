@@ -5,7 +5,7 @@ This tool is intentionally standalone so it can later be wired into the
 Anterpolator Operations panel without changing the core interpolation flow.
 
 Subcommands:
-- export: CSV regular grid -> Vulcan BMF or experimental TBMS2.0 container
+- export: CSV regular grid -> Vulcan BMF, TBMS config-text BMF, or experimental TBMS2.0 container
 - inspect: quick binary inspection for TBMS2.0-style BMF files
 """
 
@@ -21,7 +21,7 @@ import struct
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,31 +37,397 @@ TBMS_EXPERIMENTAL_SECTION_FLAGS = {
     "int32_le": 2,
     "float64_le": 3,
 }
+MAX_DENSE_EXPORT_BYTES = int(os.environ.get("ANTERPOLATOR_BMF_MAX_DENSE_BYTES", str(8 * 1024 ** 3)))
+SUPPORTED_EXPORT_BACKENDS = {"tbms-config-text", "tbms-experimental", "vulcan"}
+DENSE_EXPORT_BACKENDS = {"tbms-config-text", "vulcan"}
+MAX_SELECTED_CSV_OBJECT_BYTES = int(os.environ.get("ANTERPOLATOR_BMF_MAX_SELECTED_CSV_BYTES", str(8 * 1024 ** 3)))
 
 
-def _auto_read_csv(path: Path) -> pd.DataFrame:
-    """Read CSV with separator auto-detection fallback."""
+def _emit_progress(progress_callback, value: int, maximum: int = 100, message: str = "") -> None:
+    if progress_callback is None:
+        return
     try:
-        return pd.read_csv(path, sep=None, engine="python")
+        progress_callback(max(0, min(int(value), int(maximum))), int(maximum), str(message or ""))
     except Exception:
-        return pd.read_csv(path)
+        pass
+
+
+def _scale_progress(progress_start: int, progress_end: int, fraction: float) -> int:
+    fraction = max(0.0, min(float(fraction), 1.0))
+    return int(round(progress_start + (progress_end - progress_start) * fraction))
+
+
+def _format_byte_size(size_bytes: int | float) -> str:
+    value = float(size_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024.0 or unit == "TiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
+def _count_csv_data_rows(
+    path: Path,
+    header_line: int = 1,
+    progress_callback=None,
+    progress_start: int = 5,
+    progress_end: int = 8,
+) -> int | None:
+    try:
+        file_size = max(int(path.stat().st_size), 1)
+        total_lines = 0
+        bytes_read = 0
+        last_byte = b""
+        report_step = max(file_size // 100, 1)
+        next_report = report_step
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                total_lines += chunk.count(b"\n")
+                last_byte = chunk[-1:]
+                if bytes_read >= next_report or bytes_read >= file_size:
+                    _emit_progress(
+                        progress_callback,
+                        _scale_progress(progress_start, progress_end, bytes_read / file_size),
+                        100,
+                        f"Scanning CSV rows {bytes_read / file_size:.0%}...",
+                    )
+                    next_report = bytes_read + report_step
+        if file_size > 0 and last_byte not in (b"", b"\n", b"\r"):
+            total_lines += 1
+        return max(total_lines - max(int(header_line or 1), 1), 0)
+    except Exception:
+        return None
+
+
+def _read_csv_with_chunk_progress(
+    path: Path,
+    total_rows: int | None,
+    progress_callback=None,
+    progress_start: int = 8,
+    progress_end: int = 30,
+    chunksize: int = 250_000,
+    **read_kwargs,
+) -> pd.DataFrame:
+    chunks: List[pd.DataFrame] = []
+    rows_read = 0
+    reader = pd.read_csv(path, chunksize=chunksize, **read_kwargs)
+    for chunk in reader:
+        chunks.append(chunk)
+        rows_read += len(chunk)
+        if total_rows and total_rows > 0:
+            fraction = min(rows_read / total_rows, 1.0)
+            message = f"Reading CSV rows {rows_read:,}/{total_rows:,} ({fraction:.0%})..."
+        else:
+            fraction = 0.5
+            message = f"Reading CSV rows {rows_read:,}..."
+        _emit_progress(progress_callback, _scale_progress(progress_start, progress_end, fraction), 100, message)
+    if chunks:
+        return pd.concat(chunks, ignore_index=True)
+    return pd.DataFrame()
+
+
+def _auto_read_csv(
+    path: Path,
+    delimiter: str | None = None,
+    header_line: int = 1,
+    usecols: Sequence[str] | None = None,
+    progress_callback=None,
+    progress_start: int = 5,
+    progress_end: int = 30,
+) -> pd.DataFrame:
+    """Read CSV with optional explicit delimiter and header-line selection."""
+    header = max(int(header_line or 1), 1) - 1
+    read_kwargs = {
+        "header": header,
+        "usecols": list(usecols) if usecols else None,
+        "dtype": str,
+    }
+    total_rows = None
+    if progress_callback is not None:
+        total_rows = _count_csv_data_rows(path, header_line, progress_callback, progress_start, min(progress_start + 3, progress_end))
+        read_progress_start = min(progress_start + 3, progress_end)
+    else:
+        read_progress_start = progress_start
+    if delimiter:
+        try:
+            if progress_callback is not None:
+                return _read_csv_with_chunk_progress(
+                    path,
+                    total_rows,
+                    progress_callback=progress_callback,
+                    progress_start=read_progress_start,
+                    progress_end=progress_end,
+                    sep=delimiter,
+                    low_memory=True,
+                    memory_map=True,
+                    **read_kwargs,
+                )
+            return pd.read_csv(path, sep=delimiter, low_memory=True, memory_map=True, **read_kwargs)
+        except (MemoryError, pd.errors.ParserError) as exc:
+            if "out of memory" not in str(exc).lower() and not isinstance(exc, MemoryError):
+                raise
+            if progress_callback is not None:
+                return _read_csv_with_chunk_progress(
+                    path,
+                    total_rows,
+                    progress_callback=progress_callback,
+                    progress_start=read_progress_start,
+                    progress_end=progress_end,
+                    sep=delimiter,
+                    engine="python",
+                    **read_kwargs,
+                )
+            return pd.read_csv(path, sep=delimiter, engine="python", **read_kwargs)
+    try:
+        if progress_callback is not None:
+            return _read_csv_with_chunk_progress(
+                path,
+                total_rows,
+                progress_callback=progress_callback,
+                progress_start=read_progress_start,
+                progress_end=progress_end,
+                sep=None,
+                engine="python",
+                **read_kwargs,
+            )
+        return pd.read_csv(path, sep=None, engine="python", **read_kwargs)
+    except Exception:
+        if progress_callback is not None:
+            return _read_csv_with_chunk_progress(
+                path,
+                total_rows,
+                progress_callback=progress_callback,
+                progress_start=read_progress_start,
+                progress_end=progress_end,
+                low_memory=True,
+                memory_map=True,
+                **read_kwargs,
+            )
+        return pd.read_csv(path, low_memory=True, memory_map=True, **read_kwargs)
+
+
+def _normalize_export_field_type(field_type: object) -> str | None:
+    text = str(field_type or "").strip().lower()
+    if not text:
+        return None
+    aliases = {
+        "bool": "boolean",
+        "boolean": "boolean",
+        "logical": "boolean",
+        "int": "int",
+        "integer": "int",
+        "long": "int",
+        "double": "double",
+        "float": "double",
+        "float64": "double",
+        "number": "double",
+        "string": "string",
+        "str": "string",
+        "text": "string",
+        "name": "string",
+        "categorical": "string",
+        "category": "string",
+        "namedshort": "string",
+    }
+    normalized = aliases.get(text)
+    if normalized is None:
+        raise ValueError(
+            f"Unsupported export field type {field_type!r}. Supported types: boolean, int, double, string."
+        )
+    return normalized
+
+
+def _normalize_export_type_overrides(column_types: Mapping[str, object] | None) -> Dict[str, str]:
+    normalized: Dict[str, str] = {}
+    for raw_name, raw_type in (column_types or {}).items():
+        column_name = str(raw_name or "").strip()
+        if not column_name:
+            continue
+        normalized[column_name] = _normalize_export_field_type(raw_type) or ""
+    return {key: value for key, value in normalized.items() if value}
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return default
+
+
+def _normalize_value_exceptions(value_exceptions: Mapping[str, Mapping[str, object]] | None) -> Dict[str, Dict[str, Dict[str, object]]]:
+    normalized: Dict[str, Dict[str, Dict[str, object]]] = {}
+    for raw_column, raw_rules in (value_exceptions or {}).items():
+        column_name = str(raw_column or "").strip()
+        if not column_name or not isinstance(raw_rules, Mapping):
+            continue
+        rules: Dict[str, Dict[str, object]] = {}
+        for raw_value, raw_rule in raw_rules.items():
+            value_text = str(raw_value)
+            if isinstance(raw_rule, Mapping):
+                replacement = raw_rule.get("replacement", "")
+                include_in_regularization = _coerce_bool(
+                    raw_rule.get("include_in_regularization", raw_rule.get("include_regularization", False))
+                )
+            else:
+                replacement = raw_rule
+                include_in_regularization = False
+            rules[value_text] = {
+                "replacement": "" if replacement is None else str(replacement),
+                "include_in_regularization": bool(include_in_regularization),
+            }
+        if rules:
+            normalized[column_name] = rules
+    return normalized
+
+
+def _filter_value_exceptions_for_regularization(
+    value_exceptions: Mapping[str, Mapping[str, object]] | None,
+    include_in_regularization: bool | None,
+) -> Dict[str, Dict[str, Dict[str, object]]]:
+    normalized = _normalize_value_exceptions(value_exceptions)
+    if include_in_regularization is None:
+        return normalized
+
+    filtered: Dict[str, Dict[str, Dict[str, object]]] = {}
+    for column_name, column_rules in normalized.items():
+        rules = {
+            bad_value: rule
+            for bad_value, rule in column_rules.items()
+            if bool(rule.get("include_in_regularization", False)) == bool(include_in_regularization)
+        }
+        if rules:
+            filtered[column_name] = rules
+    return filtered
+
+
+def _apply_value_exceptions(
+    df: pd.DataFrame,
+    value_exceptions: Mapping[str, Mapping[str, object]] | None,
+    include_in_regularization: bool | None = None,
+) -> pd.DataFrame:
+    normalized = _filter_value_exceptions_for_regularization(value_exceptions, include_in_regularization)
+    if not normalized:
+        return df
+
+    out = df.copy()
+    for column_name, replacements in normalized.items():
+        if column_name not in out.columns or not replacements:
+            continue
+        series = out[column_name]
+        text_series = series.astype(str)
+        stripped_series = text_series.str.strip()
+        updated = series.copy()
+        for bad_value, rule in replacements.items():
+            replacement = str(rule.get("replacement", ""))
+            mask = series.notna() & ((text_series == bad_value) | (stripped_series == bad_value))
+            if mask.any():
+                updated.loc[mask] = replacement
+        out[column_name] = updated
+    return out
+
+
+def _infer_axis_cell_size(values: np.ndarray) -> float:
+    finite_values = values[np.isfinite(values)]
+    uniq = np.unique(finite_values)
+    if uniq.size < 2:
+        return 1.0
+
+    diffs = np.diff(np.sort(uniq))
+    diffs = diffs[diffs > 1e-12]
+    if diffs.size == 0:
+        return 1.0
+
+    rounded = np.round(diffs, decimals=6)
+    rounded = rounded[rounded > 0]
+    if rounded.size == 0:
+        return float(np.min(diffs))
+
+    values, counts = np.unique(rounded, return_counts=True)
+    best_count = int(np.max(counts))
+    if best_count <= 1:
+        return float(np.median(diffs))
+    best_values = values[counts == best_count]
+    return float(np.min(best_values))
 
 
 def _infer_cell_size(df: pd.DataFrame, xyz_cols: Sequence[str]) -> np.ndarray:
     sizes: List[float] = []
     for col in xyz_cols:
         vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
-        uniq = np.unique(vals)
-        if uniq.size < 2:
-            sizes.append(1.0)
-            continue
-        diffs = np.diff(np.sort(uniq))
-        diffs = diffs[diffs > 1e-12]
-        if diffs.size == 0:
-            sizes.append(1.0)
-        else:
-            sizes.append(float(np.min(diffs)))
+        sizes.append(_infer_axis_cell_size(vals))
     return np.asarray(sizes, dtype=float)
+
+
+def _format_numeric_vector(values: Sequence[float] | np.ndarray, precision: int = 6) -> str:
+    formatted = []
+    for value in np.asarray(values, dtype=float):
+        if not math.isfinite(float(value)):
+            formatted.append(str(float(value)))
+            continue
+        text = f"{float(value):.{precision}f}".rstrip("0").rstrip(".")
+        formatted.append(text or "0")
+    return "[" + ", ".join(formatted) + "]"
+
+
+def _build_grid_alignment_error_message(
+    clean: pd.DataFrame,
+    xyz_cols: Sequence[str],
+    cell: np.ndarray,
+    raw_idx: np.ndarray,
+    rounded: np.ndarray,
+    max_err: float,
+    index_tolerance: float,
+    explicit_cell_size: bool,
+) -> str:
+    axis_errors = np.max(np.abs(raw_idx - rounded), axis=0)
+    inferred_cell = _infer_cell_size(clean, xyz_cols)
+    message = (
+        "Coordinates do not align to a regular grid within tolerance. "
+        f"max_err={max_err:.6g}, tolerance={index_tolerance:.6g}, "
+        f"axis_errors={dict(zip(xyz_cols, _format_numeric_vector(axis_errors).strip('[]').split(', ')))}."
+    )
+    if explicit_cell_size:
+        ratios = np.divide(
+            cell,
+            inferred_cell,
+            out=np.full_like(cell, np.nan, dtype=float),
+            where=inferred_cell > 0,
+        )
+        message += (
+            f" Explicit cell_size={_format_numeric_vector(cell)}; smallest CSV coordinate/centroid increment is "
+            f"{_format_numeric_vector(inferred_cell)}; ratio={_format_numeric_vector(ratios, precision=3)}."
+        )
+        coarse_axes = [
+            str(axis_name)
+            for axis_name, ratio, axis_error in zip(xyz_cols, ratios, axis_errors)
+            if math.isfinite(float(ratio)) and ratio > 1.001 and axis_error > index_tolerance
+        ]
+        if coarse_axes:
+            message += (
+                " The selected cell size is coarser than the actual coordinate spacing on "
+                f"axis/axes {coarse_axes}, so the CSV appears to contain sub-block rows rather than one row per "
+                "requested BMF cell. For a dense tbms-config-text/Vulcan BMF, aggregate or regularize the CSV to "
+                "one row per exported cell first. For row-indexed output that preserves the CSV rows without dense "
+                "regular-grid allocation, use the tbms-experimental backend."
+            )
+    else:
+        message += (
+            f" Inferred cell_size={_format_numeric_vector(cell)}. Set explicit Cell Size X/Y/Z if these coordinates "
+            "represent a known regular grid."
+        )
+    return message
 
 
 def _to_numeric_xyz(df: pd.DataFrame, xyz_cols: Sequence[str]) -> pd.DataFrame:
@@ -83,6 +449,7 @@ def _prepare_grid(
     if clean.empty:
         raise ValueError("No valid XYZ rows found after numeric conversion.")
 
+    explicit_cell_size = cell_size is not None
     if cell_size is None:
         cell = _infer_cell_size(clean, xyz_cols)
     else:
@@ -104,8 +471,16 @@ def _prepare_grid(
     max_err = float(np.max(np.abs(raw_idx - rounded)))
     if max_err > index_tolerance:
         raise ValueError(
-            f"Coordinates do not align to a regular grid within tolerance. "
-            f"max_err={max_err:.6g}, tolerance={index_tolerance:.6g}"
+            _build_grid_alignment_error_message(
+                clean,
+                xyz_cols,
+                cell,
+                raw_idx,
+                rounded,
+                max_err,
+                index_tolerance,
+                explicit_cell_size,
+            )
         )
 
     idx = np.floor(raw_idx + 1e-9).astype(int)
@@ -132,6 +507,112 @@ def _prepare_grid(
         "duplicates": dup_count,
         "max_index_error": max_err,
     }
+
+
+def _modal_nonblank_value(series: pd.Series):
+    counts: Dict[object, int] = {}
+    first_values: Dict[object, object] = {}
+    first_order: Dict[object, int] = {}
+    for position, value in enumerate(series):
+        if pd.isna(value):
+            continue
+        if isinstance(value, str):
+            key = value.strip()
+            if not key:
+                continue
+        else:
+            try:
+                hash(value)
+                key = value
+            except TypeError:
+                key = str(value)
+        if key not in counts:
+            counts[key] = 0
+            first_values[key] = value
+            first_order[key] = position
+        counts[key] += 1
+    if not counts:
+        return np.nan
+    best_key = max(counts, key=lambda key: (counts[key], -first_order[key]))
+    return first_values[best_key]
+
+
+def _regularize_to_base_cell_grid(
+    df: pd.DataFrame,
+    xyz_cols: Sequence[str],
+    cell_size: Sequence[float] | None,
+    origin: Sequence[float] | None,
+    value_cols: Sequence[str] | None,
+    column_types: Mapping[str, object] | None,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    if cell_size is None:
+        raise ValueError(
+            "Regularize to base block size requires explicit Cell Size X/Y/Z values. "
+            "Set the BMF cell size to the intended base block dimensions, or disable regularization."
+        )
+    cell = np.asarray(cell_size, dtype=float)
+    if cell.shape != (3,) or np.any(cell <= 0):
+        raise ValueError(f"Invalid base block cell size values for regularization: {cell_size}")
+
+    clean = _to_numeric_xyz(df, xyz_cols)
+    if clean.empty:
+        raise ValueError("No valid XYZ rows found after numeric conversion.")
+
+    xyz = clean[list(xyz_cols)].to_numpy(dtype=float)
+    if origin is None:
+        base_origin = np.floor(xyz.min(axis=0) / cell) * cell
+    else:
+        base_origin = np.asarray(origin, dtype=float)
+        if base_origin.shape != (3,):
+            raise ValueError(f"Invalid origin values for regularization: {origin}")
+
+    idx = np.floor((xyz - base_origin) / cell + 1e-9).astype(np.int64)
+    if np.any(idx < 0):
+        raise ValueError(
+            "Regularized base-cell indices include negative values. Check the explicit origin and cell size."
+        )
+
+    value_columns = _classify_columns(clean, xyz_cols, value_cols)
+    work = clean.copy()
+    index_cols = ["__bmf_base_i", "__bmf_base_j", "__bmf_base_k"]
+    for axis, col in enumerate(index_cols):
+        work[col] = idx[:, axis]
+
+    grouped = work.groupby(index_cols, sort=True, dropna=False)
+    groups = grouped.size().reset_index(name="__bmf_source_rows")
+    out = pd.DataFrame(index=groups.index)
+    centers = groups[index_cols].to_numpy(dtype=float) * cell + base_origin + 0.5 * cell
+    for axis, col in enumerate(xyz_cols):
+        out[col] = centers[:, axis]
+
+    normalized_overrides = _normalize_export_type_overrides(column_types)
+    aggregation_modes: Dict[str, str] = {}
+
+    for col in value_columns:
+        forced_type = normalized_overrides.get(col)
+        numeric_values = pd.to_numeric(work[col], errors="coerce")
+        missing_mask = work[col].isna() | work[col].astype(str).str.strip().eq("")
+        numeric_compatible = bool((numeric_values.notna() | missing_mask).all() and numeric_values.notna().any())
+        should_average = forced_type == "double" or (forced_type is None and numeric_compatible)
+        if should_average:
+            numeric_work = work[index_cols].copy()
+            numeric_work["__bmf_value"] = numeric_values
+            out[col] = numeric_work.groupby(index_cols, sort=True, dropna=False)["__bmf_value"].mean().to_numpy()
+            aggregation_modes[col] = "mean"
+        else:
+            out[col] = grouped[col].agg(_modal_nonblank_value).to_numpy()
+            aggregation_modes[col] = "mode"
+
+    summary = {
+        "enabled": True,
+        "input_rows": int(len(clean)),
+        "output_rows": int(len(out)),
+        "merged_rows": int(len(clean) - len(out)),
+        "origin": [float(x) for x in base_origin],
+        "cell_size": [float(x) for x in cell],
+        "aggregation": aggregation_modes,
+    }
+    return out, summary
 
 
 def _classify_columns(df: pd.DataFrame, xyz_cols: Sequence[str], value_cols: Sequence[str] | None) -> List[str]:
@@ -177,12 +658,494 @@ def _normalize_string_records(df: pd.DataFrame, cols: Sequence[str]) -> Dict[str
     return records
 
 
+def _tbms_escape_string(value: str) -> str:
+    text = str(value)
+    text = text.replace("\\", "\\\\")
+    text = text.replace('"', '\\"')
+    text = text.replace("\r", "\\r")
+    text = text.replace("\n", "\\n")
+    text = text.replace("\t", "\\t")
+    return f'"{text}"'
+
+
+def _tbms_config_text(value: object, indent: int = 0) -> str:
+    pad = " " * indent
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        parts = ["{"]
+        items = list(value.items())
+        for index, (key, item) in enumerate(items):
+            rendered = _tbms_config_text(item, indent + 2)
+            suffix = "," if index < len(items) - 1 else ""
+            parts.append(f"{pad}  {_tbms_escape_string(str(key))} = {rendered}{suffix}")
+        parts.append(f"{pad}}}")
+        return "\n".join(parts)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (np.bool_,)):
+        return "true" if bool(value) else "false"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError("TBMS config cannot serialize non-finite floats.")
+        return format(numeric, ".15g")
+    return _tbms_escape_string(str(value))
+
+
+def _tbms_linear_indices(prepared: Dict[str, object]) -> np.ndarray:
+    dims = np.asarray(prepared["dims"], dtype=np.int64)
+    idx = np.asarray(prepared["idx"], dtype=np.int64)
+    return idx[:, 0] + dims[0] * (idx[:, 1] + dims[1] * idx[:, 2])
+
+
+def _tbms_dense_field_values(
+    prepared: Dict[str, object],
+    series: pd.Series,
+    default_value: object,
+    dtype: np.dtype,
+) -> np.ndarray:
+    dims = np.asarray(prepared["dims"], dtype=np.int64)
+    row_count = int(np.prod(dims, dtype=np.int64))
+    required_bytes = row_count * np.dtype(dtype).itemsize
+    if required_bytes > MAX_DENSE_EXPORT_BYTES:
+        cell = np.asarray(prepared.get("cell", [1.0, 1.0, 1.0]), dtype=float)
+        raise MemoryError(
+            "BMF export would require a dense grid that is too large for this writer: "
+            f"dimensions={tuple(int(value) for value in dims)}, cells={row_count:,}, "
+            f"field_size={_format_byte_size(required_bytes)}, cell_size={cell.tolist()}. "
+            "This usually means the inferred cell size is too small for the CSV coordinates, or the CSV contains "
+            "irregular/sub-block coordinates. Export a coarser regular-grid CSV or specify an explicit cell size."
+        )
+    linear = _tbms_linear_indices(prepared)
+    dense = np.full(row_count, default_value, dtype=dtype)
+    dense[linear] = np.asarray(series, dtype=dtype)
+    return dense
+
+
+def _backend_requires_dense_grid(backend: str) -> bool:
+    return str(backend or "").strip() in DENSE_EXPORT_BACKENDS
+
+
+def _validate_dense_export_size(prepared: Dict[str, object], value_cols: Sequence[str], backend: str | None = None) -> None:
+    dims = np.asarray(prepared["dims"], dtype=np.int64)
+    row_count = int(np.prod(dims, dtype=np.int64))
+    field_count = max(len(value_cols), 1)
+    estimated_bytes = row_count * 8 * field_count
+    if estimated_bytes <= MAX_DENSE_EXPORT_BYTES:
+        return
+
+    cell = np.asarray(prepared.get("cell", [1.0, 1.0, 1.0]), dtype=float)
+    valid_rows = len(prepared.get("df", []))
+    backend_text = f" for backend {backend!r}" if backend else ""
+    raise MemoryError(
+        f"BMF export would create an oversized dense grid{backend_text} before writing any values. "
+        f"Inferred dimensions={tuple(int(value) for value in dims)} ({row_count:,} cells) from "
+        f"{valid_rows:,} valid CSV rows using cell_size={cell.tolist()}. "
+        f"Estimated dense value storage for {field_count} field(s) is {_format_byte_size(estimated_bytes)}. "
+        "The CSV likely has very fine coordinate spacing, irregular/sub-block coordinates, or an incorrect XYZ/cell-size setup. "
+        "For Vulcan-compatible dense BMF output, export a regular base-block grid or set Cell Size X/Y/Z to the intended "
+        "base block dimensions, not sub-block spacing. For a row-indexed Anterpolator container that avoids dense grid "
+        "allocation, choose the tbms-experimental backend."
+    )
+
+
+def _validate_selected_csv_read_size(
+    path: Path,
+    header_line: int,
+    selected_read_cols: Sequence[str] | None,
+    backend: str,
+    regularize_to_base_block: bool,
+    progress_callback=None,
+) -> None:
+    if not selected_read_cols or not _backend_requires_dense_grid(backend):
+        return
+    row_count = _count_csv_data_rows(path, header_line, progress_callback, 3, 5)
+    if row_count is None:
+        return
+    column_count = len(selected_read_cols)
+    estimated_object_block_bytes = int(row_count) * int(column_count) * 8
+    if estimated_object_block_bytes <= MAX_SELECTED_CSV_OBJECT_BYTES:
+        return
+
+    operation = "regularized dense BMF export" if regularize_to_base_block else "dense BMF export"
+    raise MemoryError(
+        f"The selected CSV columns are too wide for {operation} with backend {backend!r}. "
+        f"The exporter would need to load {row_count:,} row(s) x {column_count:,} selected column(s) before writing, "
+        f"which is at least {_format_byte_size(estimated_object_block_bytes)} just for pandas object references. "
+        "Select fewer value columns and export in smaller batches, or use the tbms-experimental backend if you need a "
+        "row-indexed Anterpolator container rather than a dense Vulcan-style BMF."
+    )
+
+
+def _tbms_encode_export_field(
+    prepared: Dict[str, object],
+    series: pd.Series,
+    null_float: float,
+    forced_type: str | None = None,
+) -> Dict[str, object]:
+    series = series.reset_index(drop=True)
+    normalized_forced_type = _normalize_export_field_type(forced_type)
+
+    def missing_or_blank_mask(values: pd.Series) -> pd.Series:
+        return values.isna() | values.astype(str).str.strip().eq("")
+
+    def invalid_numeric_values(values: pd.Series, numeric_values: pd.Series) -> List[str]:
+        invalid_mask = ~missing_or_blank_mask(values) & numeric_values.isna()
+        return sorted(pd.unique(values.loc[invalid_mask].astype(str)))[:5]
+
+    if normalized_forced_type == "boolean":
+        boolean_series = series.fillna(False)
+        if pd.api.types.is_bool_dtype(series):
+            boolean_series = boolean_series.astype(bool)
+        else:
+            truthy = {"1", "true", "t", "yes", "y"}
+            falsy = {"0", "false", "f", "no", "n", ""}
+            normalized_text = boolean_series.astype(str).str.strip().str.lower()
+            invalid_mask = ~series.isna() & ~normalized_text.isin(truthy | falsy)
+            if invalid_mask.any():
+                invalid_values = sorted(pd.unique(series.loc[invalid_mask].astype(str)))[:5]
+                raise ValueError(
+                    f"Column {series.name!r} cannot be exported as boolean. Invalid values include: {invalid_values}"
+                )
+            boolean_series = normalized_text.isin(truthy)
+        encoded = boolean_series.astype(np.uint8)
+        return {
+            "field_type": "boolean",
+            "default": 0,
+            "dtype": np.dtype("u1"),
+            "values": _tbms_dense_field_values(prepared, encoded, 0, np.dtype("u1")),
+        }
+
+    numeric = pd.to_numeric(series, errors="coerce")
+    missing_mask = missing_or_blank_mask(series)
+    numeric_compatible = bool((numeric.notna() | missing_mask).all())
+    if normalized_forced_type == "int":
+        if not numeric_compatible:
+            invalid_values = invalid_numeric_values(series, numeric)
+            raise ValueError(
+                f"Column {series.name!r} cannot be exported as int because it contains non-numeric values. "
+                f"Invalid values include: {invalid_values}"
+            )
+        finite = numeric.dropna().to_numpy(dtype=float)
+        if finite.size > 0 and not np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0):
+            raise ValueError(f"Column {series.name!r} cannot be exported as int because it contains non-integer numeric values.")
+        min_value = int(np.min(finite)) if finite.size else 0
+        max_value = int(np.max(finite)) if finite.size else 0
+        if not (-2147483648 <= min_value and max_value <= 2147483647):
+            raise ValueError(f"Column {series.name!r} exceeds the supported int32 range for int export.")
+        converted = numeric.fillna(int(null_float)).astype(np.int32)
+        return {
+            "field_type": "int",
+            "default": int(null_float),
+            "dtype": np.dtype("<i4"),
+            "values": _tbms_dense_field_values(prepared, converted, int(null_float), np.dtype("<i4")),
+        }
+
+    if normalized_forced_type == "double":
+        if not numeric_compatible:
+            invalid_values = invalid_numeric_values(series, numeric)
+            raise ValueError(
+                f"Column {series.name!r} cannot be exported as double because it contains non-numeric values. "
+                f"Invalid values include: {invalid_values}"
+            )
+        converted = numeric.fillna(float(null_float)).astype(np.float64)
+        return {
+            "field_type": "double",
+            "default": float(null_float),
+            "dtype": np.dtype("<f8"),
+            "values": _tbms_dense_field_values(prepared, converted, float(null_float), np.dtype("<f8")),
+        }
+
+    if normalized_forced_type == "string":
+        labels = [str(value) for value in pd.unique(series.dropna())]
+        if len(labels) > 32766:
+            raise ValueError(f"Column {series.name!r} has too many categorical values for string export.")
+        code_map = {label: index + 1 for index, label in enumerate(labels)}
+        codes = series.map(lambda value: 0 if pd.isna(value) else code_map[str(value)]).astype(np.int16)
+        field_info = {
+            "field_type": "namedshort",
+            "default": 0,
+            "dtype": np.dtype("<i2"),
+            "values": _tbms_dense_field_values(prepared, codes, 0, np.dtype("<i2")),
+        }
+        for label, code in code_map.items():
+            field_info[f"string_{code}"] = label
+        field_info["string_0"] = ""
+        return field_info
+
+    if pd.api.types.is_bool_dtype(series):
+        encoded = series.fillna(False).astype(bool).astype(np.uint8)
+        return {
+            "field_type": "boolean",
+            "default": 0,
+            "dtype": np.dtype("u1"),
+            "values": _tbms_dense_field_values(prepared, encoded, 0, np.dtype("u1")),
+        }
+
+    if numeric_compatible:
+        finite = numeric.dropna().to_numpy(dtype=float)
+        integer_like = finite.size > 0 and np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0)
+        if integer_like:
+            min_value = int(np.min(finite)) if finite.size else 0
+            max_value = int(np.max(finite)) if finite.size else 0
+            if -2147483648 <= min_value and max_value <= 2147483647:
+                converted = numeric.fillna(int(null_float)).astype(np.int32)
+                return {
+                    "field_type": "int",
+                    "default": int(null_float),
+                    "dtype": np.dtype("<i4"),
+                    "values": _tbms_dense_field_values(prepared, converted, int(null_float), np.dtype("<i4")),
+                }
+        converted = numeric.fillna(float(null_float)).astype(np.float64)
+        return {
+            "field_type": "double",
+            "default": float(null_float),
+            "dtype": np.dtype("<f8"),
+            "values": _tbms_dense_field_values(prepared, converted, float(null_float), np.dtype("<f8")),
+        }
+
+    labels = [str(value) for value in pd.unique(series.dropna())]
+    if len(labels) > 32766:
+        raise ValueError(f"Column {series.name!r} has too many categorical values for namedshort export.")
+    code_map = {label: index + 1 for index, label in enumerate(labels)}
+    codes = series.map(lambda value: 0 if pd.isna(value) else code_map[str(value)]).astype(np.int16)
+    field_info = {
+        "field_type": "namedshort",
+        "default": 0,
+        "dtype": np.dtype("<i2"),
+        "values": _tbms_dense_field_values(prepared, codes, 0, np.dtype("<i2")),
+    }
+    for label, code in code_map.items():
+        field_info[f"string_{code}"] = label
+    field_info["string_0"] = ""
+    return field_info
+
+
+def _tbms_value_page(values: np.ndarray, dtype: np.dtype, default_value: object) -> List[bytes]:
+    payload_size = 2048
+    capacity = payload_size // dtype.itemsize
+    page_count = max(1, int(math.ceil(len(values) / capacity)))
+    padded = np.full(page_count * capacity, default_value, dtype=dtype)
+    padded[: len(values)] = values.astype(dtype, copy=False)
+
+    pages: List[bytes] = []
+    for page_index in range(page_count):
+        start = page_index * capacity
+        stop = start + capacity
+        payload = padded[start:stop].astype(dtype, copy=False).tobytes(order="C")
+        pages.append(struct.pack("<II", 512, 0) + payload)
+    return pages
+
+
+def _iter_tbms_value_pages(values: np.ndarray, dtype: np.dtype, default_value: object) -> Iterable[bytes]:
+    payload_size = 2048
+    capacity = payload_size // dtype.itemsize
+    page_count = max(1, int(math.ceil(len(values) / capacity)))
+    for page_index in range(page_count):
+        start = page_index * capacity
+        stop = min(start + capacity, len(values))
+        page_values = np.full(capacity, default_value, dtype=dtype)
+        if stop > start:
+            page_values[: stop - start] = values[start:stop].astype(dtype, copy=False)
+        yield struct.pack("<II", 512, 0) + page_values.tobytes(order="C")
+
+
+def _tbms_pointer_page(child_offsets: Sequence[int]) -> bytes:
+    entries = [257] + [int(offset) for offset in child_offsets[:256]]
+    if len(entries) < 257:
+        entries.extend([0] * (257 - len(entries)))
+    return struct.pack("<257Q", *entries)
+
+
+def _write_tbms_config_text(
+    prepared: Dict[str, object],
+    xyz_cols: Sequence[str],
+    value_cols: Sequence[str],
+    out_bmf: Path,
+    null_float: float,
+    column_types: Mapping[str, object] | None = None,
+    progress_callback=None,
+    progress_start: int = 50,
+    progress_end: int = 98,
+) -> Dict[str, object]:
+    if int(prepared.get("duplicates") or 0) > 0:
+        raise ValueError("tbms-config-text export requires unique grid cells; duplicate XYZ rows were found.")
+
+    df: pd.DataFrame = prepared["df"]  # type: ignore[assignment]
+    dims = np.asarray(prepared["dims"], dtype=np.int64)
+    origin = np.asarray(prepared["origin"], dtype=float)
+    cell = np.asarray(prepared["cell"], dtype=float)
+    extents = np.asarray(prepared["extents"], dtype=float)
+    row_count = int(np.prod(dims, dtype=np.int64))
+
+    first_page_offset = TBMS_EXPERIMENTAL_FIRST_SECTION_OFFSET
+    config_pointer_header_offsets = (24, 40)
+    page_size = 2056
+
+    field_entries: List[Dict[str, object]] = []
+    categorical_fields = 0
+    normalized_overrides = _normalize_export_type_overrides(column_types)
+    total_fields = max(len(value_cols), 1)
+    encode_end = _scale_progress(progress_start, progress_end, 0.82)
+    _emit_progress(
+        progress_callback,
+        progress_start,
+        100,
+        f"Encoding BMF fields from CSV data (0/{len(value_cols)})...",
+    )
+
+    page_count = 0
+
+    out_bmf.parent.mkdir(parents=True, exist_ok=True)
+    with out_bmf.open("wb") as fh:
+        _emit_progress(progress_callback, progress_start, 100, "Writing BMF header...")
+        header = bytearray(TBMS_HEADER_SIZE)
+        header[: len(TBMS_SIGNATURE)] = TBMS_SIGNATURE
+        struct.pack_into("<I", header, 12, 1)
+        struct.pack_into("<I", header, 16, first_page_offset)
+        fh.write(header)
+        if fh.tell() < first_page_offset:
+            fh.write(b"\x00" * (first_page_offset - fh.tell()))
+
+        def allocate_page(blob: bytes) -> int:
+            nonlocal page_count
+            if len(blob) != page_size:
+                raise ValueError("TBMS page blobs must be exactly 2056 bytes.")
+            offset = first_page_offset + page_count * page_size
+            if fh.tell() < offset:
+                fh.write(b"\x00" * (offset - fh.tell()))
+            fh.write(blob)
+            page_count += 1
+            return offset
+
+        for field_index, name in enumerate(value_cols):
+            field_progress = _scale_progress(progress_start, encode_end, field_index / total_fields)
+            _emit_progress(
+                progress_callback,
+                field_progress,
+                100,
+                f"Encoding BMF field {field_index + 1}/{len(value_cols)}: {name}...",
+            )
+            encoded = _tbms_encode_export_field(prepared, df[name], null_float, forced_type=normalized_overrides.get(name))
+            leaf_offsets = [
+                allocate_page(blob)
+                for blob in _iter_tbms_value_pages(encoded["values"], encoded["dtype"], encoded["default"])
+            ]
+            current_offsets = leaf_offsets
+            while len(current_offsets) > 1:
+                next_offsets: List[int] = []
+                for start in range(0, len(current_offsets), 256):
+                    next_offsets.append(allocate_page(_tbms_pointer_page(current_offsets[start:start + 256])))
+                current_offsets = next_offsets
+            location = int(current_offsets[0])
+
+            entry = {
+                "name": name,
+                "type": encoded["field_type"],
+                "location": location,
+                "default": encoded["default"],
+                "global": 0,
+                "read_only": 0,
+                "description": f"Exported from CSV column {name}",
+            }
+            for key, value in encoded.items():
+                if str(key).startswith("string_"):
+                    entry[str(key)] = value
+            if encoded["field_type"] == "namedshort":
+                categorical_fields += 1
+            field_entries.append({"entry_key": f"var_{field_index}", "entry": entry})
+
+        _emit_progress(
+            progress_callback,
+            encode_end,
+            100,
+            f"Encoded {len(field_entries)} BMF field(s); preparing file write...",
+        )
+
+    config_object: Dict[str, object] = {
+        "created": datetime.now(timezone.utc).isoformat(),
+        "modified": datetime.now(timezone.utc).isoformat(),
+        "history_source": "Anterpolator tbms-config-text export",
+        "n_blocks": row_count,
+        "n_schemas": 1,
+        "is_irregular": 0,
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+        "origin_z": 0.0,
+        "lower_x": float(origin[0]),
+        "lower_y": float(origin[1]),
+        "lower_z": float(origin[2]),
+        "upper_x": float(origin[0] + extents[0]),
+        "upper_y": float(origin[1] + extents[1]),
+        "upper_z": float(origin[2] + extents[2]),
+        "voxel_length_x": float(cell[0]),
+        "voxel_length_y": float(cell[1]),
+        "voxel_length_z": float(cell[2]),
+        "schema_0": {
+            "dim_x": int(dims[0]),
+            "dim_y": int(dims[1]),
+            "dim_z": int(dims[2]),
+            "lower_x": float(origin[0]),
+            "lower_y": float(origin[1]),
+            "lower_z": float(origin[2]),
+            "upper_x": float(origin[0] + extents[0]),
+            "upper_y": float(origin[1] + extents[1]),
+            "upper_z": float(origin[2] + extents[2]),
+            "max_size_x": float(cell[0]),
+            "max_size_y": float(cell[1]),
+            "max_size_z": float(cell[2]),
+        },
+    }
+    for field in field_entries:
+        config_object[str(field["entry_key"])] = field["entry"]
+
+    config_bytes = _tbms_config_text(config_object).encode("latin1", errors="replace")
+    config_offset = _align_offset(first_page_offset + page_count * page_size, 8)
+    file_size = config_offset + len(config_bytes)
+    with out_bmf.open("r+b") as fh:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() < config_offset:
+            fh.write(b"\x00" * (config_offset - fh.tell()))
+        _emit_progress(progress_callback, progress_end, 100, "Writing BMF configuration...")
+        fh.write(config_bytes)
+
+        fh.seek(0)
+        header = bytearray(TBMS_HEADER_SIZE)
+        header[: len(TBMS_SIGNATURE)] = TBMS_SIGNATURE
+        struct.pack_into("<I", header, 12, 1)
+        struct.pack_into("<I", header, 16, first_page_offset)
+        for header_offset in config_pointer_header_offsets:
+            struct.pack_into("<Q", header, header_offset, config_offset)
+        struct.pack_into("<Q", header, 48, file_size)
+        fh.write(header)
+
+    return {
+        "backend": "tbms-config-text",
+        "file_size": int(file_size),
+        "page_count": int(page_count),
+        "field_count": len(field_entries),
+        "categorical_fields": categorical_fields,
+        "config_offset": int(config_offset),
+        "first_page_offset": int(first_page_offset),
+        "row_count": int(row_count),
+        "value_columns": list(value_cols),
+        "xyz_columns": list(xyz_cols),
+    }
+
+
 def _write_tbms_experimental(
     prepared: Dict[str, object],
     xyz_cols: Sequence[str],
     value_cols: Sequence[str],
     out_bmf: Path,
     null_float: float,
+    column_types: Mapping[str, object] | None = None,
+    progress_callback=None,
+    progress_start: int = 50,
+    progress_end: int = 98,
 ) -> Dict[str, object]:
     df: pd.DataFrame = prepared["df"]  # type: ignore[assignment]
     idx = np.asarray(prepared["idx"], dtype=np.int32)
@@ -191,7 +1154,13 @@ def _write_tbms_experimental(
     dims = np.asarray(prepared["dims"], dtype=np.int32)
     extents = np.asarray(prepared["extents"], dtype=float)
 
-    numeric_cols = [col for col in value_cols if pd.api.types.is_numeric_dtype(df[col])]
+    normalized_overrides = _normalize_export_type_overrides(column_types)
+    _emit_progress(progress_callback, progress_start, 100, "Preparing experimental BMF sections...")
+    numeric_cols = [
+        col for col in value_cols
+        if normalized_overrides.get(col) in {"boolean", "int", "double"}
+        or (normalized_overrides.get(col) is None and pd.api.types.is_numeric_dtype(df[col]))
+    ]
     string_cols = [col for col in value_cols if col not in numeric_cols]
 
     numeric_matrix = np.empty((len(df), len(numeric_cols)), dtype="<f8")
@@ -263,6 +1232,7 @@ def _write_tbms_experimental(
     file_size = current_offset
     out_bmf.parent.mkdir(parents=True, exist_ok=True)
     with out_bmf.open("wb") as fh:
+        _emit_progress(progress_callback, _scale_progress(progress_start, progress_end, 0.1), 100, "Writing experimental BMF header...")
         header = bytearray(TBMS_HEADER_SIZE)
         header[: len(TBMS_SIGNATURE)] = TBMS_SIGNATURE
         struct.pack_into("<I", header, 12, 1)
@@ -286,10 +1256,17 @@ def _write_tbms_experimental(
             raise ValueError("Experimental TBMS directory overflowed reserved payload boundary.")
         fh.write(b"\x00" * (TBMS_EXPERIMENTAL_FIRST_SECTION_OFFSET - fh.tell()))
 
-        for info in section_infos:
+        total_sections = max(len(section_infos), 1)
+        for section_index, info in enumerate(section_infos, start=1):
             if fh.tell() < info["offset"]:
                 fh.write(b"\x00" * (info["offset"] - fh.tell()))
             fh.write(info["payload"])
+            _emit_progress(
+                progress_callback,
+                _scale_progress(progress_start, progress_end, section_index / total_sections),
+                100,
+                f"Writing experimental BMF section {section_index}/{total_sections}: {info['name']}...",
+            )
 
     return {
         "backend": "tbms-experimental",
@@ -593,6 +1570,159 @@ def _extract_tbms_segmented_config_block(path: Path, directory_offset: int) -> D
     }
 
 
+def _extract_tbms_first_page_assignments(
+    path: Path,
+    first_page_offset: int = 2056,
+    max_pages: int = 8,
+    min_matches: int = 5,
+) -> Dict[str, object] | None:
+    assignment_pattern = re.compile(r'"(?P<key>[^"\r\n]+)"\s*=\s*(?:"(?P<quoted>[^"]*)"|(?P<bare>[^,\r\n}]+))')
+    assignments: List[Dict[str, object]] = []
+    pages: List[Dict[str, object]] = []
+    file_size = path.stat().st_size
+    page_size = 2056
+    if first_page_offset <= 0 or first_page_offset >= file_size:
+        return None
+
+    with path.open("rb") as fh:
+        for index in range(max_pages):
+            page_offset = first_page_offset + index * page_size
+            if page_offset + page_size > file_size:
+                break
+            fh.seek(page_offset)
+            raw = fh.read(page_size)
+            if len(raw) != page_size:
+                break
+            payload = raw[8:]
+            text = payload.decode("latin1", errors="replace")
+            matches = list(assignment_pattern.finditer(text))
+            if len(matches) < min_matches:
+                if assignments:
+                    break
+                continue
+            pages.append({
+                "page_offset": int(page_offset),
+                "page_header": list(struct.unpack("<2I", raw[:8])),
+                "assignment_count": len(matches),
+            })
+            for match in matches:
+                value = match.group("quoted")
+                if value is None:
+                    value = (match.group("bare") or "").strip()
+                assignments.append({
+                    "entry_type": "text_assignment",
+                    "entry_key": match.group("key"),
+                    "name": match.group("key"),
+                    "value": value,
+                    "page_offset": int(page_offset),
+                })
+
+    if not assignments:
+        return None
+    return {
+        "first_page_offset": int(first_page_offset),
+        "pages": pages,
+        "assignments": assignments,
+    }
+
+
+def _extract_tbms_text_tree_config_block(path: Path, root_offset: int, max_depth: int = 4) -> Dict[str, object] | None:
+    file_size = path.stat().st_size
+    page_size = 2056
+    text_leaf_magic = 134218240
+
+    def gather_leaves(offset: int, depth: int = 0, visited: set[int] | None = None) -> List[int]:
+        if visited is None:
+            visited = set()
+        if depth > max_depth or offset <= 0 or offset >= file_size or offset in visited:
+            return []
+        visited.add(offset)
+
+        with path.open("rb") as fh:
+            fh.seek(offset)
+            raw = fh.read(page_size)
+        if len(raw) != page_size:
+            return []
+
+        magic = struct.unpack("<I", raw[:4])[0]
+        if magic == text_leaf_magic:
+            return [offset]
+
+        table = struct.unpack("<257Q", raw)
+        leaves: List[int] = []
+        for pointer in table[1:]:
+            if pointer:
+                leaves.extend(gather_leaves(int(pointer), depth + 1, visited))
+        return leaves
+
+    leaves = gather_leaves(root_offset)
+    if not leaves:
+        return None
+
+    chunks: List[bytes] = []
+    with path.open("rb") as fh:
+        for leaf in leaves:
+            fh.seek(leaf + 8)
+            chunks.append(fh.read(2048))
+    raw = b"".join(chunks)
+    span_start = min(leaves) + 8
+    span_end = max(leaves) + 2056
+    brace_index = raw.find(b"{")
+    if brace_index < 0:
+        return None
+
+    text = raw[brace_index:].decode("latin1", errors="replace")
+    parse_error: Exception | None = None
+    for candidate in (text,):
+        try:
+            parsed = _TbmsConfigParser(candidate).parse()
+            if _looks_like_tbms_config(parsed):
+                return {
+                    "start": int(span_start),
+                    "end": int(span_end),
+                    "text": candidate,
+                    "parsed": parsed,
+                    "segments": [int(leaf) for leaf in leaves],
+                    "directory_offset": int(root_offset),
+                    "source": "text-tree",
+                }
+        except Exception as exc:
+            parse_error = exc
+
+    failure_pos = None
+    match = re.search(r"position (\d+)", str(parse_error or ""))
+    if match:
+        failure_pos = int(match.group(1))
+
+    cut_candidates: List[int] = []
+    search_upto = failure_pos if failure_pos is not None else len(text)
+    for marker, marker_len in (('\n  },', 5), ('\n }', 3), ('\n  }', 4), ('},', 2)):
+        cut = text.rfind(marker, 0, search_upto)
+        if cut >= 0:
+            cut_candidates.append(cut + marker_len)
+    if not cut_candidates:
+        return None
+
+    trimmed = text[:max(cut_candidates)]
+    if not trimmed.rstrip().endswith('}'):
+        trimmed = trimmed.rstrip(',\r\n ') + '\n}\n'
+    try:
+        parsed = _TbmsConfigParser(trimmed).parse()
+    except Exception:
+        return None
+    if not _looks_like_tbms_config(parsed):
+        return None
+    return {
+        "start": int(span_start),
+        "end": int(span_end),
+        "text": trimmed,
+        "parsed": parsed,
+        "segments": [int(leaf) for leaf in leaves],
+        "directory_offset": int(root_offset),
+        "source": "text-tree-trimmed",
+    }
+
+
 def _find_tbms_config_block(path: Path, search_start: int = 0x5000, max_scan: int = 2 * 1024 * 1024) -> Dict[str, object] | None:
     candidates: List[Dict[str, object]] = []
     with path.open("rb") as fh:
@@ -602,6 +1732,13 @@ def _find_tbms_config_block(path: Path, search_start: int = 0x5000, max_scan: in
         for pointer in (header_offsets[3], header_offsets[5]):
             if pointer <= 0 or pointer >= path.stat().st_size:
                 continue
+            try:
+                result = _extract_tbms_text_tree_config_block(path, int(pointer))
+            except Exception:
+                result = None
+            if result is not None:
+                candidates.append(result)
+
             try:
                 result = _extract_tbms_segmented_config_block(path, int(pointer))
             except Exception:
@@ -1163,6 +2300,7 @@ def _load_tbms_config_variant(
     frame = _build_tbms_grid_frame(metadata, rows_to_load)
     decoded_fields: List[str] = []
     skipped_fields: List[str] = []
+    decoded_columns: Dict[str, object] = {}
     if rows_to_load > 0 and not schema_frame.empty and "entry_type" in schema_frame.columns:
         field_rows = schema_frame[schema_frame["entry_type"] == "field"]
         for field in field_rows.to_dict(orient="records"):
@@ -1194,8 +2332,11 @@ def _load_tbms_config_variant(
                 }
                 if labels:
                     values = np.asarray([labels.get(int(value), value) for value in values], dtype=object)
-            frame[name] = values
+            decoded_columns[name] = values
             decoded_fields.append(name)
+
+    if decoded_columns:
+        frame = pd.concat([frame, pd.DataFrame(decoded_columns, index=frame.index)], axis=1)
 
     report["config_block"] = {
         "start": config_block["start"],
@@ -1255,29 +2396,94 @@ def _load_tbms_binary_variant(
 def export_bmf(
     input_csv: str | Path,
     output_bmf: str | Path,
-    backend: str = "vulcan",
+    backend: str = "tbms-config-text",
     x_col: str = "x",
     y_col: str = "y",
     z_col: str = "z",
+    delimiter: str | None = None,
+    header_line: int = 1,
     cell_size: Sequence[float] | None = None,
     origin: Sequence[float] | None = None,
     value_cols: Sequence[str] | None = None,
+    column_types: Mapping[str, object] | None = None,
+    value_exceptions: Mapping[str, Mapping[str, object]] | None = None,
     null_float: float = -99.0,
     index_tolerance: float = 1e-3,
+    regularize_to_base_block: bool = False,
     dry_run: bool = False,
     summary_json: str | Path | None = None,
+    progress_callback=None,
 ) -> Dict[str, object]:
     in_csv = Path(input_csv)
     out_bmf = Path(output_bmf)
     if not in_csv.exists():
         raise FileNotFoundError(f"Input file not found: {in_csv}")
 
-    df = _auto_read_csv(in_csv)
+    _emit_progress(progress_callback, 0, 100, "Preparing BMF export...")
     xyz_cols = [x_col, y_col, z_col]
+    selected_read_cols = list(dict.fromkeys([*xyz_cols, *(value_cols or [])])) if value_cols else None
+    selected_message = "selected columns" if selected_read_cols else "all columns"
+    _validate_selected_csv_read_size(
+        in_csv,
+        header_line,
+        selected_read_cols,
+        backend,
+        regularize_to_base_block,
+        progress_callback=progress_callback,
+    )
+    _emit_progress(progress_callback, 5, 100, f"Reading CSV {selected_message}...")
+    df = _auto_read_csv(
+        in_csv,
+        delimiter=delimiter,
+        header_line=header_line,
+        usecols=selected_read_cols,
+        progress_callback=progress_callback,
+        progress_start=5,
+        progress_end=30,
+    )
+    _emit_progress(
+        progress_callback,
+        30,
+        100,
+        f"CSV read complete: {len(df):,} rows, {len(df.columns):,} columns.",
+    )
     missing = [col for col in xyz_cols if col not in df.columns]
     if missing:
         raise ValueError(f"Missing coordinate columns: {missing}")
 
+    normalized_value_exceptions = _normalize_value_exceptions(value_exceptions)
+    regularization_summary = {"enabled": False}
+    if regularize_to_base_block:
+        pre_regularization_exceptions = _filter_value_exceptions_for_regularization(
+            normalized_value_exceptions,
+            include_in_regularization=True,
+        )
+        if pre_regularization_exceptions:
+            _emit_progress(progress_callback, 32, 100, "Applying BMF value exception rules before regularization...")
+            df = _apply_value_exceptions(df, pre_regularization_exceptions)
+
+        _emit_progress(progress_callback, 34, 100, "Regularizing CSV rows to base block cells...")
+        df, regularization_summary = _regularize_to_base_cell_grid(
+            df=df,
+            xyz_cols=xyz_cols,
+            cell_size=cell_size,
+            origin=origin,
+            value_cols=value_cols,
+            column_types=column_types,
+        )
+
+        post_regularization_exceptions = _filter_value_exceptions_for_regularization(
+            normalized_value_exceptions,
+            include_in_regularization=False,
+        )
+        if post_regularization_exceptions:
+            _emit_progress(progress_callback, 35, 100, "Applying BMF value exception rules after regularization...")
+            df = _apply_value_exceptions(df, post_regularization_exceptions)
+    elif normalized_value_exceptions:
+        _emit_progress(progress_callback, 32, 100, "Applying BMF value exception rules...")
+        df = _apply_value_exceptions(df, normalized_value_exceptions)
+
+    _emit_progress(progress_callback, 36, 100, "Preparing regular BMF grid from XYZ columns...")
     prepared = _prepare_grid(
         df=df,
         xyz_cols=xyz_cols,
@@ -1285,14 +2491,28 @@ def export_bmf(
         origin=origin,
         index_tolerance=index_tolerance,
     )
+    dims_text = " x ".join(str(int(value)) for value in np.asarray(prepared["dims"], dtype=int))
+    _emit_progress(
+        progress_callback,
+        45,
+        100,
+        f"Grid prepared: {dims_text} cells from {len(prepared['df']):,} valid CSV rows.",
+    )
 
     chosen_value_cols = _classify_columns(prepared["df"], xyz_cols, value_cols)
+    _emit_progress(progress_callback, 47, 100, f"Selected {len(chosen_value_cols)} BMF value field(s).")
+    if backend not in SUPPORTED_EXPORT_BACKENDS:
+        raise ValueError(f"Unsupported backend: {backend}")
+    if _backend_requires_dense_grid(backend):
+        _validate_dense_export_size(prepared, chosen_value_cols, backend=backend)
     summary = {
         "input_csv": str(in_csv),
         "output_bmf": str(out_bmf),
         "backend": backend,
         "rows": int(len(prepared["df"])),
         "value_columns": chosen_value_cols,
+        "value_exceptions": normalized_value_exceptions,
+        "regularization": regularization_summary,
         "grid": {
             "origin": [float(x) for x in np.asarray(prepared["origin"], dtype=float)],
             "cell_size": [float(x) for x in np.asarray(prepared["cell"], dtype=float)],
@@ -1307,19 +2527,35 @@ def export_bmf(
         summary_path = Path(summary_json)
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        _emit_progress(progress_callback, 49, 100, "BMF export summary written.")
 
     backend_summary = None
     if not dry_run:
         out_bmf.parent.mkdir(parents=True, exist_ok=True)
         if backend == "vulcan":
+            _emit_progress(progress_callback, 50, 100, "Writing BMF through Vulcan backend...")
             _export_with_vulcan(
                 prepared=prepared,
                 xyz_cols=xyz_cols,
                 value_cols=chosen_value_cols,
                 out_bmf=out_bmf,
                 null_float=null_float,
+                column_types=column_types,
             )
             backend_summary = {"backend": "vulcan"}
+            _emit_progress(progress_callback, 98, 100, "Vulcan BMF write complete.")
+        elif backend == "tbms-config-text":
+            backend_summary = _write_tbms_config_text(
+                prepared=prepared,
+                xyz_cols=xyz_cols,
+                value_cols=chosen_value_cols,
+                out_bmf=out_bmf,
+                null_float=null_float,
+                column_types=column_types,
+                progress_callback=progress_callback,
+                progress_start=50,
+                progress_end=98,
+            )
         elif backend == "tbms-experimental":
             backend_summary = _write_tbms_experimental(
                 prepared=prepared,
@@ -1327,9 +2563,17 @@ def export_bmf(
                 value_cols=chosen_value_cols,
                 out_bmf=out_bmf,
                 null_float=null_float,
+                column_types=column_types,
+                progress_callback=progress_callback,
+                progress_start=50,
+                progress_end=98,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
+    else:
+        _emit_progress(progress_callback, 98, 100, "Dry-run BMF export validation complete.")
+
+    _emit_progress(progress_callback, 100, 100, "BMF export complete.")
 
     return {
         "summary": summary,
@@ -1499,6 +2743,7 @@ def _export_with_vulcan(
     value_cols: Sequence[str],
     out_bmf: Path,
     null_float: float,
+    column_types: Mapping[str, object] | None = None,
 ) -> None:
     try:
         import vulcan  # type: ignore
@@ -1511,6 +2756,7 @@ def _export_with_vulcan(
     origin = np.asarray(prepared["origin"], dtype=float)
     dims = np.asarray(prepared["dims"], dtype=int)
     extents = np.asarray(prepared["extents"], dtype=float)
+    normalized_overrides = _normalize_export_type_overrides(column_types)
 
     bm = vulcan.block_model()
     bm.create_regular(
@@ -1530,7 +2776,8 @@ def _export_with_vulcan(
     dtype_map: Dict[str, str] = {}
     for col in value_cols:
         col_series = df[col]
-        if pd.api.types.is_numeric_dtype(col_series):
+        forced_type = normalized_overrides.get(col)
+        if forced_type in {"boolean", "int", "double"} or (forced_type is None and pd.api.types.is_numeric_dtype(col_series)):
             bm.add_variable(col, "float", str(null_float), "")
             dtype_map[col] = "float"
         else:
@@ -1575,6 +2822,17 @@ def cmd_export(args: argparse.Namespace) -> int:
         print(f"Missing coordinate columns: {missing}", file=sys.stderr)
         return 2
 
+    regularization_summary = {"enabled": False}
+    if getattr(args, "regularize_to_base_block", False):
+        df, regularization_summary = _regularize_to_base_cell_grid(
+            df=df,
+            xyz_cols=xyz_cols,
+            cell_size=args.cell_size,
+            origin=args.origin,
+            value_cols=args.value_cols,
+            column_types=None,
+        )
+
     prepared = _prepare_grid(
         df=df,
         xyz_cols=xyz_cols,
@@ -1591,6 +2849,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         "backend": args.backend,
         "rows": int(len(prepared["df"])),
         "value_columns": value_cols,
+        "regularization": regularization_summary,
         "grid": {
             "origin": [float(x) for x in np.asarray(prepared["origin"], dtype=float)],
             "cell_size": [float(x) for x in np.asarray(prepared["cell"], dtype=float)],
@@ -1622,6 +2881,15 @@ def cmd_export(args: argparse.Namespace) -> int:
                 out_bmf=out_bmf,
                 null_float=args.null_float,
             )
+        elif args.backend == "tbms-config-text":
+            config_summary = _write_tbms_config_text(
+                prepared=prepared,
+                xyz_cols=xyz_cols,
+                value_cols=value_cols,
+                out_bmf=out_bmf,
+                null_float=args.null_float,
+            )
+            print(json.dumps(config_summary, indent=2))
         else:
             experimental_summary = _write_tbms_experimental(
                 prepared=prepared,
@@ -1725,9 +2993,9 @@ def build_parser() -> argparse.ArgumentParser:
     export_p.add_argument("output_bmf", help="Output BMF path")
     export_p.add_argument(
         "--backend",
-        choices=["vulcan", "tbms-experimental"],
-        default="vulcan",
-        help="Export backend. tbms-experimental writes a reverse-engineering container, not a confirmed Vulcan-compatible BMF.",
+        choices=["vulcan", "tbms-config-text", "tbms-experimental"],
+        default="tbms-config-text",
+        help="Export backend. tbms-config-text writes a reverse-engineered TBMS config/page layout that this tool can reopen; tbms-experimental writes the older standalone container.",
     )
     export_p.add_argument("--x-col", default="x", help="X coordinate column")
     export_p.add_argument("--y-col", default="y", help="Y coordinate column")
@@ -1765,6 +3033,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1e-3,
         help="Tolerance for coordinate-to-grid index alignment",
+    )
+    export_p.add_argument(
+        "--regularize-to-base-block",
+        action="store_true",
+        help="Aggregate rows into explicit cell-size base blocks before writing dense BMF output",
     )
     export_p.add_argument("--summary-json", default=None, help="Write summary JSON")
     export_p.add_argument("--dry-run", action="store_true", help="Validate and summarize only")

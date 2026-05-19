@@ -30,6 +30,8 @@ from anterpolator3DViewer import (
     load_block_domain_catalog,
     load_large_blocks_metadata,
     normalize_selected_sample_domain_column,
+    parse_leapfrog_block_metadata,
+    resolve_effective_csv_header_line,
 )
 
 
@@ -67,6 +69,117 @@ def test_streaming_metadata_collapses_subblocks_to_base_blocks():
             config=None,
         )
 
+        assert metadata["domain_mapping"] == {
+            (0, 0, 0): "A",
+            (1, 0, 0): "B",
+        }
+        assert metadata["subblock_counts"] == {
+            (0, 0, 0): 2,
+            (1, 0, 0): 2,
+        }
+
+
+def test_streaming_metadata_warns_when_block_rows_do_not_match_parent_grid():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "leapfrog_blocks_outside_grid.csv")
+        with open(blocks_path, "w", encoding="utf-8") as handle:
+            handle.write("#   rotation type: Leapfrog\n")
+            handle.write("#   azimuth: 0 degrees\n")
+            handle.write("#   dip: 0 degrees\n")
+            handle.write("#   pitch: 0 degrees\n")
+            handle.write("#   parent block size: 10 10 10\n")
+            handle.write("#   size in parent blocks: 1 1 1 = 1\n")
+            handle.write("#   minimum corner: 0 0 0\n")
+            handle.write("#   maximum corner: 10 10 10\n")
+            handle.write("x,y,z,dom\n")
+            handle.write("5,5,5,A\n")
+            handle.write("15,5,5,B\n")
+
+        with pytest.warns(RuntimeWarning) as warning_records:
+            metadata = load_large_blocks_metadata(
+                blocks_path,
+                ",",
+                1,
+                (10, 10, 10),
+                None,
+                block_x_col="x",
+                block_y_col="y",
+                block_z_col="z",
+                block_domain_col="dom",
+                config=None,
+            )
+
+        warning_messages = [str(record.message) for record in warning_records]
+        assert any("map outside metadata parent grid" in message for message in warning_messages)
+        assert any("extend above metadata maximum corner" in message for message in warning_messages)
+        assert metadata["domain_mapping"][(0, 0, 0)] == "A"
+
+
+def test_leapfrog_metadata_parser_tolerates_missing_or_unrecognized_comments():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        with open(blocks_path, "w", encoding="utf-8") as handle:
+            handle.write("# arbitrary export note\n")
+            handle.write("# another comment without a known key\n")
+            handle.write("x,y,z,dom\n")
+            handle.write("1,2,3,A\n")
+
+        metadata = parse_leapfrog_block_metadata(blocks_path)
+
+        assert metadata["raw_lines"] == ["arbitrary export note", "another comment without a known key"]
+        assert "parent_block_size" not in metadata
+        assert resolve_effective_csv_header_line(blocks_path, 1) == 3
+
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "plain.csv")
+        with open(blocks_path, "w", encoding="utf-8") as handle:
+            handle.write("x,y,z,dom\n")
+            handle.write("1,2,3,A\n")
+
+        assert parse_leapfrog_block_metadata(blocks_path) == {}
+        assert resolve_effective_csv_header_line(blocks_path, 1) == 1
+
+
+def test_streaming_metadata_uses_leapfrog_minimum_corner_for_parent_indexing():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "leapfrog_blocks.csv")
+        with open(blocks_path, "w", encoding="utf-8") as handle:
+            handle.write("# BM DG May2026 v06 20260410.csv\n")
+            handle.write("#   exported from Leapfrog Geo\n")
+            handle.write("#   rotation type: Leapfrog\n")
+            handle.write("#   azimuth: 0 degrees (rotate clockwise around the Z axis when looking down)\n")
+            handle.write("#   dip: 0 degrees\n")
+            handle.write("#   pitch: 0 degrees\n")
+            handle.write("#   parent block size: 25 25 15\n")
+            handle.write("#   size in parent blocks: 2 1 1 = 2\n")
+            handle.write("#   minimum parent centroid: 11547.5 99032.5 707.5\n")
+            handle.write("#   maximum parent centroid: 11572.5 99032.5 707.5\n")
+            handle.write("#   minimum corner: 11535 99020 700\n")
+            handle.write("#   maximum corner: 11585 99045 715\n")
+            handle.write("#   sub-blocks: octree 4 4 4\n")
+            handle.write("x,y,z,dom\n")
+            handle.write("11538.125,99023.125,701.875,A\n")
+            handle.write("11556.875,99023.125,701.875,A\n")
+            handle.write("11563.125,99023.125,701.875,B\n")
+            handle.write("11581.875,99023.125,701.875,B\n")
+
+        with pytest.warns(RuntimeWarning, match="configured block size"):
+            metadata = load_large_blocks_metadata(
+                blocks_path,
+                ",",
+                1,
+                (10, 10, 10),
+                None,
+                block_x_col="x",
+                block_y_col="y",
+                block_z_col="z",
+                block_domain_col="dom",
+                config=None,
+            )
+
+        assert metadata["unified_dims"].tolist() == [25.0, 25.0, 15.0]
+        assert metadata["grid_index_origin"].tolist() == [11535.0, 99020.0, 700.0]
+        assert metadata["source_blocks_header_line"] == 14
         assert metadata["domain_mapping"] == {
             (0, 0, 0): "A",
             (1, 0, 0): "B",
