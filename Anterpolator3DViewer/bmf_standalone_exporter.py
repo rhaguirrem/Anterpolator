@@ -41,6 +41,7 @@ MAX_DENSE_EXPORT_BYTES = int(os.environ.get("ANTERPOLATOR_BMF_MAX_DENSE_BYTES", 
 SUPPORTED_EXPORT_BACKENDS = {"tbms-config-text", "tbms-experimental", "vulcan"}
 DENSE_EXPORT_BACKENDS = {"tbms-config-text", "vulcan"}
 MAX_SELECTED_CSV_OBJECT_BYTES = int(os.environ.get("ANTERPOLATOR_BMF_MAX_SELECTED_CSV_BYTES", str(8 * 1024 ** 3)))
+MAX_SOURCE_ROW_PREP_BYTES = int(os.environ.get("ANTERPOLATOR_BMF_MAX_SOURCE_ROW_PREP_BYTES", str(1 * 1024 ** 3)))
 _LOGGED_LEAPFROG_METADATA_SIGNATURES: set[tuple[str, str, tuple[str, ...]]] = set()
 GRID_INDEX_COLUMNS = ("grid_i", "grid_j", "grid_k")
 GEOMETRY_EXTENT_COLUMNS = ("__lower_x", "__upper_x", "__lower_y", "__upper_y", "__lower_z", "__upper_z")
@@ -506,8 +507,80 @@ def _read_csv_with_chunk_progress(
             message = f"Reading CSV rows {rows_read:,}..."
         _emit_progress(progress_callback, _scale_progress(progress_start, progress_end, fraction), 100, message)
     if chunks:
+        _emit_progress(progress_callback, progress_end, 100, f"Combining {len(chunks):,} CSV chunks into a table...")
         return pd.concat(chunks, ignore_index=True)
     return pd.DataFrame()
+
+
+def _build_csv_read_names(header_names: Sequence[str]) -> list[str]:
+    seen_names: dict[str, int] = {}
+    final_names = []
+    for index, name in enumerate(header_names):
+        base_name = str(name or "").strip() or f"Column_{index + 1}"
+        count = seen_names.get(base_name, 0)
+        seen_names[base_name] = count + 1
+        final_names.append(base_name if count == 0 else f"{base_name}_{count + 1}")
+    return final_names
+
+
+def _iter_csv_chunks_for_export(
+    path: Path,
+    delimiter: str | None,
+    header_line: int,
+    usecols: Sequence[str] | None = None,
+    chunksize: int = 250_000,
+    progress_callback=None,
+    progress_start: int = 5,
+    progress_end: int = 30,
+    progress_label: str = "Reading CSV rows",
+    total_rows: int | None = None,
+) -> Iterable[pd.DataFrame]:
+    effective_header_line = resolve_effective_csv_header_line(path, header_line)
+    csv_delimiter = delimiter or detect_csv_delimiter(path)
+    final_names = _build_csv_read_names(parse_header_line(path, csv_delimiter, effective_header_line))
+    read_kwargs = {
+        "sep": csv_delimiter,
+        "header": None,
+        "names": final_names,
+        "skiprows": effective_header_line,
+        "usecols": list(usecols) if usecols else None,
+        "dtype": str,
+        "comment": "#",
+        "chunksize": chunksize,
+        "low_memory": True,
+        "memory_map": True,
+    }
+    rows_read = 0
+    try:
+        reader = pd.read_csv(path, **read_kwargs)
+        for chunk in reader:
+            rows_read += len(chunk)
+            if total_rows and total_rows > 0:
+                fraction = min(rows_read / total_rows, 1.0)
+                message = f"{progress_label} {rows_read:,}/{total_rows:,} ({fraction:.0%})..."
+            else:
+                fraction = 0.5
+                message = f"{progress_label} {rows_read:,}..."
+            _emit_progress(progress_callback, _scale_progress(progress_start, progress_end, fraction), 100, message)
+            yield chunk
+    except (MemoryError, pd.errors.ParserError) as exc:
+        if "out of memory" not in str(exc).lower() and not isinstance(exc, MemoryError):
+            raise
+        read_kwargs.pop("low_memory", None)
+        read_kwargs.pop("memory_map", None)
+        read_kwargs["engine"] = "python"
+        rows_read = 0
+        reader = pd.read_csv(path, **read_kwargs)
+        for chunk in reader:
+            rows_read += len(chunk)
+            if total_rows and total_rows > 0:
+                fraction = min(rows_read / total_rows, 1.0)
+                message = f"{progress_label} {rows_read:,}/{total_rows:,} ({fraction:.0%})..."
+            else:
+                fraction = 0.5
+                message = f"{progress_label} {rows_read:,}..."
+            _emit_progress(progress_callback, _scale_progress(progress_start, progress_end, fraction), 100, message)
+            yield chunk
 
 
 def _auto_read_csv(
@@ -523,13 +596,7 @@ def _auto_read_csv(
     effective_header_line = resolve_effective_csv_header_line(path, header_line)
     csv_delimiter = delimiter or detect_csv_delimiter(path)
     header_names = parse_header_line(path, csv_delimiter, effective_header_line)
-    seen_names: dict[str, int] = {}
-    final_names = []
-    for index, name in enumerate(header_names):
-        base_name = str(name or "").strip() or f"Column_{index + 1}"
-        count = seen_names.get(base_name, 0)
-        seen_names[base_name] = count + 1
-        final_names.append(base_name if count == 0 else f"{base_name}_{count + 1}")
+    final_names = _build_csv_read_names(header_names)
     read_kwargs = {
         "header": None,
         "names": final_names,
@@ -2068,25 +2135,48 @@ def _validate_selected_csv_read_size(
     selected_read_cols: Sequence[str] | None,
     backend: str,
     regularize_to_base_block: bool,
+    source_row_mode: bool = False,
     progress_callback=None,
 ) -> None:
-    if not selected_read_cols or not _backend_requires_dense_grid(backend):
+    if not selected_read_cols:
         return
     row_count = _count_csv_data_rows(path, header_line, progress_callback, 3, 5)
     if row_count is None:
         return
     column_count = len(selected_read_cols)
     estimated_object_block_bytes = int(row_count) * int(column_count) * 8
+    if source_row_mode:
+        estimated_coordinate_bytes = int(row_count) * 3 * 8
+        if estimated_coordinate_bytes > MAX_SOURCE_ROW_PREP_BYTES:
+            raise MemoryError(
+                f"The source-row tbms-config-text export is too large for the current in-memory irregular row preparation. "
+                f"It would need to allocate at least {_format_byte_size(estimated_coordinate_bytes)} just for the "
+                f"XYZ coordinate matrix ({row_count:,} rows x 3 float64 columns) before writing. "
+                "This path does not create an implied dense grid, but this particular export could not use the streaming "
+                "irregular writer. Streaming source-row BMF export requires explicit row geometry, Leapfrog parent/sub-block "
+                "metadata, or an explicit parent Cell Size X/Y/Z. Increasing ANTERPOLATOR_BMF_MAX_SOURCE_ROW_PREP_BYTES "
+                "only helps on machines with enough RAM."
+            )
     if estimated_object_block_bytes <= MAX_SELECTED_CSV_OBJECT_BYTES:
         return
 
-    operation = "regularized dense BMF export" if regularize_to_base_block else "dense BMF export"
+    if regularize_to_base_block:
+        operation = "regularized dense BMF export"
+    elif source_row_mode:
+        operation = "source-row BMF export"
+    elif _backend_requires_dense_grid(backend):
+        operation = "dense BMF export"
+    else:
+        operation = "source-row BMF export"
     raise MemoryError(
         f"The selected CSV columns are too wide for {operation} with backend {backend!r}. "
         f"The exporter would need to load {row_count:,} row(s) x {column_count:,} selected column(s) before writing, "
         f"which is at least {_format_byte_size(estimated_object_block_bytes)} just for pandas object references. "
-        "Select fewer value columns and export in smaller batches, or use the tbms-experimental backend if you need a "
-        "row-indexed Anterpolator container rather than a dense Vulcan-style BMF."
+        "This source-row path avoids creating an implied dense grid, but the current standalone writer still has to "
+        "materialize the selected CSV columns before writing when the streaming irregular writer cannot be used. "
+        "Streaming source-row BMF export requires explicit row geometry, Leapfrog parent/sub-block metadata, or an explicit "
+        "parent Cell Size X/Y/Z. Select fewer value columns and export in smaller batches, or increase "
+        "ANTERPOLATOR_BMF_MAX_SELECTED_CSV_BYTES only if the machine has enough RAM."
     )
 
 
@@ -2292,6 +2382,613 @@ def _tbms_pointer_page(child_offsets: Sequence[int]) -> bytes:
     if len(entries) < 257:
         entries.extend([0] * (257 - len(entries)))
     return struct.pack("<257Q", *entries)
+
+
+class _TbmsStreamingPageField:
+    def __init__(self, dtype: np.dtype, default_value: object, allocate_page):
+        self.dtype = np.dtype(dtype)
+        self.default_value = default_value
+        self.allocate_page = allocate_page
+        self.capacity = 2048 // self.dtype.itemsize
+        self.buffer = np.full(self.capacity, default_value, dtype=self.dtype)
+        self.buffer_count = 0
+        self.leaf_offsets: list[int] = []
+
+    def append(self, values: Sequence[object] | np.ndarray) -> None:
+        incoming = np.asarray(values, dtype=self.dtype)
+        position = 0
+        total = len(incoming)
+        while position < total:
+            available = self.capacity - self.buffer_count
+            take = min(available, total - position)
+            self.buffer[self.buffer_count:self.buffer_count + take] = incoming[position:position + take]
+            self.buffer_count += take
+            position += take
+            if self.buffer_count == self.capacity:
+                self._flush_full_buffer()
+
+    def _flush_full_buffer(self) -> None:
+        payload = self.buffer.astype(self.dtype, copy=False).tobytes(order="C")
+        self.leaf_offsets.append(self.allocate_page(struct.pack("<II", 512, 0) + payload))
+        self.buffer.fill(self.default_value)
+        self.buffer_count = 0
+
+    def finish(self) -> list[int]:
+        if self.buffer_count > 0 or not self.leaf_offsets:
+            payload = self.buffer.astype(self.dtype, copy=False).tobytes(order="C")
+            self.leaf_offsets.append(self.allocate_page(struct.pack("<II", 512, 0) + payload))
+            self.buffer.fill(self.default_value)
+            self.buffer_count = 0
+        return list(self.leaf_offsets)
+
+
+def _tbms_page_tree_root_from_leaf_offsets(leaf_offsets: Sequence[int], allocate_page) -> int:
+    current_offsets = list(leaf_offsets)
+    if not current_offsets:
+        current_offsets = [allocate_page(_tbms_value_page(np.empty(0, dtype="<f4"), np.dtype("<f4"), 0.0)[0])]
+    while len(current_offsets) > 1:
+        next_offsets: list[int] = []
+        for start in range(0, len(current_offsets), 256):
+            next_offsets.append(allocate_page(_tbms_pointer_page(current_offsets[start:start + 256])))
+        current_offsets = next_offsets
+    return int(current_offsets[0])
+
+
+def _stream_missing_or_blank_mask(series: pd.Series) -> pd.Series:
+    return series.isna() | series.astype(str).str.strip().eq("")
+
+
+def _new_stream_field_state(name: str, forced_type: str | None) -> dict[str, object]:
+    return {
+        "name": name,
+        "forced_type": _normalize_export_field_type(forced_type),
+        "numeric_compatible": True,
+        "integer_like": True,
+        "has_numeric": False,
+        "min": None,
+        "max": None,
+        "labels": {},
+        "too_many_labels": False,
+        "invalid_values": [],
+    }
+
+
+def _remember_stream_invalid_values(state: dict[str, object], values: pd.Series) -> None:
+    invalid_values = state.setdefault("invalid_values", [])
+    if not isinstance(invalid_values, list) or len(invalid_values) >= 5:
+        return
+    for value in pd.unique(values.astype(str)):
+        if len(invalid_values) >= 5:
+            break
+        text = str(value)
+        if text not in invalid_values:
+            invalid_values.append(text)
+
+
+def _scan_stream_field_values(state: dict[str, object], series: pd.Series) -> None:
+    missing_mask = _stream_missing_or_blank_mask(series)
+    label_values = series.loc[series.notna()]
+    labels = state.get("labels")
+    if isinstance(labels, dict) and not state.get("too_many_labels"):
+        for value in pd.unique(label_values.astype(str)):
+            label = str(value)
+            if label not in labels:
+                if len(labels) >= 32766:
+                    state["too_many_labels"] = True
+                    break
+                labels[label] = len(labels) + 1
+
+    numeric = pd.to_numeric(series, errors="coerce")
+    invalid_numeric = ~missing_mask & numeric.isna()
+    if invalid_numeric.any():
+        state["numeric_compatible"] = False
+        _remember_stream_invalid_values(state, series.loc[invalid_numeric])
+        return
+
+    finite = numeric.loc[numeric.notna()].to_numpy(dtype=float)
+    if finite.size == 0:
+        return
+    state["has_numeric"] = True
+    min_value = int(np.min(finite)) if np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0) else float(np.min(finite))
+    max_value = int(np.max(finite)) if np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0) else float(np.max(finite))
+    state["min"] = min_value if state.get("min") is None else min(float(state["min"]), float(min_value))
+    state["max"] = max_value if state.get("max") is None else max(float(state["max"]), float(max_value))
+    if not np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0):
+        state["integer_like"] = False
+
+
+def _finalize_stream_field_state(state: dict[str, object], null_float: float) -> dict[str, object]:
+    name = str(state.get("name"))
+    forced_type = state.get("forced_type")
+    numeric_compatible = bool(state.get("numeric_compatible"))
+    invalid_values = state.get("invalid_values") if isinstance(state.get("invalid_values"), list) else []
+
+    if forced_type == "boolean":
+        return {"field_type": "boolean", "default": 0, "dtype": np.dtype("u1")}
+    if forced_type == "int":
+        if not numeric_compatible:
+            raise ValueError(f"Column {name!r} cannot be exported as int because it contains non-numeric values. Invalid values include: {invalid_values}")
+        if not bool(state.get("integer_like", True)):
+            raise ValueError(f"Column {name!r} cannot be exported as int because it contains non-integer numeric values.")
+        min_value = int(float(state.get("min") or 0))
+        max_value = int(float(state.get("max") or 0))
+        if not (-2147483648 <= min_value and max_value <= 2147483647):
+            raise ValueError(f"Column {name!r} exceeds the supported int32 range for int export.")
+        return {"field_type": "int", "default": int(null_float), "dtype": np.dtype("<i4")}
+    if forced_type == "double":
+        if not numeric_compatible:
+            raise ValueError(f"Column {name!r} cannot be exported as double because it contains non-numeric values. Invalid values include: {invalid_values}")
+        return {"field_type": "double", "default": float(null_float), "dtype": np.dtype("<f8")}
+    if forced_type == "string":
+        if state.get("too_many_labels"):
+            raise ValueError(f"Column {name!r} has too many categorical values for string export.")
+        labels = dict(state.get("labels") or {})
+        return {"field_type": "namedshort", "default": 0, "dtype": np.dtype("<i2"), "labels": labels}
+
+    if numeric_compatible:
+        if bool(state.get("integer_like", True)) and bool(state.get("has_numeric", False)):
+            min_value = int(float(state.get("min") or 0))
+            max_value = int(float(state.get("max") or 0))
+            if -2147483648 <= min_value and max_value <= 2147483647:
+                return {"field_type": "int", "default": int(null_float), "dtype": np.dtype("<i4")}
+        return {"field_type": "double", "default": float(null_float), "dtype": np.dtype("<f8")}
+
+    if state.get("too_many_labels"):
+        raise ValueError(f"Column {name!r} has too many categorical values for namedshort export.")
+    labels = dict(state.get("labels") or {})
+    return {"field_type": "namedshort", "default": 0, "dtype": np.dtype("<i2"), "labels": labels}
+
+
+def _encode_stream_field_chunk(series: pd.Series, field_info: Mapping[str, object], null_float: float) -> np.ndarray:
+    field_type = str(field_info.get("field_type"))
+    if field_type == "boolean":
+        truthy = {"1", "true", "t", "yes", "y"}
+        falsy = {"0", "false", "f", "no", "n", ""}
+        normalized = series.fillna(False).astype(str).str.strip().str.lower()
+        invalid = ~series.isna() & ~normalized.isin(truthy | falsy)
+        if invalid.any():
+            invalid_values = sorted(pd.unique(series.loc[invalid].astype(str)))[:5]
+            raise ValueError(f"Column {series.name!r} cannot be exported as boolean. Invalid values include: {invalid_values}")
+        return normalized.isin(truthy).astype(np.uint8).to_numpy(dtype="u1", copy=False)
+    if field_type == "int":
+        return pd.to_numeric(series, errors="coerce").fillna(int(null_float)).astype(np.int32).to_numpy(dtype="<i4", copy=False)
+    if field_type == "double":
+        return pd.to_numeric(series, errors="coerce").fillna(float(null_float)).astype(np.float64).to_numpy(dtype="<f8", copy=False)
+    labels = field_info.get("labels") if isinstance(field_info.get("labels"), Mapping) else {}
+    return series.map(lambda value: 0 if pd.isna(value) else int(labels[str(value)])).astype(np.int16).to_numpy(dtype="<i2", copy=False)
+
+
+def _classify_header_value_columns(
+    header_names: Sequence[str],
+    xyz_cols: Sequence[str],
+    value_cols: Sequence[str] | None,
+    geometry_columns: Sequence[str] | None = None,
+) -> list[str]:
+    geometry_cols = set(GRID_INDEX_COLUMNS) | set(GEOMETRY_EXTENT_COLUMNS) | set(geometry_columns or [])
+    if value_cols:
+        cols = [c for c in value_cols if c in header_names and c not in xyz_cols and c not in geometry_cols]
+        if not cols:
+            raise ValueError("No valid value columns were provided.")
+        return cols
+    return [c for c in header_names if c not in xyz_cols and c not in geometry_cols]
+
+
+def _prepare_stream_irregular_chunk_geometry(
+    chunk: pd.DataFrame,
+    xyz_cols: Sequence[str],
+    metadata: Mapping[str, object],
+    cell_size: Sequence[float] | np.ndarray | None,
+    origin: Sequence[float] | np.ndarray | None,
+    index_tolerance: float,
+    geometry_size_cols: Mapping[str, str] | None = None,
+    geometry_extent_cols: Mapping[str, str] | None = None,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    clean = chunk.copy()
+    for col in xyz_cols:
+        clean[col] = pd.to_numeric(clean[col], errors="coerce")
+    clean = clean.dropna(subset=list(xyz_cols))
+    if clean.empty:
+        return clean, np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=np.int64), np.empty((0, 3), dtype=float)
+
+    extent_col_map = dict(geometry_extent_cols or {})
+    if not extent_col_map and all(column in clean.columns for column in GEOMETRY_EXTENT_COLUMNS):
+        extent_col_map = dict(zip(GEOMETRY_EXTENT_COLUMNS, GEOMETRY_EXTENT_COLUMNS))
+    if all(extent_col_map.get(role) in clean.columns for role in GEOMETRY_EXTENT_COLUMNS):
+        extent_values = clean[[extent_col_map[role] for role in GEOMETRY_EXTENT_COLUMNS]].apply(pd.to_numeric, errors="coerce")
+        valid = extent_values.notna().all(axis=1)
+        clean = clean.loc[valid].reset_index(drop=True)
+        extent_values = extent_values.loc[valid].reset_index(drop=True)
+        lower = extent_values[[extent_col_map["__lower_x"], extent_col_map["__lower_y"], extent_col_map["__lower_z"]]].to_numpy(dtype=float)
+        upper = extent_values[[extent_col_map["__upper_x"], extent_col_map["__upper_y"], extent_col_map["__upper_z"]]].to_numpy(dtype=float)
+        xyz = (lower + upper) * 0.5
+        parent_size_source = metadata.get("parent_block_size") or cell_size
+        parent_size = np.asarray(parent_size_source if parent_size_source is not None else np.nanmax(upper - lower, axis=0), dtype=float)
+        origin_arr = np.asarray(origin if origin is not None else metadata.get("minimum_corner", np.nanmin(lower, axis=0)), dtype=float)
+        parent_idx = np.floor((xyz - origin_arr) / parent_size + float(index_tolerance)).astype(np.int64)
+        return clean, lower, upper, parent_idx, parent_size
+
+    size_col_map = dict(geometry_size_cols or {})
+    if all(size_col_map.get(role) in clean.columns for role in GEOMETRY_SIZE_COLUMN_ROLES):
+        size_cols = [size_col_map[role] for role in GEOMETRY_SIZE_COLUMN_ROLES]
+        size_values = clean[size_cols].apply(pd.to_numeric, errors="coerce")
+        valid = size_values.notna().all(axis=1)
+        clean = clean.loc[valid].reset_index(drop=True)
+        size_values = size_values.loc[valid].reset_index(drop=True)
+        widths = size_values[size_cols].to_numpy(dtype=float)
+        xyz = clean[list(xyz_cols)].to_numpy(dtype=float)
+        lower = xyz - 0.5 * widths
+        upper = xyz + 0.5 * widths
+        parent_size_source = metadata.get("parent_block_size") or cell_size
+        parent_size = np.asarray(parent_size_source if parent_size_source is not None else np.nanmax(widths, axis=0), dtype=float)
+        origin_arr = np.asarray(origin if origin is not None else metadata.get("minimum_corner", np.nanmin(lower, axis=0)), dtype=float)
+        parent_idx = np.floor((xyz - origin_arr) / parent_size + float(index_tolerance)).astype(np.int64)
+        return clean, lower, upper, parent_idx, parent_size
+
+    parent_size_source = metadata.get("parent_block_size") or cell_size
+    if parent_size_source is None:
+        raise ValueError("Streaming irregular export requires parent block size metadata or explicit Cell Size X/Y/Z when no row extent/dimension columns are available.")
+    parent_size = np.asarray(parent_size_source, dtype=float)
+    if origin is not None:
+        origin_arr = np.asarray(origin, dtype=float)
+    elif metadata.get("minimum_corner") is not None:
+        origin_arr = np.asarray(metadata["minimum_corner"], dtype=float)
+    elif metadata.get("minimum_parent_centroid") is not None:
+        origin_arr = np.asarray(metadata["minimum_parent_centroid"], dtype=float) - 0.5 * parent_size
+    else:
+        xyz_min = clean[list(xyz_cols)].to_numpy(dtype=float).min(axis=0)
+        origin_arr = np.floor(xyz_min / parent_size) * parent_size
+    xyz = clean[list(xyz_cols)].to_numpy(dtype=float)
+    parent_idx = np.floor((xyz - origin_arr) / parent_size + float(index_tolerance)).astype(np.int64)
+    local = np.clip(xyz - (origin_arr + parent_idx.astype(float) * parent_size), 0.0, parent_size)
+    widths = np.empty_like(xyz, dtype=float)
+    axis_tolerance = max(float(index_tolerance), 1e-9)
+    for axis in range(3):
+        widths[:, axis] = _infer_irregular_axis_widths(local[:, axis], float(parent_size[axis]), axis_tolerance)
+    lower = xyz - 0.5 * widths
+    upper = xyz + 0.5 * widths
+    return clean.reset_index(drop=True), lower, upper, parent_idx, parent_size
+
+
+def _scan_stream_irregular_export(
+    input_csv: Path,
+    delimiter: str | None,
+    header_line: int,
+    selected_read_cols: Sequence[str],
+    xyz_cols: Sequence[str],
+    value_cols: Sequence[str],
+    metadata: Mapping[str, object],
+    cell_size: Sequence[float] | np.ndarray | None,
+    origin: Sequence[float] | np.ndarray | None,
+    index_tolerance: float,
+    geometry_size_cols: Mapping[str, str] | None,
+    geometry_extent_cols: Mapping[str, str] | None,
+    column_types: Mapping[str, object] | None,
+    value_exceptions: Mapping[str, Mapping[str, object]] | None,
+    null_float: float,
+    total_rows: int | None,
+    progress_callback=None,
+) -> dict[str, object]:
+    normalized_overrides = _normalize_export_type_overrides(column_types)
+    field_states = {
+        name: _new_stream_field_state(name, normalized_overrides.get(name))
+        for name in value_cols
+    }
+    row_count = 0
+    min_lower = np.full(3, np.inf, dtype=float)
+    max_upper = np.full(3, -np.inf, dtype=float)
+    max_parent_idx = np.full(3, -1, dtype=np.int64)
+    parent_size = None
+
+    _emit_progress(progress_callback, 30, 100, "Scanning CSV chunks for streaming BMF schema and geometry...")
+    for chunk in _iter_csv_chunks_for_export(
+        input_csv,
+        delimiter=delimiter,
+        header_line=header_line,
+        usecols=selected_read_cols,
+        progress_callback=progress_callback,
+        progress_start=30,
+        progress_end=45,
+        progress_label="Scanning CSV rows",
+        total_rows=total_rows,
+    ):
+        if value_exceptions:
+            chunk = _apply_value_exceptions(chunk, value_exceptions)
+        clean, lower, upper, parent_idx, chunk_parent_size = _prepare_stream_irregular_chunk_geometry(
+            chunk,
+            xyz_cols=xyz_cols,
+            metadata=metadata,
+            cell_size=cell_size,
+            origin=origin,
+            index_tolerance=index_tolerance,
+            geometry_size_cols=geometry_size_cols,
+            geometry_extent_cols=geometry_extent_cols,
+        )
+        if clean.empty:
+            continue
+        widths = upper - lower
+        if np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper)) or np.any(widths <= 0):
+            raise ValueError("Invalid irregular row geometry encountered while scanning CSV chunks.")
+        row_count += len(clean)
+        min_lower = np.minimum(min_lower, np.nanmin(lower, axis=0))
+        max_upper = np.maximum(max_upper, np.nanmax(upper, axis=0))
+        if len(parent_idx):
+            max_parent_idx = np.maximum(max_parent_idx, np.nanmax(parent_idx, axis=0).astype(np.int64))
+        chunk_parent_size = np.asarray(chunk_parent_size, dtype=float)
+        parent_size = chunk_parent_size if parent_size is None else np.maximum(np.asarray(parent_size, dtype=float), chunk_parent_size)
+        for name in value_cols:
+            _scan_stream_field_values(field_states[name], clean[name])
+
+    if row_count <= 0:
+        raise ValueError("No valid irregular source rows found while streaming CSV export.")
+    parent_size_arr = np.asarray(parent_size if parent_size is not None else cell_size, dtype=float)
+    if parent_size_arr.shape != (3,) or np.any(parent_size_arr <= 0) or np.any(~np.isfinite(parent_size_arr)):
+        raise ValueError("Could not determine a valid parent block size for streaming irregular export.")
+    if origin is not None:
+        origin_arr = np.asarray(origin, dtype=float)
+    elif metadata.get("minimum_corner") is not None:
+        origin_arr = np.asarray(metadata["minimum_corner"], dtype=float)
+    else:
+        origin_arr = min_lower
+    if origin_arr.shape != (3,) or np.any(~np.isfinite(origin_arr)):
+        raise ValueError("Could not determine a valid origin for streaming irregular export.")
+
+    if metadata.get("size_in_parent_blocks") is not None:
+        dims = np.asarray(metadata["size_in_parent_blocks"], dtype=np.int64)
+    else:
+        span_dims = np.ceil((max_upper - origin_arr) / parent_size_arr - 1e-9).astype(np.int64)
+        dims = np.maximum(span_dims, max_parent_idx + 1)
+    dims = np.maximum(dims.astype(np.int64), 1)
+    extents = np.maximum(max_upper - origin_arr, dims.astype(float) * parent_size_arr)
+    field_infos = {
+        name: _finalize_stream_field_state(state, null_float)
+        for name, state in field_states.items()
+    }
+    return {
+        "row_count": int(row_count),
+        "origin": origin_arr,
+        "cell": parent_size_arr,
+        "dims": dims,
+        "extents": extents,
+        "field_infos": field_infos,
+    }
+
+
+def _write_streaming_irregular_tbms_config_text(
+    input_csv: Path,
+    prepared: Mapping[str, object],
+    xyz_cols: Sequence[str],
+    value_cols: Sequence[str],
+    selected_read_cols: Sequence[str],
+    delimiter: str | None,
+    header_line: int,
+    metadata: Mapping[str, object],
+    cell_size: Sequence[float] | np.ndarray | None,
+    origin: Sequence[float] | np.ndarray | None,
+    index_tolerance: float,
+    geometry_size_cols: Mapping[str, str] | None,
+    geometry_extent_cols: Mapping[str, str] | None,
+    value_exceptions: Mapping[str, Mapping[str, object]] | None,
+    out_bmf: Path,
+    null_float: float,
+    progress_callback=None,
+    progress_start: int = 50,
+    progress_end: int = 98,
+    total_rows: int | None = None,
+) -> dict[str, object]:
+    dims = np.asarray(prepared["dims"], dtype=np.int64)
+    origin_arr = np.asarray(prepared["origin"], dtype=float)
+    cell = np.asarray(prepared["cell"], dtype=float)
+    extents = np.asarray(prepared["extents"], dtype=float)
+    row_count = int(prepared["row_count"])
+    field_infos = dict(prepared.get("field_infos") or {})
+
+    first_page_offset = TBMS_EXPERIMENTAL_FIRST_SECTION_OFFSET
+    config_pointer_header_offsets = (24, 40)
+    page_size = 2056
+    field_entries: list[dict[str, object]] = []
+    categorical_fields = 0
+    page_count = 0
+
+    out_bmf.parent.mkdir(parents=True, exist_ok=True)
+    with out_bmf.open("wb") as fh:
+        _emit_progress(progress_callback, progress_start, 100, "Writing streaming BMF header...")
+        header = bytearray(TBMS_HEADER_SIZE)
+        header[: len(TBMS_SIGNATURE)] = TBMS_SIGNATURE
+        struct.pack_into("<I", header, 12, 1)
+        struct.pack_into("<I", header, 16, first_page_offset)
+        fh.write(header)
+        if fh.tell() < first_page_offset:
+            fh.write(b"\x00" * (first_page_offset - fh.tell()))
+
+        def allocate_page(blob: bytes) -> int:
+            nonlocal page_count
+            if len(blob) != page_size:
+                raise ValueError("TBMS page blobs must be exactly 2056 bytes.")
+            offset = first_page_offset + page_count * page_size
+            if fh.tell() < offset:
+                fh.write(b"\x00" * (offset - fh.tell()))
+            fh.write(blob)
+            page_count += 1
+            return offset
+
+        geometry_names = ["__lower_x", "__upper_x", "__lower_y", "__upper_y", "__lower_z", "__upper_z"]
+        geometry_builders = {
+            name: _TbmsStreamingPageField(np.dtype("<f4"), 0.0, allocate_page)
+            for name in geometry_names
+        }
+        _emit_progress(progress_callback, progress_start, 100, "Streaming irregular geometry pages from CSV chunks...")
+        for chunk in _iter_csv_chunks_for_export(
+            input_csv,
+            delimiter=delimiter,
+            header_line=header_line,
+            usecols=selected_read_cols,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=_scale_progress(progress_start, progress_end, 0.35),
+            progress_label="Writing geometry rows",
+            total_rows=total_rows,
+        ):
+            if value_exceptions:
+                chunk = _apply_value_exceptions(chunk, value_exceptions)
+            clean, lower, upper, _parent_idx, _parent_size = _prepare_stream_irregular_chunk_geometry(
+                chunk,
+                xyz_cols=xyz_cols,
+                metadata=metadata,
+                cell_size=cell_size,
+                origin=origin,
+                index_tolerance=index_tolerance,
+                geometry_size_cols=geometry_size_cols,
+                geometry_extent_cols=geometry_extent_cols,
+            )
+            if clean.empty:
+                continue
+            geometry_builders["__lower_x"].append(lower[:, 0].astype("<f4", copy=False))
+            geometry_builders["__upper_x"].append(upper[:, 0].astype("<f4", copy=False))
+            geometry_builders["__lower_y"].append(lower[:, 1].astype("<f4", copy=False))
+            geometry_builders["__upper_y"].append(upper[:, 1].astype("<f4", copy=False))
+            geometry_builders["__lower_z"].append(lower[:, 2].astype("<f4", copy=False))
+            geometry_builders["__upper_z"].append(upper[:, 2].astype("<f4", copy=False))
+
+        for geometry_index, name in enumerate(geometry_names):
+            root_offset = _tbms_page_tree_root_from_leaf_offsets(geometry_builders[name].finish(), allocate_page)
+            field_entries.append({
+                "entry_key": f"var_{geometry_index}",
+                "entry": {
+                    "name": name,
+                    "type": "float",
+                    "location": int(root_offset),
+                    "default": 0.0,
+                    "global": 0,
+                    "read_only": 1,
+                    "description": "Irregular block geometry extent",
+                },
+            })
+
+        value_entry_offset = len(field_entries)
+        value_builders = {
+            name: _TbmsStreamingPageField(np.dtype(field_infos[name]["dtype"]), field_infos[name]["default"], allocate_page)
+            for name in value_cols
+        }
+        _emit_progress(progress_callback, _scale_progress(progress_start, progress_end, 0.36), 100, "Streaming BMF value pages from CSV chunks...")
+        for chunk in _iter_csv_chunks_for_export(
+            input_csv,
+            delimiter=delimiter,
+            header_line=header_line,
+            usecols=selected_read_cols,
+            progress_callback=progress_callback,
+            progress_start=_scale_progress(progress_start, progress_end, 0.36),
+            progress_end=_scale_progress(progress_start, progress_end, 0.82),
+            progress_label="Writing value rows",
+            total_rows=total_rows,
+        ):
+            if value_exceptions:
+                chunk = _apply_value_exceptions(chunk, value_exceptions)
+            clean, _lower, _upper, _parent_idx, _parent_size = _prepare_stream_irregular_chunk_geometry(
+                chunk,
+                xyz_cols=xyz_cols,
+                metadata=metadata,
+                cell_size=cell_size,
+                origin=origin,
+                index_tolerance=index_tolerance,
+                geometry_size_cols=geometry_size_cols,
+                geometry_extent_cols=geometry_extent_cols,
+            )
+            if clean.empty:
+                continue
+            for name in value_cols:
+                value_builders[name].append(_encode_stream_field_chunk(clean[name], field_infos[name], null_float))
+
+        for field_index, name in enumerate(value_cols):
+            encoded = field_infos[name]
+            root_offset = _tbms_page_tree_root_from_leaf_offsets(value_builders[name].finish(), allocate_page)
+            entry = {
+                "name": name,
+                "type": encoded["field_type"],
+                "location": int(root_offset),
+                "default": encoded["default"],
+                "global": 0,
+                "read_only": 0,
+                "description": f"Exported from CSV column {name}",
+            }
+            labels = encoded.get("labels") if isinstance(encoded.get("labels"), Mapping) else {}
+            for label, code in labels.items():
+                entry[f"string_{int(code)}"] = str(label)
+            if encoded["field_type"] == "namedshort":
+                entry["string_0"] = ""
+                categorical_fields += 1
+            field_entries.append({"entry_key": f"var_{value_entry_offset + field_index}", "entry": entry})
+
+    now_text = datetime.now(timezone.utc).isoformat()
+    config_object: dict[str, object] = {
+        "created": now_text,
+        "modified": now_text,
+        "history_source": "Anterpolator streaming tbms-config-text export",
+        "n_blocks": row_count,
+        "n_schemas": 1,
+        "is_irregular": 1,
+        "geometry_encoding": "row_extents_lower_upper",
+        "origin_x": 0.0,
+        "origin_y": 0.0,
+        "origin_z": 0.0,
+        "lower_x": float(origin_arr[0]),
+        "lower_y": float(origin_arr[1]),
+        "lower_z": float(origin_arr[2]),
+        "upper_x": float(origin_arr[0] + extents[0]),
+        "upper_y": float(origin_arr[1] + extents[1]),
+        "upper_z": float(origin_arr[2] + extents[2]),
+        "voxel_length_x": float(cell[0]),
+        "voxel_length_y": float(cell[1]),
+        "voxel_length_z": float(cell[2]),
+        "schema_0": {
+            "dim_x": int(dims[0]),
+            "dim_y": int(dims[1]),
+            "dim_z": int(dims[2]),
+            "lower_x": float(origin_arr[0]),
+            "lower_y": float(origin_arr[1]),
+            "lower_z": float(origin_arr[2]),
+            "upper_x": float(origin_arr[0] + extents[0]),
+            "upper_y": float(origin_arr[1] + extents[1]),
+            "upper_z": float(origin_arr[2] + extents[2]),
+            "max_size_x": float(cell[0]),
+            "max_size_y": float(cell[1]),
+            "max_size_z": float(cell[2]),
+        },
+    }
+    for field in field_entries:
+        config_object[str(field["entry_key"])] = field["entry"]
+
+    config_bytes = _tbms_config_text(config_object).encode("latin1", errors="replace")
+    config_offset = _align_offset(first_page_offset + page_count * page_size, 8)
+    file_size = config_offset + len(config_bytes)
+    with out_bmf.open("r+b") as fh:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() < config_offset:
+            fh.write(b"\x00" * (config_offset - fh.tell()))
+        _emit_progress(progress_callback, progress_end, 100, "Writing streaming BMF configuration...")
+        fh.write(config_bytes)
+        fh.seek(0)
+        header = bytearray(TBMS_HEADER_SIZE)
+        header[: len(TBMS_SIGNATURE)] = TBMS_SIGNATURE
+        struct.pack_into("<I", header, 12, 1)
+        struct.pack_into("<I", header, 16, first_page_offset)
+        for header_offset in config_pointer_header_offsets:
+            struct.pack_into("<Q", header, header_offset, config_offset)
+        struct.pack_into("<Q", header, 48, file_size)
+        fh.write(header)
+
+    return {
+        "backend": "tbms-config-text",
+        "streaming": True,
+        "file_size": int(file_size),
+        "page_count": int(page_count),
+        "field_count": len(field_entries),
+        "categorical_fields": categorical_fields,
+        "config_offset": int(config_offset),
+        "first_page_offset": int(first_page_offset),
+        "row_count": int(row_count),
+        "value_columns": list(value_cols),
+        "xyz_columns": list(xyz_cols),
+    }
 
 
 def _write_tbms_config_text(
@@ -3860,18 +4557,182 @@ def export_bmf(
         and not regularize_to_base_block
         and not use_irregular_tbms_config
     )
+    source_row_mode = bool(backend == "tbms-config-text" and not regularize_to_base_block)
+    header_value_cols = _classify_header_value_columns(
+        csv_header_names,
+        xyz_cols=xyz_cols,
+        value_cols=value_cols,
+        geometry_columns=explicit_geometry_cols,
+    ) if source_row_mode else []
     selected_read_cols = (
         list(dict.fromkeys([*xyz_cols, *available_grid_index_cols, *(explicit_geometry_cols if use_irregular_tbms_config else []), *(value_cols or [])]))
         if value_cols else None
     )
+    if source_row_mode and selected_read_cols is None:
+        selected_read_cols = list(dict.fromkeys([*xyz_cols, *(explicit_geometry_cols if use_irregular_tbms_config else []), *header_value_cols]))
     selected_message = "selected columns" if selected_read_cols else "all columns"
+    counted_source_rows = _count_csv_data_rows(in_csv, effective_header_line, progress_callback, 3, 5) if selected_read_cols else None
+    selected_column_count = len(selected_read_cols or [])
+    estimated_selected_bytes = int(counted_source_rows or 0) * selected_column_count * 8
+    estimated_coordinate_bytes = int(counted_source_rows or 0) * 3 * 8
+    can_stream_irregular_source_rows = bool(
+        source_row_mode
+        and selected_read_cols
+        and not use_grid_index_columns
+        and (use_irregular_tbms_config or cell_size is not None or csv_metadata.get("parent_block_size"))
+    )
+    should_stream_irregular_source_rows = bool(
+        can_stream_irregular_source_rows
+        and counted_source_rows is not None
+        and (
+            estimated_coordinate_bytes > MAX_SOURCE_ROW_PREP_BYTES
+            or estimated_selected_bytes > MAX_SELECTED_CSV_OBJECT_BYTES
+        )
+    )
+
+    if should_stream_irregular_source_rows:
+        chosen_value_cols = header_value_cols
+        if not chosen_value_cols:
+            raise ValueError("No valid value columns were available for streaming source-row BMF export.")
+        normalized_value_exceptions = _normalize_value_exceptions(value_exceptions)
+        _emit_progress(
+            progress_callback,
+            6,
+            100,
+            "Using streaming source-row BMF writer; CSV rows will not be materialized as one table.",
+        )
+        parent_cell_size = cell_size
+        stream_scan = _scan_stream_irregular_export(
+            input_csv=in_csv,
+            delimiter=delimiter,
+            header_line=effective_header_line,
+            selected_read_cols=selected_read_cols,
+            xyz_cols=xyz_cols,
+            value_cols=chosen_value_cols,
+            metadata=csv_metadata,
+            cell_size=parent_cell_size,
+            origin=origin,
+            index_tolerance=index_tolerance,
+            geometry_size_cols=mapped_size_cols,
+            geometry_extent_cols=mapped_extent_cols,
+            column_types=column_types,
+            value_exceptions=normalized_value_exceptions,
+            null_float=null_float,
+            total_rows=counted_source_rows,
+            progress_callback=progress_callback,
+        )
+        prepared_summary = {
+            "df": pd.DataFrame(index=range(0)),
+            "origin": stream_scan["origin"],
+            "cell": stream_scan["cell"],
+            "dims": stream_scan["dims"],
+            "extents": stream_scan["extents"],
+            "duplicates": 0,
+            "max_index_error": 0.0,
+            "is_irregular": True,
+            "irregular_width_source": (
+                "mapped_lower_upper_columns" if mapped_extent_cols and any(mapped_extent_cols.get(role) != role for role in GEOMETRY_EXTENT_COLUMNS)
+                else "lower_upper_columns" if mapped_extent_cols
+                else "dimension_columns" if mapped_size_cols
+                else "centroid_hierarchy_inference"
+            ),
+            "grid_index_source": (
+                "irregular_mapped_lower_upper_columns" if mapped_extent_cols and any(mapped_extent_cols.get(role) != role for role in GEOMETRY_EXTENT_COLUMNS)
+                else "irregular_lower_upper_columns" if mapped_extent_cols
+                else "irregular_dimension_columns" if mapped_size_cols
+                else "irregular_xyz_metadata_parent"
+            ),
+        }
+        if mapped_extent_cols:
+            prepared_summary["geometry_column_mapping"] = {"extent_cols": dict(mapped_extent_cols)}
+        elif mapped_size_cols:
+            prepared_summary["geometry_column_mapping"] = {"size_cols": dict(mapped_size_cols)}
+        block_size_determination = _build_block_size_determination_report(
+            prepared=prepared_summary,
+            metadata_geometry=metadata_geometry,
+            statistical_base_geometry={},
+            user_cell_size_provided=user_cell_size_provided,
+            user_origin_provided=user_origin_provided,
+            use_grid_index_columns=False,
+            regularize_to_base_block=regularize_to_base_block,
+        )
+        block_size_message = (
+            f"Block size determination: {block_size_determination['message']} "
+            f"cell_size={_format_numeric_vector(block_size_determination['cell_size'])}, "
+            f"origin={_format_numeric_vector(block_size_determination['origin'])}."
+        )
+        print(block_size_message)
+        summary = {
+            "input_csv": str(in_csv),
+            "output_bmf": str(out_bmf),
+            "backend": backend,
+            "streaming": True,
+            "csv_header_line": int(effective_header_line),
+            "csv_configured_header_line": int(max(int(header_line or 1), 1)),
+            "csv_metadata": csv_metadata,
+            "csv_metadata_geometry": metadata_geometry,
+            "rows": int(stream_scan["row_count"]),
+            "value_columns": chosen_value_cols,
+            "value_exceptions": normalized_value_exceptions,
+            "csv_statistical_base_block": {},
+            "block_size_determination": block_size_determination,
+            "regularization": {"enabled": False},
+            "grid": {
+                "origin": [float(x) for x in np.asarray(stream_scan["origin"], dtype=float)],
+                "cell_size": [float(x) for x in np.asarray(stream_scan["cell"], dtype=float)],
+                "dimensions": [int(x) for x in np.asarray(stream_scan["dims"], dtype=int)],
+                "extents": [float(x) for x in np.asarray(stream_scan["extents"], dtype=float)],
+                "duplicate_grid_rows": 0,
+                "max_index_error": 0.0,
+                "index_source": str(prepared_summary.get("grid_index_source")),
+                "is_irregular": True,
+                "irregular_width_source": prepared_summary.get("irregular_width_source"),
+                "irregular_hierarchy": None,
+                "irregular_hierarchy_text": "",
+            },
+        }
+        if summary_json:
+            summary_path = Path(summary_json)
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            _emit_progress(progress_callback, 49, 100, "BMF export summary written.")
+        backend_summary = None
+        if not dry_run:
+            backend_summary = _write_streaming_irregular_tbms_config_text(
+                input_csv=in_csv,
+                prepared=stream_scan,
+                xyz_cols=xyz_cols,
+                value_cols=chosen_value_cols,
+                selected_read_cols=selected_read_cols,
+                delimiter=delimiter,
+                header_line=effective_header_line,
+                metadata=csv_metadata,
+                cell_size=parent_cell_size,
+                origin=origin,
+                index_tolerance=index_tolerance,
+                geometry_size_cols=mapped_size_cols,
+                geometry_extent_cols=mapped_extent_cols,
+                value_exceptions=normalized_value_exceptions,
+                out_bmf=out_bmf,
+                null_float=null_float,
+                progress_callback=progress_callback,
+                progress_start=50,
+                progress_end=98,
+                total_rows=counted_source_rows,
+            )
+        else:
+            _emit_progress(progress_callback, 98, 100, "Dry-run streaming BMF export validation complete.")
+        _emit_progress(progress_callback, 100, 100, "BMF export complete.")
+        return {"summary": summary, "backend_summary": backend_summary, "dry_run": bool(dry_run)}
+
     _validate_selected_csv_read_size(
         in_csv,
         effective_header_line,
         selected_read_cols,
-        "tbms-experimental" if use_irregular_tbms_config else backend,
+        backend,
         regularize_to_base_block,
-        progress_callback=progress_callback,
+        source_row_mode=source_row_mode,
+        progress_callback=None if counted_source_rows is not None else progress_callback,
     )
     _emit_progress(progress_callback, 5, 100, f"Reading CSV {selected_message}...")
     df = _auto_read_csv(

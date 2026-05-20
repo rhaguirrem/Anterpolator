@@ -8419,9 +8419,9 @@ if __name__ == "__main__":
                 spin.setValue(0.0)
                 spin.setSpecialValueText('Auto')
             self.bmf_export_regularize_base_blocks = QtWidgets.QCheckBox('Regularize to base block size')
-            self.bmf_export_regularize_base_blocks.setChecked(True)
+            self.bmf_export_regularize_base_blocks.setChecked(False)
             self.bmf_export_regularize_warning = QtWidgets.QLabel(
-                'Warning: if unchecked, sub-blocked CSVs may fail with grid alignment errors or oversized dense-grid memory errors.'
+                'Info: unchecked preserves the source CSV block rows; checked aggregates rows to base blocks and may create a dense regular grid.'
             )
             self.bmf_export_regularize_warning.setWordWrap(True)
             self.bmf_export_regularize_warning.setStyleSheet('color: #b36b00;')
@@ -9957,7 +9957,15 @@ if __name__ == "__main__":
         def _update_bmf_export_regularize_warning(self):
             if not hasattr(self, 'bmf_export_regularize_warning') or not hasattr(self, 'bmf_export_regularize_base_blocks'):
                 return
-            self.bmf_export_regularize_warning.setVisible(not self.bmf_export_regularize_base_blocks.isChecked())
+            if self.bmf_export_regularize_base_blocks.isChecked():
+                self.bmf_export_regularize_warning.setText(
+                    'Warning: regularization aggregates source CSV rows to base blocks and may create a dense regular grid.'
+                )
+            else:
+                self.bmf_export_regularize_warning.setText(
+                    'Info: tbms-config-text preserves source CSV rows as BMF rows instead of regularizing to a dense grid.'
+                )
+            self.bmf_export_regularize_warning.setVisible(True)
 
         def _get_selected_bmf_export_value_columns(self):
             if not hasattr(self, 'bmf_export_value_cols'):
@@ -11036,7 +11044,7 @@ if __name__ == "__main__":
                         'Column type overrides must refer only to selected value columns. '
                         f'Unknown or unselected columns: {unknown_typed_columns}'
                     )
-                regularize_to_base_block = bool(cfg.get('bmf_export_regularize_to_base_block', True))
+                regularize_to_base_block = bool(cfg.get('bmf_export_regularize_to_base_block', False))
                 bmf_cell_size = cfg.get('bmf_export_cell_size')
                 if regularize_to_base_block and not bmf_cell_size:
                     block_size = cfg.get('block_size')

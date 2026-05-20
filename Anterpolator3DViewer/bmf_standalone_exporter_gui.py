@@ -256,9 +256,9 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         self.cell_y_spin = self._make_cell_size_spin()
         self.cell_z_spin = self._make_cell_size_spin()
         self.regularize_base_blocks_check = QtWidgets.QCheckBox("Regularize to base block size")
-        self.regularize_base_blocks_check.setChecked(True)
+        self.regularize_base_blocks_check.setChecked(False)
         self.regularize_warning_label = QtWidgets.QLabel(
-            "Warning: if unchecked, sub-blocked CSVs may fail with grid alignment errors or oversized dense-grid memory errors."
+            "Info: unchecked preserves the source CSV block rows; checked aggregates rows to base blocks and may create a dense regular grid."
         )
         self.regularize_warning_label.setWordWrap(True)
         self.regularize_warning_label.setStyleSheet("color: #b36b00;")
@@ -332,7 +332,7 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         cell_layout.addWidget(self.cell_x_spin)
         cell_layout.addWidget(self.cell_y_spin)
         cell_layout.addWidget(self.cell_z_spin)
-        export_options_form.addRow("Cell Size X / Y / Z", self._layout_widget(cell_layout))
+        csv_format_form.addRow("Cell Size X / Y / Z", self._layout_widget(cell_layout))
         regularize_layout = QtWidgets.QVBoxLayout()
         regularize_layout.addWidget(self.regularize_base_blocks_check)
         regularize_layout.addWidget(self.regularize_warning_label)
@@ -729,10 +729,19 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
             self.regularize_warning_label.setVisible(True)
             return
 
-        self.regularize_warning_label.setText(
-            "Warning: if unchecked, sub-blocked CSVs may fail with grid alignment errors or oversized dense-grid memory errors."
-        )
-        self.regularize_warning_label.setVisible(not self.regularize_base_blocks_check.isChecked())
+        if self.regularize_base_blocks_check.isChecked():
+            self.regularize_warning_label.setText(
+                "Warning: regularization aggregates source CSV rows to base blocks and may create a dense regular grid."
+            )
+        elif backend == "tbms-config-text":
+            self.regularize_warning_label.setText(
+                "Info: tbms-config-text will preserve source CSV rows as BMF rows instead of regularizing to a dense grid."
+            )
+        else:
+            self.regularize_warning_label.setText(
+                "Info: unchecked preserves source CSV rows when the selected backend supports row-indexed or irregular output."
+            )
+        self.regularize_warning_label.setVisible(True)
 
     def _refresh_export_columns(self) -> None:
         path = self.export_input_edit.text().strip()

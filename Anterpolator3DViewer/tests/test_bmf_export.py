@@ -96,6 +96,84 @@ def run_dense_guard_backend_selection():
             bmf_exporter.MAX_DENSE_EXPORT_BYTES = original_limit
 
 
+def run_source_row_selected_columns_stream_when_wide():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = os.path.join(tmpdir, "wide_source_rows.csv")
+        bmf_path = os.path.join(tmpdir, "wide_source_rows.bmf")
+
+        with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Parent block size: 10, 10, 10\n")
+            handle.write("# Size in parent blocks: 10, 1, 1\n")
+            handle.write("# Minimum corner: 0, 0, 0\n")
+            handle.write("# Sub-blocks: octree 2, 2, 2\n")
+            handle.write("x,y,z,v1,v2,v3,v4\n")
+            for index in range(10):
+                handle.write(f"{index + 0.5},0.5,0.5,{index},{index + 1},{index + 2},{index + 3}\n")
+
+        original_limit = bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES
+        bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = 64
+        try:
+            result = export_bmf(
+                csv_path,
+                bmf_path,
+                backend="tbms-config-text",
+                header_line=1,
+                value_cols=["v1", "v2", "v3", "v4"],
+                regularize_to_base_block=False,
+            )
+            assert result["summary"]["streaming"] is True
+            assert result["backend_summary"]["streaming"] is True
+            assert result["backend_summary"]["row_count"] == 10
+
+            loaded = load_bmf_table(bmf_path)
+            rows = loaded["dataframe"]
+            assert loaded["row_count"] == 10
+            assert list(rows["v1"]) == list(range(10))
+            assert list(rows["v4"]) == [index + 3 for index in range(10)]
+        finally:
+            bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = original_limit
+
+
+def run_source_row_coordinate_prep_stream_when_large():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = os.path.join(tmpdir, "source_row_coordinates.csv")
+        bmf_path = os.path.join(tmpdir, "source_row_coordinates.bmf")
+
+        with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Parent block size: 10, 10, 10\n")
+            handle.write("# Size in parent blocks: 10, 1, 1\n")
+            handle.write("# Minimum corner: 0, 0, 0\n")
+            handle.write("# Sub-blocks: octree 2, 2, 2\n")
+            handle.write("x,y,z,grade\n")
+            for index in range(10):
+                handle.write(f"{index + 0.5},0.5,0.5,{index}\n")
+
+        original_selected_limit = bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES
+        original_prep_limit = bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES
+        bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = 1024 * 1024
+        bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = 64
+        try:
+            result = export_bmf(
+                csv_path,
+                bmf_path,
+                backend="tbms-config-text",
+                header_line=1,
+                value_cols=["grade"],
+                regularize_to_base_block=False,
+            )
+            assert result["summary"]["streaming"] is True
+            assert result["backend_summary"]["streaming"] is True
+            assert result["backend_summary"]["row_count"] == 10
+
+            loaded = load_bmf_table(bmf_path)
+            rows = loaded["dataframe"]
+            assert loaded["row_count"] == 10
+            assert list(rows["grade"]) == list(range(10))
+        finally:
+            bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = original_selected_limit
+            bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = original_prep_limit
+
+
 def run_coarse_cell_size_alignment_diagnostic():
     with tempfile.TemporaryDirectory() as tmpdir:
         csv_path = os.path.join(tmpdir, "subblocks.csv")
@@ -685,6 +763,8 @@ def run_tbms_config_text_manual_parent_still_infers_row_extents():
 if __name__ == "__main__":
     run_tbms_config_text_round_trip()
     run_dense_guard_backend_selection()
+    run_source_row_selected_columns_stream_when_wide()
+    run_source_row_coordinate_prep_stream_when_large()
     run_coarse_cell_size_alignment_diagnostic()
     run_regularize_to_base_cell_export()
     run_regularize_ignores_value_exception_replacements()
