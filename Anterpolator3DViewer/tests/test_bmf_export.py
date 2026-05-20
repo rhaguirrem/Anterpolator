@@ -277,6 +277,100 @@ def run_streaming_forced_numeric_uses_value_exceptions_and_decimal_cleanup():
             bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = original_prep_limit
 
 
+def run_streaming_forced_numeric_reports_multiple_invalid_tokens_once():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = os.path.join(tmpdir, "numeric_invalid_tokens.csv")
+        bmf_path = os.path.join(tmpdir, "numeric_invalid_tokens.bmf")
+
+        with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Parent block size: 10, 10, 10\n")
+            handle.write("# Size in parent blocks: 5, 1, 1\n")
+            handle.write("# Minimum corner: 0, 0, 0\n")
+            handle.write("# Sub-blocks: octree 2, 2, 2\n")
+            handle.write("x,y,z,RQD_srk\n")
+            handle.write("0.5,0.5,0.5,12.5\n")
+            handle.write("1.5,0.5,0.5,not_logged\n")
+            handle.write("2.5,0.5,0.5,trace\n")
+            handle.write("3.5,0.5,0.5,below_detection\n")
+            handle.write("4.5,0.5,0.5,13.75\n")
+
+        original_selected_limit = bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES
+        original_prep_limit = bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES
+        bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = 64
+        bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = 64
+        try:
+            try:
+                export_bmf(
+                    csv_path,
+                    bmf_path,
+                    backend="tbms-config-text",
+                    header_line=1,
+                    value_cols=["RQD_srk"],
+                    column_types={"RQD_srk": "double"},
+                    regularize_to_base_block=False,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                assert "RQD_srk" in message
+                assert "cannot be exported as double" in message
+                assert "not_logged" in message
+                assert "trace" in message
+                assert "below_detection" in message
+            else:
+                raise AssertionError("Expected forced numeric streaming export to report invalid tokens")
+        finally:
+            bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = original_selected_limit
+            bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = original_prep_limit
+
+
+def run_streaming_forced_numeric_reports_all_invalid_columns_once():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = os.path.join(tmpdir, "numeric_invalid_columns.csv")
+        bmf_path = os.path.join(tmpdir, "numeric_invalid_columns.bmf")
+
+        with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Parent block size: 10, 10, 10\n")
+            handle.write("# Size in parent blocks: 5, 1, 1\n")
+            handle.write("# Minimum corner: 0, 0, 0\n")
+            handle.write("# Sub-blocks: octree 2, 2, 2\n")
+            handle.write("x,y,z,RQD_srk,grade\n")
+            handle.write("0.5,0.5,0.5,12.5,0.2\n")
+            handle.write("1.5,0.5,0.5,not_logged,missing\n")
+            handle.write("2.5,0.5,0.5,trace,0.4\n")
+            handle.write("3.5,0.5,0.5,13.0,below_detection\n")
+            handle.write("4.5,0.5,0.5,14.0,0.6\n")
+
+        original_selected_limit = bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES
+        original_prep_limit = bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES
+        bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = 64
+        bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = 64
+        try:
+            try:
+                export_bmf(
+                    csv_path,
+                    bmf_path,
+                    backend="tbms-config-text",
+                    header_line=1,
+                    value_cols=["RQD_srk", "grade"],
+                    column_types={"RQD_srk": "double", "grade": "double"},
+                    regularize_to_base_block=False,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                assert bmf_exporter.BMF_NUMERIC_TYPE_ERRORS_MARKER in message
+                assert "RQD_srk" in message
+                assert "grade" in message
+                assert "not_logged" in message
+                assert "trace" in message
+                assert "missing" in message
+                assert "below_detection" in message
+            else:
+                raise AssertionError("Expected forced numeric streaming export to report all invalid columns")
+        finally:
+            bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = original_selected_limit
+            bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = original_prep_limit
+
+
 def run_coarse_cell_size_alignment_diagnostic():
     with tempfile.TemporaryDirectory() as tmpdir:
         csv_path = os.path.join(tmpdir, "subblocks.csv")
@@ -871,6 +965,8 @@ if __name__ == "__main__":
     run_streaming_auto_high_cardinality_message_points_to_numeric_type()
     run_preview_type_inference_matches_app_numeric_cleanup()
     run_streaming_forced_numeric_uses_value_exceptions_and_decimal_cleanup()
+    run_streaming_forced_numeric_reports_multiple_invalid_tokens_once()
+    run_streaming_forced_numeric_reports_all_invalid_columns_once()
     run_coarse_cell_size_alignment_diagnostic()
     run_regularize_to_base_cell_export()
     run_regularize_ignores_value_exception_replacements()

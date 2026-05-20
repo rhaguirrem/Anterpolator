@@ -1194,26 +1194,57 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
                 excluded.update(extent_columns)
         return excluded
 
-    def _parse_numeric_type_error(self, error_text: str) -> dict[str, object] | None:
-        match = re.search(
+    def _parse_numeric_type_errors(self, error_text: str) -> list[dict[str, object]]:
+        text = str(error_text or "")
+        marker = getattr(bmf_tools, "BMF_NUMERIC_TYPE_ERRORS_MARKER", "BMF_NUMERIC_TYPE_ERRORS_JSON:")
+        if marker in text:
+            payload_text = text.split(marker, 1)[1].strip().splitlines()[0]
+            try:
+                payload = json.loads(payload_text)
+            except Exception:
+                payload = []
+            parsed = []
+            if isinstance(payload, list):
+                for entry in payload:
+                    if not isinstance(entry, dict):
+                        continue
+                    values = entry.get("values") if isinstance(entry.get("values"), list) else []
+                    if not values:
+                        continue
+                    parsed.append({
+                        "column": str(entry.get("column") or "").strip(),
+                        "field_type": str(entry.get("field_type") or "double").lower(),
+                        "value": str(values[0]),
+                        "values": [str(value) for value in values],
+                    })
+            if parsed:
+                return parsed
+
+        parsed = []
+        pattern = re.compile(
             r"Column (?P<column>.+?) cannot be exported as (?P<field_type>int|double).*?Invalid values include: (?P<values>\[[^\]]*\])",
-            str(error_text or ""),
-            flags=re.IGNORECASE | re.DOTALL,
+            flags=re.IGNORECASE,
         )
-        if not match:
-            return None
-        try:
-            values = ast.literal_eval(match.group("values"))
-        except Exception:
-            values = []
-        if not values:
-            return None
-        return {
-            "column": str(match.group("column")).strip().strip("'\""),
-            "field_type": match.group("field_type").lower(),
-            "value": str(values[0]),
-            "values": [str(value) for value in values],
-        }
+        for line in text.splitlines():
+            match = pattern.search(line)
+            if not match:
+                continue
+            try:
+                values = ast.literal_eval(match.group("values"))
+            except Exception:
+                values = []
+            if values:
+                parsed.append({
+                    "column": str(match.group("column")).strip().strip("'\""),
+                    "field_type": match.group("field_type").lower(),
+                    "value": str(values[0]),
+                    "values": [str(value) for value in values],
+                })
+        return parsed
+
+    def _parse_numeric_type_error(self, error_text: str) -> dict[str, object] | None:
+        parsed = self._parse_numeric_type_errors(error_text)
+        return parsed[0] if parsed else None
 
     def _prompt_value_exception(self, column_name: str, bad_value: str, field_type: str = "double") -> str | None:
         dialog = QtWidgets.QDialog(self)
@@ -1251,6 +1282,135 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Invalid Replacement", "Replacement must be numeric or blank.")
             return self._prompt_value_exception(column_name, bad_value, field_type=field_type)
         return replacement
+
+    def _prompt_value_exceptions(self, column_name: str, bad_values: list[str], field_type: str = "double") -> dict[str, str] | None:
+        values = []
+        seen = set()
+        for value in bad_values:
+            text = str(value)
+            if text not in seen:
+                seen.add(text)
+                values.append(text)
+        if not values:
+            return None
+        if len(values) == 1:
+            replacement = self._prompt_value_exception(column_name, values[0], field_type=field_type)
+            return None if replacement is None else {values[0]: replacement}
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("BMF Value Exceptions")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        label = QtWidgets.QLabel(
+            f"Column '{column_name}' is being exported as {field_type}, but {len(values)} distinct values are not numeric. "
+            "Enter a numeric replacement for each value, or leave replacement blank to export null/default."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        table = QtWidgets.QTableWidget(len(values), 2)
+        table.setHorizontalHeaderLabels(["CSV Value", "Replacement"])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+        table.setMinimumSize(520, min(360, 90 + 28 * len(values)))
+        for row, value in enumerate(values):
+            value_item = QtWidgets.QTableWidgetItem(value)
+            value_item.setFlags(value_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 0, value_item)
+            table.setItem(row, 1, QtWidgets.QTableWidgetItem(""))
+        layout.addWidget(table)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+
+        replacements = {}
+        for row, value in enumerate(values):
+            item = table.item(row, 1)
+            replacement = "" if item is None else item.text().strip()
+            if replacement:
+                try:
+                    float(replacement)
+                except ValueError:
+                    QtWidgets.QMessageBox.warning(self, "Invalid Replacement", "Replacements must be numeric or blank.")
+                    return self._prompt_value_exceptions(column_name, values, field_type=field_type)
+            replacements[value] = replacement
+        return replacements
+
+    def _prompt_value_exceptions_for_columns(self, invalid_columns: list[dict[str, object]]) -> list[dict[str, str]] | None:
+        rows = []
+        seen = set()
+        for entry in invalid_columns:
+            column = str(entry.get("column") or "").strip()
+            field_type = str(entry.get("field_type") or "double").strip() or "double"
+            values = entry.get("values") if isinstance(entry.get("values"), list) else []
+            if not column:
+                continue
+            for value in values:
+                text = str(value)
+                key = (column, text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"column": column, "field_type": field_type, "value": text})
+        if not rows:
+            return None
+        if len(rows) == 1:
+            only = rows[0]
+            replacement = self._prompt_value_exception(only["column"], only["value"], field_type=only["field_type"])
+            if replacement is None:
+                return None
+            return [{**only, "replacement": replacement}]
+
+        column_count = len({row["column"] for row in rows})
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("BMF Value Exceptions")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        label = QtWidgets.QLabel(
+            f"{len(rows)} distinct CSV values across {column_count} numeric column(s) are not numeric. "
+            "Enter numeric replacements, or leave replacement blank to export null/default."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        table = QtWidgets.QTableWidget(len(rows), 3)
+        table.setHorizontalHeaderLabels(["Column", "CSV Value", "Replacement"])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+        table.setMinimumSize(720, min(480, 100 + 28 * len(rows)))
+        for row_index, row in enumerate(rows):
+            column_item = QtWidgets.QTableWidgetItem(row["column"])
+            column_item.setFlags(column_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            value_item = QtWidgets.QTableWidgetItem(row["value"])
+            value_item.setFlags(value_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row_index, 0, column_item)
+            table.setItem(row_index, 1, value_item)
+            table.setItem(row_index, 2, QtWidgets.QTableWidgetItem(""))
+        table.resizeColumnToContents(0)
+        table.resizeColumnToContents(1)
+        layout.addWidget(table)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+
+        replacements = []
+        for row_index, row in enumerate(rows):
+            item = table.item(row_index, 2)
+            replacement = "" if item is None else item.text().strip()
+            if replacement:
+                try:
+                    float(replacement)
+                except ValueError:
+                    QtWidgets.QMessageBox.warning(self, "Invalid Replacement", "Replacements must be numeric or blank.")
+                    return self._prompt_value_exceptions_for_columns(invalid_columns)
+            replacements.append({**row, "replacement": replacement})
+        return replacements
 
     def _run_export(self) -> None:
         if self._bmf_export_thread is not None:
@@ -1344,17 +1504,15 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
             thread.quit()
 
         def handle_failed(message: str) -> None:
-            parsed = self._parse_numeric_type_error(message)
-            if parsed:
-                replacement = self._prompt_value_exception(
-                    str(parsed["column"]),
-                    str(parsed["value"]),
-                    field_type=str(parsed.get("field_type") or "double"),
-                )
-                if replacement is not None:
-                    self._add_exception_row(str(parsed["column"]), str(parsed["value"]), replacement)
+            parsed_columns = self._parse_numeric_type_errors(message)
+            if parsed_columns:
+                replacements = self._prompt_value_exceptions_for_columns(parsed_columns)
+                if replacements is not None:
+                    for row in replacements:
+                        self._add_exception_row(row["column"], row["value"], row["replacement"])
                     self.export_result_text.appendPlainText(
-                        f"\nAdded value exception for {parsed['column']!r}={parsed['value']!r}; retrying export..."
+                        f"\nAdded {len(replacements)} value exception rule(s) across "
+                        f"{len({row['column'] for row in replacements})} column(s); retrying export..."
                     )
                     thread.finished.connect(lambda: QtCore.QTimer.singleShot(0, self._run_export))
                     thread.quit()

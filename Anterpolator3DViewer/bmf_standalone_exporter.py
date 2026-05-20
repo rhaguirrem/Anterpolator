@@ -46,6 +46,8 @@ _LOGGED_LEAPFROG_METADATA_SIGNATURES: set[tuple[str, str, tuple[str, ...]]] = se
 GRID_INDEX_COLUMNS = ("grid_i", "grid_j", "grid_k")
 GEOMETRY_EXTENT_COLUMNS = ("__lower_x", "__upper_x", "__lower_y", "__upper_y", "__lower_z", "__upper_z")
 GEOMETRY_SIZE_COLUMN_ROLES = ("dx", "dy", "dz")
+MAX_REPORTED_VALUE_EXCEPTION_TOKENS = 100
+BMF_NUMERIC_TYPE_ERRORS_MARKER = "BMF_NUMERIC_TYPE_ERRORS_JSON:"
 
 
 def _normalize_column_token(value: object) -> str:
@@ -2256,7 +2258,7 @@ def _tbms_encode_export_field(
 
     def invalid_numeric_values(values: pd.Series, numeric_values: pd.Series) -> List[str]:
         invalid_mask = ~missing_or_blank_mask(values) & numeric_values.isna()
-        return sorted(pd.unique(values.loc[invalid_mask].astype(str)))[:5]
+        return list(pd.unique(values.loc[invalid_mask].astype(str)))[:MAX_REPORTED_VALUE_EXCEPTION_TOKENS]
 
     if normalized_forced_type == "boolean":
         boolean_series = series.fillna(False)
@@ -2289,7 +2291,7 @@ def _tbms_encode_export_field(
             invalid_values = invalid_numeric_values(series, numeric)
             raise ValueError(
                 f"Column {series.name!r} cannot be exported as int because it contains non-numeric values. "
-                f"Invalid values include: {invalid_values}"
+                f"{_format_invalid_values_message(invalid_values, len(invalid_values) >= MAX_REPORTED_VALUE_EXCEPTION_TOKENS)}"
             )
         finite = numeric.dropna().to_numpy(dtype=float)
         if finite.size > 0 and not np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0):
@@ -2311,7 +2313,7 @@ def _tbms_encode_export_field(
             invalid_values = invalid_numeric_values(series, numeric)
             raise ValueError(
                 f"Column {series.name!r} cannot be exported as double because it contains non-numeric values. "
-                f"Invalid values include: {invalid_values}"
+                f"{_format_invalid_values_message(invalid_values, len(invalid_values) >= MAX_REPORTED_VALUE_EXCEPTION_TOKENS)}"
             )
         converted = numeric.fillna(float(null_float)).astype(np.float64)
         return {
@@ -2531,14 +2533,60 @@ def _new_stream_field_state(name: str, forced_type: str | None) -> dict[str, obj
 
 def _remember_stream_invalid_values(state: dict[str, object], values: pd.Series) -> None:
     invalid_values = state.setdefault("invalid_values", [])
-    if not isinstance(invalid_values, list) or len(invalid_values) >= 5:
+    if not isinstance(invalid_values, list) or len(invalid_values) >= MAX_REPORTED_VALUE_EXCEPTION_TOKENS:
+        if isinstance(invalid_values, list):
+            state["invalid_values_truncated"] = True
         return
     for value in pd.unique(values.astype(str)):
-        if len(invalid_values) >= 5:
+        if len(invalid_values) >= MAX_REPORTED_VALUE_EXCEPTION_TOKENS:
+            state["invalid_values_truncated"] = True
             break
         text = str(value)
         if text not in invalid_values:
             invalid_values.append(text)
+
+
+def _format_invalid_values_message(invalid_values: Sequence[object], truncated: bool = False) -> str:
+    values = [str(value) for value in invalid_values]
+    message = f"Invalid values include: {values}"
+    if truncated:
+        message += f" (showing first {MAX_REPORTED_VALUE_EXCEPTION_TOKENS} distinct invalid values)"
+    return message
+
+
+def _collect_stream_numeric_type_errors(field_states: Mapping[str, Mapping[str, object]]) -> list[dict[str, object]]:
+    errors: list[dict[str, object]] = []
+    for name, state in field_states.items():
+        forced_type = str(state.get("forced_type") or "")
+        if forced_type not in {"int", "double"}:
+            continue
+        if bool(state.get("numeric_compatible", True)):
+            continue
+        invalid_values = state.get("invalid_values") if isinstance(state.get("invalid_values"), list) else []
+        errors.append({
+            "column": str(name),
+            "field_type": forced_type,
+            "values": [str(value) for value in invalid_values],
+            "truncated": bool(state.get("invalid_values_truncated", False)),
+        })
+    return errors
+
+
+def _raise_stream_numeric_type_errors(errors: Sequence[Mapping[str, object]]) -> None:
+    lines = [
+        "Forced numeric columns contain non-numeric CSV values. Add Value Exceptions for these tokens and retry."
+    ]
+    for entry in errors:
+        column = str(entry.get("column") or "")
+        field_type = str(entry.get("field_type") or "double")
+        values = entry.get("values") if isinstance(entry.get("values"), list) else []
+        truncated = bool(entry.get("truncated", False))
+        lines.append(
+            f"Column {column!r} cannot be exported as {field_type} because it contains non-numeric values. "
+            f"{_format_invalid_values_message(values, truncated)}"
+        )
+    lines.append(f"{BMF_NUMERIC_TYPE_ERRORS_MARKER} {json.dumps(list(errors), ensure_ascii=False)}")
+    raise ValueError("\n".join(lines))
 
 
 def _namedshort_cardinality_error_message(
@@ -2599,12 +2647,16 @@ def _finalize_stream_field_state(state: dict[str, object], null_float: float) ->
     forced_type = state.get("forced_type")
     numeric_compatible = bool(state.get("numeric_compatible"))
     invalid_values = state.get("invalid_values") if isinstance(state.get("invalid_values"), list) else []
+    invalid_values_truncated = bool(state.get("invalid_values_truncated", False))
 
     if forced_type == "boolean":
         return {"field_type": "boolean", "default": 0, "dtype": np.dtype("u1")}
     if forced_type == "int":
         if not numeric_compatible:
-            raise ValueError(f"Column {name!r} cannot be exported as int because it contains non-numeric values. Invalid values include: {invalid_values}")
+            raise ValueError(
+                f"Column {name!r} cannot be exported as int because it contains non-numeric values. "
+                f"{_format_invalid_values_message(invalid_values, invalid_values_truncated)}"
+            )
         if not bool(state.get("integer_like", True)):
             raise ValueError(f"Column {name!r} cannot be exported as int because it contains non-integer numeric values.")
         min_value = int(float(state.get("min") or 0))
@@ -2614,7 +2666,10 @@ def _finalize_stream_field_state(state: dict[str, object], null_float: float) ->
         return {"field_type": "int", "default": int(null_float), "dtype": np.dtype("<i4")}
     if forced_type == "double":
         if not numeric_compatible:
-            raise ValueError(f"Column {name!r} cannot be exported as double because it contains non-numeric values. Invalid values include: {invalid_values}")
+            raise ValueError(
+                f"Column {name!r} cannot be exported as double because it contains non-numeric values. "
+                f"{_format_invalid_values_message(invalid_values, invalid_values_truncated)}"
+            )
         return {"field_type": "double", "default": float(null_float), "dtype": np.dtype("<f8")}
     if forced_type == "string":
         if state.get("too_many_labels"):
@@ -2850,6 +2905,9 @@ def _scan_stream_irregular_export(
         dims = np.maximum(span_dims, max_parent_idx + 1)
     dims = np.maximum(dims.astype(np.int64), 1)
     extents = np.maximum(max_upper - origin_arr, dims.astype(float) * parent_size_arr)
+    numeric_type_errors = _collect_stream_numeric_type_errors(field_states)
+    if numeric_type_errors:
+        _raise_stream_numeric_type_errors(numeric_type_errors)
     field_infos = {
         name: _finalize_stream_field_state(state, null_float)
         for name, state in field_states.items()
