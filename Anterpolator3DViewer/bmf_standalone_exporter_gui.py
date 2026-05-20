@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import ast
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,13 +46,6 @@ def _metadata_frame(result: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["key", "value"])
 
 
-def _coerce_numeric_series(series: pd.Series, delimiter: str | None = None) -> pd.Series:
-    text_series = series.astype(str).str.strip()
-    if delimiter == ";":
-        text_series = text_series.str.replace(",", ".", regex=False)
-    return pd.to_numeric(text_series, errors="coerce")
-
-
 def _normalize_bmf_field_type(field_type: object) -> str:
     normalized = str(field_type or "").strip().lower()
     aliases = {
@@ -73,30 +68,7 @@ def _normalize_bmf_field_type(field_type: object) -> str:
 
 
 def _infer_bmf_field_types_from_preview(frame: pd.DataFrame, candidate_columns: list[str], delimiter: str | None = None) -> dict[str, str]:
-    inferred = {}
-    truthy = {"1", "true", "t", "yes", "y"}
-    falsy = {"0", "false", "f", "no", "n", ""}
-    for column_name in candidate_columns:
-        if column_name not in frame.columns:
-            continue
-        series = frame[column_name]
-        non_null = series.dropna()
-        if len(non_null) == 0:
-            inferred[column_name] = ""
-            continue
-        normalized_text = non_null.astype(str).str.strip().str.lower()
-        normalized_text = normalized_text[normalized_text != ""]
-        if len(normalized_text) > 0 and normalized_text.isin(truthy | falsy).all():
-            inferred[column_name] = "boolean"
-            continue
-        numeric_series = _coerce_numeric_series(series, delimiter=delimiter)
-        blank_mask = series.isna() | (series.astype(str).str.strip() == "")
-        if bool((numeric_series.notna() | blank_mask).all()):
-            finite = numeric_series.dropna().to_numpy(dtype=float)
-            inferred[column_name] = "int" if finite.size and (abs(finite - finite.round()) < 1e-9).all() else "double"
-            continue
-        inferred[column_name] = "string"
-    return inferred
+    return bmf_tools.infer_bmf_export_field_types_from_preview(frame, candidate_columns, delimiter=delimiter)
 
 
 class TrimmedDisplayDoubleSpinBox(QtWidgets.QDoubleSpinBox):
@@ -227,23 +199,22 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
     def _build_export_tab(self) -> None:
         layout = QtWidgets.QVBoxLayout(self.export_tab)
 
-        paths_group = QtWidgets.QGroupBox("Paths")
-        paths_form = QtWidgets.QFormLayout(paths_group)
+        csv2bmf_tabs = QtWidgets.QTabWidget()
+        paths_tab = QtWidgets.QWidget()
+        csv_format_tab = QtWidgets.QWidget()
+        export_options_tab = QtWidgets.QWidget()
+        paths_form = QtWidgets.QFormLayout(paths_tab)
+        csv_format_form = QtWidgets.QFormLayout(csv_format_tab)
+        export_options_form = QtWidgets.QFormLayout(export_options_tab)
+        csv2bmf_tabs.addTab(paths_tab, "Paths")
+        csv2bmf_tabs.addTab(csv_format_tab, "CSV Format")
+        csv2bmf_tabs.addTab(export_options_tab, "Export Options")
         self.export_input_edit = QtWidgets.QLineEdit()
         self.export_output_edit = QtWidgets.QLineEdit()
         self.export_summary_edit = QtWidgets.QLineEdit()
         paths_form.addRow("Input CSV", self._path_row(self.export_input_edit, self._browse_input_csv))
         paths_form.addRow("Output BMF", self._path_row(self.export_output_edit, self._browse_output_bmf))
         paths_form.addRow("Summary JSON", self._path_row(self.export_summary_edit, self._browse_summary_json))
-        layout.addWidget(paths_group)
-
-        csv2bmf_tabs = QtWidgets.QTabWidget()
-        csv_format_tab = QtWidgets.QWidget()
-        export_options_tab = QtWidgets.QWidget()
-        csv_format_form = QtWidgets.QFormLayout(csv_format_tab)
-        export_options_form = QtWidgets.QFormLayout(export_options_tab)
-        csv2bmf_tabs.addTab(csv_format_tab, "CSV Format")
-        csv2bmf_tabs.addTab(export_options_tab, "Export Options")
         self.delimiter_combo = QtWidgets.QComboBox()
         self.delimiter_combo.addItems([",", ";", "\t", "|"])
         self.header_line_spin = QtWidgets.QSpinBox()
@@ -297,7 +268,8 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         self.value_cols_table.setHorizontalHeaderLabels(["Field", "Type"])
         self.value_cols_table.verticalHeader().setVisible(False)
         self.value_cols_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-        self.value_cols_table.setMinimumHeight(160)
+        self.value_cols_table.setMinimumHeight(280)
+        self.value_cols_table.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.value_cols_table.horizontalHeader().setStretchLastSection(False)
         self.value_cols_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.value_cols_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
@@ -333,9 +305,9 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         cell_layout.addWidget(self.cell_y_spin)
         cell_layout.addWidget(self.cell_z_spin)
         csv_format_form.addRow("Cell Size X / Y / Z", self._layout_widget(cell_layout))
-        regularize_layout = QtWidgets.QVBoxLayout()
+        regularize_layout = QtWidgets.QHBoxLayout()
         regularize_layout.addWidget(self.regularize_base_blocks_check)
-        regularize_layout.addWidget(self.regularize_warning_label)
+        regularize_layout.addWidget(self.regularize_warning_label, stretch=1)
         export_options_form.addRow("", self._layout_widget(regularize_layout))
         coords_layout = QtWidgets.QHBoxLayout()
         coords_layout.addWidget(self.x_col_combo)
@@ -413,6 +385,12 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         self._update_geometry_mode_controls()
 
         action_row = QtWidgets.QHBoxLayout()
+        self.load_config_button = QtWidgets.QPushButton("Load Config")
+        self.load_config_button.clicked.connect(self._load_config)
+        self.save_config_button = QtWidgets.QPushButton("Save Config")
+        self.save_config_button.clicked.connect(self._save_config)
+        action_row.addWidget(self.load_config_button)
+        action_row.addWidget(self.save_config_button)
         action_row.addStretch(1)
         self.export_button = QtWidgets.QPushButton("Run Export")
         self.export_button.clicked.connect(self._run_export)
@@ -495,6 +473,225 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         button.clicked.connect(callback)
         row.addWidget(button)
         return self._layout_widget(row)
+
+    def _combo_value(self, combo: QtWidgets.QComboBox) -> str:
+        data = combo.currentData()
+        if data is not None:
+            return str(data)
+        return str(combo.currentText() or "")
+
+    def _set_combo_value(self, combo: QtWidgets.QComboBox, value: object) -> None:
+        text = str(value or "")
+        index = combo.findData(text)
+        if index < 0:
+            index = combo.findText(text)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        elif combo.isEditable():
+            combo.setCurrentText(text)
+
+    def _value_column_rows_config(self) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for row_index in range(self.value_cols_table.rowCount()):
+            item = self.value_cols_table.item(row_index, 0)
+            combo = self.value_cols_table.cellWidget(row_index, 1)
+            if item is None or combo is None:
+                continue
+            rows.append(
+                {
+                    "field": item.text(),
+                    "selected": item.checkState() == QtCore.Qt.Checked,
+                    "type": _normalize_bmf_field_type(combo.currentData() or combo.currentText()),
+                    "explicit_type": bool(combo.property("bmf_type_is_explicit")),
+                }
+            )
+        return rows
+
+    def _config_dict(self) -> dict[str, object]:
+        return {
+            "config_type": "anterpolator_bmf_standalone_exporter",
+            "version": 1,
+            "csv2bmf": {
+                "input_csv": self.export_input_edit.text().strip(),
+                "output_bmf": self.export_output_edit.text().strip(),
+                "summary_json": self.export_summary_edit.text().strip(),
+                "delimiter": self.delimiter_combo.currentText(),
+                "header_line": int(self.header_line_spin.value()),
+                "backend": self.backend_combo.currentText(),
+                "cell_size": [float(self.cell_x_spin.value()), float(self.cell_y_spin.value()), float(self.cell_z_spin.value())],
+                "regularize_to_base_block": self.regularize_base_blocks_check.isChecked(),
+                "x_col": self.x_col_combo.currentText().strip(),
+                "y_col": self.y_col_combo.currentText().strip(),
+                "z_col": self.z_col_combo.currentText().strip(),
+                "geometry_mode": self._geometry_mode(),
+                "size_cols": [self.size_x_col_combo.currentText(), self.size_y_col_combo.currentText(), self.size_z_col_combo.currentText()],
+                "extent_cols": [combo.currentText() for combo in self._extent_column_combos()],
+                "value_columns": self._value_column_rows_config(),
+                "value_exceptions": self._get_value_exceptions(),
+                "origin": self.origin_edit.text().strip(),
+                "null_float": self.null_float_edit.text().strip(),
+                "index_tolerance": self.index_tolerance_edit.text().strip(),
+                "dry_run": self.dry_run_check.isChecked(),
+            },
+            "bmf2csv": {
+                "input_bmf": self.browse_input_edit.text().strip(),
+                "output_csv": self.browse_output_edit.text().strip(),
+                "read_all_rows": self.read_all_rows_check.isChecked(),
+                "row_limit": int(self.row_limit_spin.value()),
+            },
+        }
+
+    def _normalize_loaded_value_columns(self, raw_value_columns: object) -> tuple[list[str], dict[str, str]]:
+        selected: list[str] = []
+        column_types: dict[str, str] = {}
+        if isinstance(raw_value_columns, list):
+            for entry in raw_value_columns:
+                if isinstance(entry, dict):
+                    field = str(entry.get("field") or "").strip()
+                    if not field:
+                        continue
+                    if bool(entry.get("selected", True)):
+                        selected.append(field)
+                    field_type = _normalize_bmf_field_type(entry.get("type") or "")
+                    if field_type and bool(entry.get("explicit_type", True)):
+                        column_types[field] = field_type
+                else:
+                    field = str(entry or "").strip()
+                    if field:
+                        selected.append(field)
+        return selected, column_types
+
+    def _set_value_exceptions(self, raw_exceptions: object) -> None:
+        rules = bmf_tools._normalize_value_exceptions(raw_exceptions if isinstance(raw_exceptions, dict) else {})
+        blocker = QtCore.QSignalBlocker(self.exception_table)
+        try:
+            rows = []
+            for column_name, column_rules in rules.items():
+                for bad_value, rule in column_rules.items():
+                    rows.append(
+                        (
+                            column_name,
+                            bad_value,
+                            str(rule.get("replacement", "")),
+                            bool(rule.get("include_in_regularization", False)),
+                        )
+                    )
+            self.exception_table.setRowCount(len(rows))
+            for row_index, (column_name, bad_value, replacement, include_in_regularization) in enumerate(rows):
+                self.exception_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(column_name))
+                self.exception_table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(bad_value))
+                self.exception_table.setItem(row_index, 2, QtWidgets.QTableWidgetItem(replacement))
+                self.exception_table.setItem(row_index, 3, self._make_exception_include_item(include_in_regularization))
+        finally:
+            del blocker
+        self._update_exception_summary()
+
+    def _apply_config_dict(self, config: dict[str, object]) -> None:
+        csv_config = config.get("csv2bmf", config)
+        if not isinstance(csv_config, dict):
+            raise ValueError("Config file does not contain csv2bmf settings.")
+        reader_config = config.get("bmf2csv", {}) if isinstance(config.get("bmf2csv", {}), dict) else {}
+
+        raw_value_columns = csv_config.get("value_columns", csv_config.get("value_cols", []))
+        selected_columns, column_types = self._normalize_loaded_value_columns(raw_value_columns)
+        if not column_types and isinstance(csv_config.get("column_types"), dict):
+            column_types = {
+                str(column_name).strip(): _normalize_bmf_field_type(field_type)
+                for column_name, field_type in dict(csv_config.get("column_types") or {}).items()
+                if str(column_name).strip() and _normalize_bmf_field_type(field_type)
+            }
+        self.export_input_edit.setText(str(csv_config.get("input_csv", csv_config.get("input_file", "")) or ""))
+        self.export_output_edit.setText(str(csv_config.get("output_bmf", csv_config.get("output_file", "")) or ""))
+        self.export_summary_edit.setText(str(csv_config.get("summary_json", "") or ""))
+        self._set_combo_value(self.delimiter_combo, csv_config.get("delimiter", ","))
+        try:
+            self.header_line_spin.setValue(int(csv_config.get("header_line", 1) or 1))
+        except Exception:
+            self.header_line_spin.setValue(1)
+        self._set_combo_value(self.backend_combo, csv_config.get("backend", "tbms-config-text"))
+
+        cell_size = csv_config.get("cell_size")
+        if isinstance(cell_size, (list, tuple)) and len(cell_size) == 3:
+            for spin, value in zip((self.cell_x_spin, self.cell_y_spin, self.cell_z_spin), cell_size):
+                try:
+                    spin.setValue(float(value))
+                except Exception:
+                    spin.setValue(0.0)
+        self.regularize_base_blocks_check.setChecked(bool(csv_config.get("regularize_to_base_block", False)))
+        self._set_combo_value(self.geometry_mode_combo, csv_config.get("geometry_mode", "infer"))
+
+        self._refresh_export_columns()
+        blockers = [
+            QtCore.QSignalBlocker(self.x_col_combo),
+            QtCore.QSignalBlocker(self.y_col_combo),
+            QtCore.QSignalBlocker(self.z_col_combo),
+            QtCore.QSignalBlocker(self.size_x_col_combo),
+            QtCore.QSignalBlocker(self.size_y_col_combo),
+            QtCore.QSignalBlocker(self.size_z_col_combo),
+            *[QtCore.QSignalBlocker(combo) for combo in self._extent_column_combos()],
+        ]
+        try:
+            for combo, value in zip((self.x_col_combo, self.y_col_combo, self.z_col_combo), [csv_config.get("x_col"), csv_config.get("y_col"), csv_config.get("z_col")]):
+                if value:
+                    self._set_combo_value(combo, value)
+            for combo, value in zip((self.size_x_col_combo, self.size_y_col_combo, self.size_z_col_combo), csv_config.get("size_cols", []) or []):
+                self._set_combo_value(combo, value)
+            for combo, value in zip(self._extent_column_combos(), csv_config.get("extent_cols", []) or []):
+                self._set_combo_value(combo, value)
+        finally:
+            del blockers
+        self._pending_export_value_cols = selected_columns
+        self._pending_export_column_types = column_types
+        self._refresh_export_columns()
+
+        self._set_value_exceptions(csv_config.get("value_exceptions", {}))
+        self.origin_edit.setText(str(csv_config.get("origin", "") or ""))
+        self.null_float_edit.setText(str(csv_config.get("null_float", "-99") or "-99"))
+        self.index_tolerance_edit.setText(str(csv_config.get("index_tolerance", "1e-3") or "1e-3"))
+        self.dry_run_check.setChecked(bool(csv_config.get("dry_run", False)))
+        self._update_geometry_mode_controls()
+        self._update_regularize_warning()
+
+        self.browse_input_edit.setText(str(reader_config.get("input_bmf", "") or ""))
+        self.browse_output_edit.setText(str(reader_config.get("output_csv", "") or ""))
+        self.read_all_rows_check.setChecked(bool(reader_config.get("read_all_rows", True)))
+        try:
+            self.row_limit_spin.setValue(int(reader_config.get("row_limit", 1000) or 1000))
+        except Exception:
+            self.row_limit_spin.setValue(1000)
+        self._toggle_row_limit_enabled(self.read_all_rows_check.isChecked())
+
+    def _save_config(self) -> None:
+        default_path = ""
+        input_path = self.export_input_edit.text().strip()
+        if input_path:
+            default_path = str(Path(input_path).with_suffix(".bmf_export_config.json"))
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save BMF Export Config", default_path, "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(json.dumps(self._config_dict(), indent=2), encoding="utf-8")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Save Config Failed", str(exc))
+            self.statusBar().showMessage("Config save failed")
+            return
+        self.statusBar().showMessage(f"Saved config to {path}")
+
+    def _load_config(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load BMF Export Config", "", "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            config = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(config, dict):
+                raise ValueError("Config JSON must contain an object.")
+            self._apply_config_dict(config)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Load Config Failed", str(exc))
+            self.statusBar().showMessage("Config load failed")
+            return
+        self.statusBar().showMessage(f"Loaded config from {path}")
 
     def _make_cell_size_spin(self) -> QtWidgets.QDoubleSpinBox:
         spin = TrimmedDisplayDoubleSpinBox()
@@ -997,6 +1194,64 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
                 excluded.update(extent_columns)
         return excluded
 
+    def _parse_numeric_type_error(self, error_text: str) -> dict[str, object] | None:
+        match = re.search(
+            r"Column (?P<column>.+?) cannot be exported as (?P<field_type>int|double).*?Invalid values include: (?P<values>\[[^\]]*\])",
+            str(error_text or ""),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        try:
+            values = ast.literal_eval(match.group("values"))
+        except Exception:
+            values = []
+        if not values:
+            return None
+        return {
+            "column": str(match.group("column")).strip().strip("'\""),
+            "field_type": match.group("field_type").lower(),
+            "value": str(values[0]),
+            "values": [str(value) for value in values],
+        }
+
+    def _prompt_value_exception(self, column_name: str, bad_value: str, field_type: str = "double") -> str | None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("BMF Value Exception")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        label = QtWidgets.QLabel(
+            f"Column '{column_name}' is being exported as {field_type}, but value '{bad_value}' is not numeric."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        replacement_edit = QtWidgets.QLineEdit()
+        replacement_edit.setPlaceholderText("Numeric replacement")
+        blank_check = QtWidgets.QCheckBox("Replace with blank/null")
+        blank_check.setChecked(True)
+        replacement_edit.setEnabled(False)
+        blank_check.toggled.connect(lambda checked: replacement_edit.setEnabled(not checked))
+        layout.addWidget(blank_check)
+        layout.addWidget(replacement_edit)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+        if blank_check.isChecked():
+            return ""
+        replacement = replacement_edit.text().strip()
+        if not replacement:
+            return ""
+        try:
+            float(replacement)
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Invalid Replacement", "Replacement must be numeric or blank.")
+            return self._prompt_value_exception(column_name, bad_value, field_type=field_type)
+        return replacement
+
     def _run_export(self) -> None:
         if self._bmf_export_thread is not None:
             self.statusBar().showMessage("BMF export already in progress")
@@ -1089,6 +1344,21 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
             thread.quit()
 
         def handle_failed(message: str) -> None:
+            parsed = self._parse_numeric_type_error(message)
+            if parsed:
+                replacement = self._prompt_value_exception(
+                    str(parsed["column"]),
+                    str(parsed["value"]),
+                    field_type=str(parsed.get("field_type") or "double"),
+                )
+                if replacement is not None:
+                    self._add_exception_row(str(parsed["column"]), str(parsed["value"]), replacement)
+                    self.export_result_text.appendPlainText(
+                        f"\nAdded value exception for {parsed['column']!r}={parsed['value']!r}; retrying export..."
+                    )
+                    thread.finished.connect(lambda: QtCore.QTimer.singleShot(0, self._run_export))
+                    thread.quit()
+                    return
             QtWidgets.QMessageBox.critical(self, "Export Failed", message)
             self.export_result_text.appendPlainText(f"\nExport failed: {message}")
             self.statusBar().showMessage("Export failed")

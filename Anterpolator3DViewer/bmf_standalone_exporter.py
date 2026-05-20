@@ -683,6 +683,66 @@ def _normalize_export_type_overrides(column_types: Mapping[str, object] | None) 
     return {key: value for key, value in normalized.items() if value}
 
 
+def coerce_bmf_numeric_series(series: pd.Series, delimiter: str | None = None) -> pd.Series:
+    numeric_series = pd.to_numeric(series, errors="coerce")
+    missing_mask = numeric_series.isna()
+    if not missing_mask.any():
+        return numeric_series
+
+    text_series = series.astype(str)
+    normalized = text_series.str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False)
+    if delimiter and delimiter != ",":
+        normalized = normalized.str.replace(",", ".", regex=False)
+    alternate_numeric = pd.to_numeric(normalized, errors="coerce")
+    return numeric_series.where(~missing_mask, alternate_numeric)
+
+
+def infer_bmf_export_field_types_from_preview(
+    df: pd.DataFrame,
+    candidate_columns: Sequence[str],
+    delimiter: str | None = None,
+) -> Dict[str, str]:
+    inferred: Dict[str, str] = {}
+    truthy = {"1", "true", "t", "yes", "y"}
+    falsy = {"0", "false", "f", "no", "n", ""}
+
+    for column_name in candidate_columns or []:
+        if column_name not in df.columns:
+            continue
+
+        series = df[column_name]
+        non_null = series.dropna()
+        if len(non_null) == 0:
+            inferred[str(column_name)] = ""
+            continue
+
+        if pd.api.types.is_bool_dtype(series):
+            inferred[str(column_name)] = "boolean"
+            continue
+
+        normalized_text = non_null.astype(str).str.strip().str.lower()
+        normalized_text = normalized_text[normalized_text != ""]
+        if len(normalized_text) > 0 and normalized_text.isin(truthy | falsy).all():
+            inferred[str(column_name)] = "boolean"
+            continue
+
+        numeric_series = coerce_bmf_numeric_series(series, delimiter=delimiter)
+        blank_mask = series.isna() | series.astype(str).str.strip().eq("")
+        numeric_compatible = bool((numeric_series.notna() | blank_mask).all())
+        if numeric_compatible:
+            finite = numeric_series.dropna().to_numpy(dtype=float)
+            if finite.size == 0:
+                inferred[str(column_name)] = "double"
+                continue
+            integer_like = np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0)
+            inferred[str(column_name)] = "int" if integer_like else "double"
+            continue
+
+        inferred[str(column_name)] = "string"
+
+    return inferred
+
+
 def _coerce_bool(value, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -1908,6 +1968,7 @@ def _regularize_to_base_cell_grid(
     origin: Sequence[float] | None,
     value_cols: Sequence[str] | None,
     column_types: Mapping[str, object] | None,
+    delimiter: str | None = None,
 ) -> Tuple[pd.DataFrame, Dict[str, object]]:
     if cell_size is None:
         raise ValueError(
@@ -1954,7 +2015,7 @@ def _regularize_to_base_cell_grid(
 
     for col in value_columns:
         forced_type = normalized_overrides.get(col)
-        numeric_values = pd.to_numeric(work[col], errors="coerce")
+        numeric_values = coerce_bmf_numeric_series(work[col], delimiter=delimiter)
         missing_mask = work[col].isna() | work[col].astype(str).str.strip().eq("")
         numeric_compatible = bool((numeric_values.notna() | missing_mask).all() and numeric_values.notna().any())
         should_average = forced_type == "double" or (forced_type is None and numeric_compatible)
@@ -2185,6 +2246,7 @@ def _tbms_encode_export_field(
     series: pd.Series,
     null_float: float,
     forced_type: str | None = None,
+    delimiter: str | None = None,
 ) -> Dict[str, object]:
     series = series.reset_index(drop=True)
     normalized_forced_type = _normalize_export_field_type(forced_type)
@@ -2219,7 +2281,7 @@ def _tbms_encode_export_field(
             "values": _tbms_export_field_values(prepared, encoded, 0, np.dtype("u1")),
         }
 
-    numeric = pd.to_numeric(series, errors="coerce")
+    numeric = coerce_bmf_numeric_series(series, delimiter=delimiter)
     missing_mask = missing_or_blank_mask(series)
     numeric_compatible = bool((numeric.notna() | missing_mask).all())
     if normalized_forced_type == "int":
@@ -2262,7 +2324,14 @@ def _tbms_encode_export_field(
     if normalized_forced_type == "string":
         labels = [str(value) for value in pd.unique(series.dropna())]
         if len(labels) > 32766:
-            raise ValueError(f"Column {series.name!r} has too many categorical values for string export.")
+            raise ValueError(
+                _namedshort_cardinality_error_message(
+                    str(series.name),
+                    "string",
+                    invalid_values=invalid_numeric_values(series, numeric),
+                    saw_numeric_values=bool(numeric.notna().any()),
+                )
+            )
         code_map = {label: index + 1 for index, label in enumerate(labels)}
         codes = series.map(lambda value: 0 if pd.isna(value) else code_map[str(value)]).astype(np.int16)
         field_info = {
@@ -2309,7 +2378,14 @@ def _tbms_encode_export_field(
 
     labels = [str(value) for value in pd.unique(series.dropna())]
     if len(labels) > 32766:
-        raise ValueError(f"Column {series.name!r} has too many categorical values for namedshort export.")
+        raise ValueError(
+            _namedshort_cardinality_error_message(
+                str(series.name),
+                "namedshort",
+                invalid_values=invalid_numeric_values(series, numeric),
+                saw_numeric_values=bool(numeric.notna().any()),
+            )
+        )
     code_map = {label: index + 1 for index, label in enumerate(labels)}
     codes = series.map(lambda value: 0 if pd.isna(value) else code_map[str(value)]).astype(np.int16)
     field_info = {
@@ -2465,7 +2541,30 @@ def _remember_stream_invalid_values(state: dict[str, object], values: pd.Series)
             invalid_values.append(text)
 
 
-def _scan_stream_field_values(state: dict[str, object], series: pd.Series) -> None:
+def _namedshort_cardinality_error_message(
+    column_name: str,
+    export_type_label: str,
+    invalid_values: Sequence[object] | None = None,
+    saw_numeric_values: bool = False,
+) -> str:
+    message = (
+        f"Column {column_name!r} has too many distinct values for {export_type_label} export. "
+        "TBMS namedshort/string fields are limited to 32,766 unique labels."
+    )
+    if saw_numeric_values:
+        message += (
+            " This column appears to contain numeric values, but Auto treated it as categorical because at least one "
+            "non-numeric value was found. Set this field's Type to double or int if it is numeric."
+        )
+    else:
+        message += " If this column is numeric, set its Type to double or int instead of Auto/string."
+    if invalid_values:
+        message += f" Non-numeric examples include: {list(invalid_values)[:5]}."
+    message += " Use Value Exceptions for placeholder values that should be replaced before export."
+    return message
+
+
+def _scan_stream_field_values(state: dict[str, object], series: pd.Series, delimiter: str | None = None) -> None:
     missing_mask = _stream_missing_or_blank_mask(series)
     label_values = series.loc[series.notna()]
     labels = state.get("labels")
@@ -2478,23 +2577,21 @@ def _scan_stream_field_values(state: dict[str, object], series: pd.Series) -> No
                     break
                 labels[label] = len(labels) + 1
 
-    numeric = pd.to_numeric(series, errors="coerce")
+    numeric = coerce_bmf_numeric_series(series, delimiter=delimiter)
     invalid_numeric = ~missing_mask & numeric.isna()
+    finite = numeric.loc[numeric.notna()].to_numpy(dtype=float)
+    if finite.size > 0:
+        state["has_numeric"] = True
+        min_value = int(np.min(finite)) if np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0) else float(np.min(finite))
+        max_value = int(np.max(finite)) if np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0) else float(np.max(finite))
+        state["min"] = min_value if state.get("min") is None else min(float(state["min"]), float(min_value))
+        state["max"] = max_value if state.get("max") is None else max(float(state["max"]), float(max_value))
+        if not np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0):
+            state["integer_like"] = False
     if invalid_numeric.any():
         state["numeric_compatible"] = False
         _remember_stream_invalid_values(state, series.loc[invalid_numeric])
         return
-
-    finite = numeric.loc[numeric.notna()].to_numpy(dtype=float)
-    if finite.size == 0:
-        return
-    state["has_numeric"] = True
-    min_value = int(np.min(finite)) if np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0) else float(np.min(finite))
-    max_value = int(np.max(finite)) if np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0) else float(np.max(finite))
-    state["min"] = min_value if state.get("min") is None else min(float(state["min"]), float(min_value))
-    state["max"] = max_value if state.get("max") is None else max(float(state["max"]), float(max_value))
-    if not np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0):
-        state["integer_like"] = False
 
 
 def _finalize_stream_field_state(state: dict[str, object], null_float: float) -> dict[str, object]:
@@ -2521,7 +2618,14 @@ def _finalize_stream_field_state(state: dict[str, object], null_float: float) ->
         return {"field_type": "double", "default": float(null_float), "dtype": np.dtype("<f8")}
     if forced_type == "string":
         if state.get("too_many_labels"):
-            raise ValueError(f"Column {name!r} has too many categorical values for string export.")
+            raise ValueError(
+                _namedshort_cardinality_error_message(
+                    name,
+                    "string",
+                    invalid_values=invalid_values,
+                    saw_numeric_values=bool(state.get("has_numeric", False)),
+                )
+            )
         labels = dict(state.get("labels") or {})
         return {"field_type": "namedshort", "default": 0, "dtype": np.dtype("<i2"), "labels": labels}
 
@@ -2534,12 +2638,19 @@ def _finalize_stream_field_state(state: dict[str, object], null_float: float) ->
         return {"field_type": "double", "default": float(null_float), "dtype": np.dtype("<f8")}
 
     if state.get("too_many_labels"):
-        raise ValueError(f"Column {name!r} has too many categorical values for namedshort export.")
+        raise ValueError(
+            _namedshort_cardinality_error_message(
+                name,
+                "namedshort",
+                invalid_values=invalid_values,
+                saw_numeric_values=bool(state.get("has_numeric", False)),
+            )
+        )
     labels = dict(state.get("labels") or {})
     return {"field_type": "namedshort", "default": 0, "dtype": np.dtype("<i2"), "labels": labels}
 
 
-def _encode_stream_field_chunk(series: pd.Series, field_info: Mapping[str, object], null_float: float) -> np.ndarray:
+def _encode_stream_field_chunk(series: pd.Series, field_info: Mapping[str, object], null_float: float, delimiter: str | None = None) -> np.ndarray:
     field_type = str(field_info.get("field_type"))
     if field_type == "boolean":
         truthy = {"1", "true", "t", "yes", "y"}
@@ -2551,9 +2662,9 @@ def _encode_stream_field_chunk(series: pd.Series, field_info: Mapping[str, objec
             raise ValueError(f"Column {series.name!r} cannot be exported as boolean. Invalid values include: {invalid_values}")
         return normalized.isin(truthy).astype(np.uint8).to_numpy(dtype="u1", copy=False)
     if field_type == "int":
-        return pd.to_numeric(series, errors="coerce").fillna(int(null_float)).astype(np.int32).to_numpy(dtype="<i4", copy=False)
+        return coerce_bmf_numeric_series(series, delimiter=delimiter).fillna(int(null_float)).astype(np.int32).to_numpy(dtype="<i4", copy=False)
     if field_type == "double":
-        return pd.to_numeric(series, errors="coerce").fillna(float(null_float)).astype(np.float64).to_numpy(dtype="<f8", copy=False)
+        return coerce_bmf_numeric_series(series, delimiter=delimiter).fillna(float(null_float)).astype(np.float64).to_numpy(dtype="<f8", copy=False)
     labels = field_info.get("labels") if isinstance(field_info.get("labels"), Mapping) else {}
     return series.map(lambda value: 0 if pd.isna(value) else int(labels[str(value)])).astype(np.int16).to_numpy(dtype="<i2", copy=False)
 
@@ -2716,7 +2827,7 @@ def _scan_stream_irregular_export(
         chunk_parent_size = np.asarray(chunk_parent_size, dtype=float)
         parent_size = chunk_parent_size if parent_size is None else np.maximum(np.asarray(parent_size, dtype=float), chunk_parent_size)
         for name in value_cols:
-            _scan_stream_field_values(field_states[name], clean[name])
+            _scan_stream_field_values(field_states[name], clean[name], delimiter=delimiter)
 
     if row_count <= 0:
         raise ValueError("No valid irregular source rows found while streaming CSV export.")
@@ -2896,7 +3007,7 @@ def _write_streaming_irregular_tbms_config_text(
             if clean.empty:
                 continue
             for name in value_cols:
-                value_builders[name].append(_encode_stream_field_chunk(clean[name], field_infos[name], null_float))
+                value_builders[name].append(_encode_stream_field_chunk(clean[name], field_infos[name], null_float, delimiter=delimiter))
 
         for field_index, name in enumerate(value_cols):
             encoded = field_infos[name]
@@ -2998,6 +3109,7 @@ def _write_tbms_config_text(
     out_bmf: Path,
     null_float: float,
     column_types: Mapping[str, object] | None = None,
+    delimiter: str | None = None,
     progress_callback=None,
     progress_start: int = 50,
     progress_end: int = 98,
@@ -3105,7 +3217,13 @@ def _write_tbms_config_text(
                 100,
                 f"Encoding BMF field {field_index + 1}/{len(value_cols)}: {name}...",
             )
-            encoded = _tbms_encode_export_field(prepared, df[name], null_float, forced_type=normalized_overrides.get(name))
+            encoded = _tbms_encode_export_field(
+                prepared,
+                df[name],
+                null_float,
+                forced_type=normalized_overrides.get(name),
+                delimiter=delimiter,
+            )
             leaf_offsets = [
                 allocate_page(blob)
                 for blob in _iter_tbms_value_pages(encoded["values"], encoded["dtype"], encoded["default"])
@@ -4604,7 +4722,7 @@ def export_bmf(
         parent_cell_size = cell_size
         stream_scan = _scan_stream_irregular_export(
             input_csv=in_csv,
-            delimiter=delimiter,
+            delimiter=csv_delimiter,
             header_line=effective_header_line,
             selected_read_cols=selected_read_cols,
             xyz_cols=xyz_cols,
@@ -4704,7 +4822,7 @@ def export_bmf(
                 xyz_cols=xyz_cols,
                 value_cols=chosen_value_cols,
                 selected_read_cols=selected_read_cols,
-                delimiter=delimiter,
+                delimiter=csv_delimiter,
                 header_line=effective_header_line,
                 metadata=csv_metadata,
                 cell_size=parent_cell_size,
@@ -4808,6 +4926,7 @@ def export_bmf(
             origin=origin,
             value_cols=value_cols,
             column_types=column_types,
+            delimiter=csv_delimiter,
         )
 
         post_regularization_exceptions = _filter_value_exceptions_for_regularization(
@@ -4985,6 +5104,7 @@ def export_bmf(
                 out_bmf=out_bmf,
                 null_float=null_float,
                 column_types=column_types,
+                delimiter=csv_delimiter,
                 progress_callback=progress_callback,
                 progress_start=50,
                 progress_end=98,

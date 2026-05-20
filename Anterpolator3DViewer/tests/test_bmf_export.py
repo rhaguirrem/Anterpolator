@@ -174,6 +174,109 @@ def run_source_row_coordinate_prep_stream_when_large():
             bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = original_prep_limit
 
 
+def run_streaming_auto_high_cardinality_message_points_to_numeric_type():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = os.path.join(tmpdir, "high_cardinality_auto.csv")
+        bmf_path = os.path.join(tmpdir, "high_cardinality_auto.bmf")
+
+        with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Parent block size: 10, 10, 10\n")
+            handle.write("# Size in parent blocks: 40000, 1, 1\n")
+            handle.write("# Minimum corner: 0, 0, 0\n")
+            handle.write("# Sub-blocks: octree 2, 2, 2\n")
+            handle.write("x,y,z,RQD_srk\n")
+            handle.write("0.5,0.5,0.5,12.5\n")
+            for index in range(32767):
+                handle.write(f"{index + 1.5},0.5,0.5,bad_token_{index}\n")
+
+        original_selected_limit = bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES
+        original_prep_limit = bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES
+        bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = 64
+        bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = 64
+        try:
+            try:
+                export_bmf(
+                    csv_path,
+                    bmf_path,
+                    backend="tbms-config-text",
+                    header_line=1,
+                    value_cols=["RQD_srk"],
+                    regularize_to_base_block=False,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                assert "RQD_srk" in message
+                assert "too many distinct values" in message
+                assert "Set this field's Type to double or int" in message
+                assert "Non-numeric examples include" in message
+                assert "Value Exceptions" in message
+            else:
+                raise AssertionError("Expected Auto high-cardinality string fallback to fail with an actionable message")
+        finally:
+            bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = original_selected_limit
+            bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = original_prep_limit
+
+
+def run_preview_type_inference_matches_app_numeric_cleanup():
+    frame = pd.DataFrame(
+        {
+            "RQD_srk": ["12,5", "13,75", ""],
+            "Flag": ["yes", "no", ""],
+            "Domain": ["ore", "waste", "ore"],
+        }
+    )
+    inferred = bmf_exporter.infer_bmf_export_field_types_from_preview(
+        frame,
+        ["RQD_srk", "Flag", "Domain"],
+        delimiter=";",
+    )
+    assert inferred["RQD_srk"] == "double"
+    assert inferred["Flag"] == "boolean"
+    assert inferred["Domain"] == "string"
+
+
+def run_streaming_forced_numeric_uses_value_exceptions_and_decimal_cleanup():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path = os.path.join(tmpdir, "numeric_exceptions.csv")
+        bmf_path = os.path.join(tmpdir, "numeric_exceptions.bmf")
+
+        with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("# Parent block size: 10, 10, 10\n")
+            handle.write("# Size in parent blocks: 3, 1, 1\n")
+            handle.write("# Minimum corner: 0, 0, 0\n")
+            handle.write("# Sub-blocks: octree 2, 2, 2\n")
+            handle.write("x;y;z;RQD_srk\n")
+            handle.write("0.5;0.5;0.5;12,5\n")
+            handle.write("1.5;0.5;0.5;not_logged\n")
+            handle.write("2.5;0.5;0.5;13,75\n")
+
+        original_selected_limit = bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES
+        original_prep_limit = bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES
+        bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = 64
+        bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = 64
+        try:
+            result = export_bmf(
+                csv_path,
+                bmf_path,
+                backend="tbms-config-text",
+                delimiter=";",
+                header_line=1,
+                value_cols=["RQD_srk"],
+                column_types={"RQD_srk": "double"},
+                value_exceptions={"RQD_srk": {"not_logged": ""}},
+                regularize_to_base_block=False,
+            )
+            assert result["summary"]["streaming"] is True
+            loaded = load_bmf_table(bmf_path)
+            values = list(loaded["dataframe"]["RQD_srk"])
+            assert abs(values[0] - 12.5) < 1e-9
+            assert abs(values[1] - (-99.0)) < 1e-9
+            assert abs(values[2] - 13.75) < 1e-9
+        finally:
+            bmf_exporter.MAX_SELECTED_CSV_OBJECT_BYTES = original_selected_limit
+            bmf_exporter.MAX_SOURCE_ROW_PREP_BYTES = original_prep_limit
+
+
 def run_coarse_cell_size_alignment_diagnostic():
     with tempfile.TemporaryDirectory() as tmpdir:
         csv_path = os.path.join(tmpdir, "subblocks.csv")
@@ -765,6 +868,9 @@ if __name__ == "__main__":
     run_dense_guard_backend_selection()
     run_source_row_selected_columns_stream_when_wide()
     run_source_row_coordinate_prep_stream_when_large()
+    run_streaming_auto_high_cardinality_message_points_to_numeric_type()
+    run_preview_type_inference_matches_app_numeric_cleanup()
+    run_streaming_forced_numeric_uses_value_exceptions_and_decimal_cleanup()
     run_coarse_cell_size_alignment_diagnostic()
     run_regularize_to_base_cell_export()
     run_regularize_ignores_value_exception_replacements()

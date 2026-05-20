@@ -6124,44 +6124,11 @@ def normalize_bmf_export_field_type_name(field_type):
 
 
 def infer_bmf_export_field_types_from_preview(df, candidate_columns, delimiter=None):
-    inferred = {}
-    truthy = {'1', 'true', 't', 'yes', 'y'}
-    falsy = {'0', 'false', 'f', 'no', 'n', ''}
-
-    for column_name in candidate_columns or []:
-        if column_name not in df.columns:
-            continue
-
-        series = df[column_name]
-        non_null = series.dropna()
-        if len(non_null) == 0:
-            inferred[str(column_name)] = ''
-            continue
-
-        if pd.api.types.is_bool_dtype(series):
-            inferred[str(column_name)] = 'boolean'
-            continue
-
-        normalized_text = non_null.astype(str).str.strip().str.lower()
-        normalized_text = normalized_text[normalized_text != '']
-        if len(normalized_text) > 0 and normalized_text.isin(truthy | falsy).all():
-            inferred[str(column_name)] = 'boolean'
-            continue
-
-        numeric_series = coerce_numeric_series(series, delimiter=delimiter)
-        numeric_compatible = bool((numeric_series.notna() | series.isna() | (series.astype(str).str.strip() == '')).all())
-        if numeric_compatible:
-            finite = numeric_series.dropna().to_numpy(dtype=float)
-            if finite.size == 0:
-                inferred[str(column_name)] = 'double'
-                continue
-            integer_like = np.allclose(finite, np.rint(finite), atol=1e-9, rtol=0.0)
-            inferred[str(column_name)] = 'int' if integer_like else 'double'
-            continue
-
-        inferred[str(column_name)] = 'string'
-
-    return inferred
+    return _get_bmf_tools_module().infer_bmf_export_field_types_from_preview(
+        df,
+        candidate_columns,
+        delimiter=delimiter,
+    )
 
 
 def export_csv_grid_to_bmf(input_csv, output_bmf, x_col='x', y_col='y', z_col='z',
