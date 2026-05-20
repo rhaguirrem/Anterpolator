@@ -41,6 +41,127 @@ MAX_DENSE_EXPORT_BYTES = int(os.environ.get("ANTERPOLATOR_BMF_MAX_DENSE_BYTES", 
 SUPPORTED_EXPORT_BACKENDS = {"tbms-config-text", "tbms-experimental", "vulcan"}
 DENSE_EXPORT_BACKENDS = {"tbms-config-text", "vulcan"}
 MAX_SELECTED_CSV_OBJECT_BYTES = int(os.environ.get("ANTERPOLATOR_BMF_MAX_SELECTED_CSV_BYTES", str(8 * 1024 ** 3)))
+_LOGGED_LEAPFROG_METADATA_SIGNATURES: set[tuple[str, str, tuple[str, ...]]] = set()
+GRID_INDEX_COLUMNS = ("grid_i", "grid_j", "grid_k")
+GEOMETRY_EXTENT_COLUMNS = ("__lower_x", "__upper_x", "__lower_y", "__upper_y", "__lower_z", "__upper_z")
+GEOMETRY_SIZE_COLUMN_ROLES = ("dx", "dy", "dz")
+
+
+def _normalize_column_token(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _find_header_column(header_names: Sequence[str], candidates: Sequence[str]) -> str | None:
+    exact = {str(name): str(name) for name in header_names}
+    for candidate in candidates:
+        token = _normalize_column_token(candidate)
+        if token in exact:
+            return exact[token]
+    lowered: dict[str, str | None] = {}
+    for name in header_names:
+        key = str(name).strip().lower()
+        if key in lowered:
+            lowered[key] = None
+        else:
+            lowered[key] = str(name)
+    for candidate in candidates:
+        match = lowered.get(_normalize_column_token(candidate).lower())
+        if match:
+            return match
+    return None
+
+
+def _normalize_geometry_column_spec(
+    spec: Sequence[str] | Mapping[str, str] | str | None,
+    roles: Sequence[str],
+    label: str,
+) -> dict[str, str]:
+    if spec is None:
+        return {}
+    if isinstance(spec, str):
+        values = [part.strip() for part in spec.split(",") if part.strip()]
+        if not values:
+            return {}
+        spec = values
+    if isinstance(spec, Mapping):
+        resolved = {role: _normalize_column_token(spec.get(role)) for role in roles}
+    else:
+        values = [_normalize_column_token(value) for value in spec]
+        if not values:
+            return {}
+        if len(values) != len(roles):
+            raise ValueError(f"{label} must provide exactly {len(roles)} column names.")
+        resolved = dict(zip(roles, values))
+    missing = [role for role in roles if not resolved.get(role)]
+    if missing and len(missing) != len(roles):
+        raise ValueError(f"{label} must provide all required columns; missing: {missing}")
+    if len(missing) == len(roles):
+        return {}
+    return resolved
+
+
+def _resolve_geometry_column_map(
+    header_names: Sequence[str],
+    spec: Sequence[str] | Mapping[str, str] | str | None,
+    roles: Sequence[str],
+    label: str,
+) -> dict[str, str]:
+    requested = _normalize_geometry_column_spec(spec, roles, label)
+    if not requested:
+        return {}
+    resolved: dict[str, str] = {}
+    missing = []
+    for role, column_name in requested.items():
+        match = _find_header_column(header_names, [column_name])
+        if match is None:
+            missing.append(column_name)
+        else:
+            resolved[role] = match
+    if missing:
+        raise ValueError(f"{label} column(s) not found in CSV: {missing}")
+    return resolved
+
+
+def _detect_geometry_size_columns(header_names: Sequence[str]) -> dict[str, str]:
+    candidates = {
+        "dx": ("dx", "dX", "DX", "size_x", "block_size_x", "width_x"),
+        "dy": ("dy", "dY", "DY", "size_y", "block_size_y", "width_y"),
+        "dz": ("dz", "dZ", "DZ", "size_z", "block_size_z", "width_z", "height_z"),
+    }
+    resolved: dict[str, str] = {}
+    for role in GEOMETRY_SIZE_COLUMN_ROLES:
+        match = _find_header_column(header_names, candidates[role])
+        if match is None:
+            return {}
+        resolved[role] = match
+    return resolved
+
+
+def _detect_geometry_extent_columns(header_names: Sequence[str]) -> dict[str, str]:
+    canonical: dict[str, str] = {}
+    for role in GEOMETRY_EXTENT_COLUMNS:
+        match = _find_header_column(header_names, [role])
+        if match is None:
+            canonical = {}
+            break
+        canonical[role] = match
+    if canonical:
+        return canonical
+    candidates = {
+        "__lower_x": ("lower_x", "x_lower", "min_x", "x_min", "from_x"),
+        "__upper_x": ("upper_x", "x_upper", "max_x", "x_max", "to_x"),
+        "__lower_y": ("lower_y", "y_lower", "min_y", "y_min", "from_y"),
+        "__upper_y": ("upper_y", "y_upper", "max_y", "y_max", "to_y"),
+        "__lower_z": ("lower_z", "z_lower", "min_z", "z_min", "from_z"),
+        "__upper_z": ("upper_z", "z_upper", "max_z", "z_max", "to_z"),
+    }
+    resolved: dict[str, str] = {}
+    for role, role_candidates in candidates.items():
+        match = _find_header_column(header_names, role_candidates)
+        if match is None:
+            return {}
+        resolved[role] = match
+    return resolved
 
 
 def _emit_progress(progress_callback, value: int, maximum: int = 100, message: str = "") -> None:
@@ -64,6 +185,265 @@ def _format_byte_size(size_bytes: int | float) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024.0
     return f"{value:.1f} TiB"
+
+
+def detect_csv_delimiter(path: str | Path) -> str:
+    path = Path(path)
+    if not path.is_file():
+        return ","
+    try:
+        lines = []
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if line.strip() and not line.lstrip().startswith(("#", "//")):
+                    lines.append(line)
+                if len(lines) >= 3:
+                    break
+    except OSError:
+        return ","
+    sample = "".join(lines)
+    counts = {delimiter: sample.count(delimiter) for delimiter in [",", ";", "\t", "|"]}
+    delimiter = max(counts, key=counts.get)
+    return delimiter if counts[delimiter] > 0 else ","
+
+
+def parse_header_line(path: str | Path, delimiter: str, line_number: int) -> list[str]:
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(f"File not found: {path}")
+    line_number = max(int(line_number or 1), 1)
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for current, line in enumerate(handle, start=1):
+            if current == line_number:
+                tokens = [token.strip() for token in line.rstrip("\r\n").split(delimiter)]
+                tokens = [token for token in tokens if token]
+                if not tokens:
+                    raise ValueError(f"Parsed header line {line_number} in '{path.name}' produced no tokens.")
+                return tokens
+    raise ValueError(f"Header line {line_number} exceeds total lines in file '{path.name}'.")
+
+
+def resolve_effective_csv_header_line(path: str | Path, configured_line: int = 1) -> int:
+    path = Path(path)
+    line_number = max(int(configured_line or 1), 1)
+    if not path.is_file():
+        raise ValueError(f"File not found: {path}")
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for current_line_number, line_text in enumerate(handle, start=1):
+            if current_line_number < line_number:
+                continue
+            stripped = line_text.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if current_line_number != line_number:
+                print(
+                    f"Header line {line_number} in '{path.name}' is metadata/comment; "
+                    f"using first data header line {current_line_number}."
+                )
+            return current_line_number
+    raise ValueError(f"Could not find a non-comment CSV header line in '{path.name}'.")
+
+
+def parse_effective_header_line(path: str | Path, delimiter: str, line_number: int) -> list[str]:
+    metadata = parse_leapfrog_block_metadata(path)
+    log_leapfrog_metadata_summary(path, metadata, context="header scan")
+    return parse_header_line(path, delimiter, resolve_effective_csv_header_line(path, line_number))
+
+
+def _parse_metadata_numeric_values(text: object, numeric_type=float, stop_at_equals: bool = False) -> list[object]:
+    value_text = str(text or "")
+    if stop_at_equals:
+        value_text = value_text.split("=", 1)[0]
+    values = re.findall(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", value_text)
+    return [numeric_type(value) for value in values]
+
+
+def parse_leapfrog_block_metadata(path: str | Path, max_lines: int = 100) -> dict[str, object]:
+    path = Path(path)
+    if not path.is_file():
+        return {}
+
+    metadata: dict[str, object] = {}
+    raw_lines = []
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line_number, line_text in enumerate(handle, start=1):
+            if line_number > max_lines:
+                break
+            stripped = line_text.strip()
+            if not stripped:
+                continue
+            if not stripped.startswith("#"):
+                break
+
+            content = stripped.lstrip("#").strip()
+            raw_lines.append(content)
+            if ":" not in content:
+                if "title" not in metadata and content:
+                    metadata["title"] = content
+                continue
+
+            key, raw_value = content.split(":", 1)
+            normalized_key = re.sub(r"[^a-z0-9]+", "_", key.strip().lower()).strip("_")
+            value = raw_value.strip()
+
+            if normalized_key == "encoding":
+                metadata["encoding"] = value
+            elif normalized_key == "rotation_type":
+                metadata["rotation_type"] = value
+            elif normalized_key in {"azimuth", "dip", "pitch"}:
+                numbers = _parse_metadata_numeric_values(value)
+                if numbers:
+                    metadata[f"{normalized_key}_degrees"] = float(numbers[0])
+            elif normalized_key == "parent_block_size":
+                numbers = _parse_metadata_numeric_values(value)
+                if len(numbers) >= 3:
+                    metadata["parent_block_size"] = [float(number) for number in numbers[:3]]
+            elif normalized_key == "size_in_parent_blocks":
+                numbers = _parse_metadata_numeric_values(value, numeric_type=int, stop_at_equals=True)
+                if len(numbers) >= 3:
+                    metadata["size_in_parent_blocks"] = [int(number) for number in numbers[:3]]
+                total_values = _parse_metadata_numeric_values(value.split("=", 1)[1], numeric_type=int) if "=" in value else []
+                if total_values:
+                    metadata["parent_block_count"] = int(total_values[0])
+            elif normalized_key in {"minimum_parent_centroid", "maximum_parent_centroid", "minimum_corner", "maximum_corner"}:
+                numbers = _parse_metadata_numeric_values(value)
+                if len(numbers) >= 3:
+                    metadata[normalized_key] = [float(number) for number in numbers[:3]]
+            elif normalized_key in {"sub_blocks", "subblocks"}:
+                parts = value.split()
+                if parts:
+                    metadata["subblock_scheme"] = parts[0]
+                numbers = _parse_metadata_numeric_values(value, numeric_type=int)
+                if len(numbers) >= 3:
+                    metadata["subblock_factors"] = [int(number) for number in numbers[:3]]
+
+    if raw_lines:
+        metadata["raw_lines"] = raw_lines
+    return metadata
+
+
+def _format_metadata_vector(metadata: Mapping[str, object], key: str) -> str | None:
+    values = metadata.get(key)
+    if not values:
+        return None
+    return "(" + ", ".join(f"{float(value):g}" for value in values) + ")"
+
+
+def log_leapfrog_metadata_summary(path: str | Path, metadata: Mapping[str, object], context: str = "") -> None:
+    if not metadata:
+        return
+
+    recognized_fields = [
+        key for key in (
+            "rotation_type",
+            "azimuth_degrees",
+            "dip_degrees",
+            "pitch_degrees",
+            "parent_block_size",
+            "size_in_parent_blocks",
+            "minimum_parent_centroid",
+            "maximum_parent_centroid",
+            "minimum_corner",
+            "maximum_corner",
+            "subblock_scheme",
+            "subblock_factors",
+        )
+        if key in metadata
+    ]
+    if not recognized_fields:
+        return
+
+    path = Path(path)
+    signature = (str(path.resolve()), str(context or "default"), tuple(recognized_fields))
+    if signature in _LOGGED_LEAPFROG_METADATA_SIGNATURES:
+        return
+    _LOGGED_LEAPFROG_METADATA_SIGNATURES.add(signature)
+
+    summary_parts = []
+    parent_size = _format_metadata_vector(metadata, "parent_block_size")
+    if parent_size:
+        summary_parts.append(f"parent block size={parent_size}")
+    grid_size = metadata.get("size_in_parent_blocks")
+    if grid_size:
+        summary_parts.append(f"parent grid={tuple(int(value) for value in grid_size)}")
+    min_corner = _format_metadata_vector(metadata, "minimum_corner")
+    if min_corner:
+        summary_parts.append(f"minimum corner={min_corner}")
+    min_centroid = _format_metadata_vector(metadata, "minimum_parent_centroid")
+    if min_centroid:
+        summary_parts.append(f"minimum parent centroid={min_centroid}")
+    if any(key in metadata for key in ("azimuth_degrees", "dip_degrees", "pitch_degrees")):
+        summary_parts.append(
+            "rotation=(azimuth {azimuth:g}, dip {dip:g}, pitch {pitch:g})".format(
+                azimuth=float(metadata.get("azimuth_degrees", 0.0) or 0.0),
+                dip=float(metadata.get("dip_degrees", 0.0) or 0.0),
+                pitch=float(metadata.get("pitch_degrees", 0.0) or 0.0),
+            )
+        )
+    subblock_factors = metadata.get("subblock_factors")
+    if subblock_factors:
+        scheme = metadata.get("subblock_scheme") or "sub-blocks"
+        summary_parts.append(f"{scheme}={tuple(int(value) for value in subblock_factors)}")
+
+    label = f" ({context})" if context else ""
+    print(f"Recognized Leapfrog block metadata{label} in '{path.name}': " + "; ".join(summary_parts))
+
+
+def infer_bmf_export_geometry_from_metadata(
+    metadata: Mapping[str, object],
+    regularize_to_base_block: bool = False,
+    dense_regular_grid: bool = False,
+) -> dict[str, object]:
+    if not metadata:
+        return {}
+
+    parent_block_size = metadata.get("parent_block_size")
+    subblock_factors = metadata.get("subblock_factors")
+    cell_size = None
+    source = ""
+    if (regularize_to_base_block or dense_regular_grid) and parent_block_size:
+        cell_size = [float(value) for value in parent_block_size]
+        source = "parent_block_size"
+    elif parent_block_size and subblock_factors:
+        factors = [int(value) for value in subblock_factors]
+        if len(factors) == 3 and all(value > 0 for value in factors):
+            cell_size = [float(size) / float(factor) for size, factor in zip(parent_block_size, factors)]
+            source = "parent_block_size/subblock_factors"
+    elif parent_block_size:
+        cell_size = [float(value) for value in parent_block_size]
+        source = "parent_block_size"
+
+    if not cell_size or len(cell_size) != 3 or any(value <= 0 for value in cell_size):
+        return {}
+
+    origin = None
+    origin_source = ""
+    if metadata.get("minimum_corner"):
+        origin = [float(value) for value in metadata["minimum_corner"]]
+        origin_source = "minimum_corner"
+    elif metadata.get("minimum_parent_centroid") and parent_block_size:
+        origin = [
+            float(centroid) - 0.5 * float(size)
+            for centroid, size in zip(metadata["minimum_parent_centroid"], parent_block_size)
+        ]
+        origin_source = "minimum_parent_centroid-parent_block_size/2"
+
+    result: dict[str, object] = {
+        "cell_size": cell_size,
+        "cell_size_source": source,
+    }
+    if dense_regular_grid and parent_block_size and subblock_factors and not regularize_to_base_block:
+        result["dense_metadata_note"] = (
+            "Detected sub-block metadata, but dense tbms-config-text/Vulcan output uses the parent block size by default. "
+            "Using the minimum sub-block size would create the full dense sub-cell lattice for the entire model extent."
+        )
+    if origin is not None and len(origin) == 3:
+        result["origin"] = origin
+        result["origin_source"] = origin_source
+    if any(key in metadata for key in ("azimuth_degrees", "dip_degrees", "pitch_degrees", "rotation_type")):
+        result["rotation_metadata_detected"] = True
+        result["rotation_note"] = "Rotation metadata is preserved in the export summary, but this BMF writer emits an axis-aligned grid."
+    return result
 
 
 def _count_csv_data_rows(
@@ -140,48 +520,30 @@ def _auto_read_csv(
     progress_end: int = 30,
 ) -> pd.DataFrame:
     """Read CSV with optional explicit delimiter and header-line selection."""
-    header = max(int(header_line or 1), 1) - 1
+    effective_header_line = resolve_effective_csv_header_line(path, header_line)
+    csv_delimiter = delimiter or detect_csv_delimiter(path)
+    header_names = parse_header_line(path, csv_delimiter, effective_header_line)
+    seen_names: dict[str, int] = {}
+    final_names = []
+    for index, name in enumerate(header_names):
+        base_name = str(name or "").strip() or f"Column_{index + 1}"
+        count = seen_names.get(base_name, 0)
+        seen_names[base_name] = count + 1
+        final_names.append(base_name if count == 0 else f"{base_name}_{count + 1}")
     read_kwargs = {
-        "header": header,
+        "header": None,
+        "names": final_names,
+        "skiprows": effective_header_line,
         "usecols": list(usecols) if usecols else None,
         "dtype": str,
+        "comment": "#",
     }
     total_rows = None
     if progress_callback is not None:
-        total_rows = _count_csv_data_rows(path, header_line, progress_callback, progress_start, min(progress_start + 3, progress_end))
+        total_rows = _count_csv_data_rows(path, effective_header_line, progress_callback, progress_start, min(progress_start + 3, progress_end))
         read_progress_start = min(progress_start + 3, progress_end)
     else:
         read_progress_start = progress_start
-    if delimiter:
-        try:
-            if progress_callback is not None:
-                return _read_csv_with_chunk_progress(
-                    path,
-                    total_rows,
-                    progress_callback=progress_callback,
-                    progress_start=read_progress_start,
-                    progress_end=progress_end,
-                    sep=delimiter,
-                    low_memory=True,
-                    memory_map=True,
-                    **read_kwargs,
-                )
-            return pd.read_csv(path, sep=delimiter, low_memory=True, memory_map=True, **read_kwargs)
-        except (MemoryError, pd.errors.ParserError) as exc:
-            if "out of memory" not in str(exc).lower() and not isinstance(exc, MemoryError):
-                raise
-            if progress_callback is not None:
-                return _read_csv_with_chunk_progress(
-                    path,
-                    total_rows,
-                    progress_callback=progress_callback,
-                    progress_start=read_progress_start,
-                    progress_end=progress_end,
-                    sep=delimiter,
-                    engine="python",
-                    **read_kwargs,
-                )
-            return pd.read_csv(path, sep=delimiter, engine="python", **read_kwargs)
     try:
         if progress_callback is not None:
             return _read_csv_with_chunk_progress(
@@ -190,12 +552,15 @@ def _auto_read_csv(
                 progress_callback=progress_callback,
                 progress_start=read_progress_start,
                 progress_end=progress_end,
-                sep=None,
-                engine="python",
+                sep=csv_delimiter,
+                low_memory=True,
+                memory_map=True,
                 **read_kwargs,
             )
-        return pd.read_csv(path, sep=None, engine="python", **read_kwargs)
-    except Exception:
+        return pd.read_csv(path, sep=csv_delimiter, low_memory=True, memory_map=True, **read_kwargs)
+    except (MemoryError, pd.errors.ParserError) as exc:
+        if "out of memory" not in str(exc).lower() and not isinstance(exc, MemoryError):
+            raise
         if progress_callback is not None:
             return _read_csv_with_chunk_progress(
                 path,
@@ -203,11 +568,11 @@ def _auto_read_csv(
                 progress_callback=progress_callback,
                 progress_start=read_progress_start,
                 progress_end=progress_end,
-                low_memory=True,
-                memory_map=True,
+                sep=csv_delimiter,
+                engine="python",
                 **read_kwargs,
             )
-        return pd.read_csv(path, low_memory=True, memory_map=True, **read_kwargs)
+        return pd.read_csv(path, sep=csv_delimiter, engine="python", **read_kwargs)
 
 
 def _normalize_export_field_type(field_type: object) -> str | None:
@@ -370,6 +735,279 @@ def _infer_cell_size(df: pd.DataFrame, xyz_cols: Sequence[str]) -> np.ndarray:
     return np.asarray(sizes, dtype=float)
 
 
+def _next_power_of_two_multiple(value: float, quantum: float) -> float:
+    value = float(value)
+    quantum = float(quantum)
+    if value <= 0 or quantum <= 0 or not math.isfinite(value) or not math.isfinite(quantum):
+        return float("nan")
+    ratio = max(value / quantum, 1.0)
+    level = int(math.ceil(math.log(ratio, 2))) if ratio > 1.0 else 0
+    return quantum * (2.0 ** level)
+
+
+def _hierarchy_level_for_multiple(value: float, quantum: float, tolerance: float) -> int | None:
+    value = float(value)
+    quantum = float(quantum)
+    if value <= 0 or quantum <= 0 or not math.isfinite(value) or not math.isfinite(quantum):
+        return None
+    ratio = value / quantum
+    if ratio <= 0:
+        return None
+    level = int(round(math.log(ratio, 2)))
+    expected = quantum * (2.0 ** level)
+    if level < 0 or abs(value - expected) > max(float(tolerance), abs(expected) * 1e-6, 1e-9):
+        return None
+    return level
+
+
+def _hierarchy_spacing_masks(values: np.ndarray, quantum: float, tolerance: float) -> tuple[np.ndarray, np.ndarray]:
+    spacings = np.asarray(values, dtype=float)
+    valid_mask = np.asarray([
+        _hierarchy_level_for_multiple(float(value), quantum, tolerance) is not None
+        for value in spacings
+    ], dtype=bool)
+    return spacings[valid_mask], spacings[~valid_mask]
+
+
+def _spacing_histogram(values: np.ndarray, precision: int = 6) -> list[dict[str, object]]:
+    if len(values) == 0:
+        return []
+    rounded = np.round(np.asarray(values, dtype=float), decimals=precision)
+    rounded = rounded[np.isfinite(rounded) & (rounded > 0)]
+    if len(rounded) == 0:
+        return []
+    unique_values, counts = np.unique(rounded, return_counts=True)
+    order = np.argsort(unique_values)
+    return [
+        {"spacing": float(unique_values[index]), "count": int(counts[index])}
+        for index in order
+    ]
+
+
+def _infer_base_size_from_hierarchy_spacing_frequencies(
+    values: np.ndarray,
+    quantum: float,
+    tolerance: float,
+) -> dict[str, object]:
+    levels: List[int] = []
+    for value in np.asarray(values, dtype=float):
+        level = _hierarchy_level_for_multiple(float(value), quantum, tolerance)
+        if level is not None:
+            levels.append(int(level))
+    if not levels:
+        return {"status": "insufficient", "confidence": "none", "frequency_table": []}
+
+    level_counts = {level: int(levels.count(level)) for level in sorted(set(levels))}
+    max_level = max(level_counts)
+    counts = [int(level_counts.get(level, 0)) for level in range(max_level + 1)]
+    frequency_table = [
+        {
+            "level": int(level),
+            "spacing": float(quantum * (2.0 ** level)),
+            "count": int(counts[level]),
+        }
+        for level in range(max_level + 1)
+    ]
+
+    best_candidate: dict[str, object] | None = None
+    for level in range(max_level):
+        current_count = int(counts[level])
+        next_count = int(counts[level + 1])
+        if current_count < 3:
+            continue
+        if next_count <= 0:
+            continue
+        if next_count > current_count * 0.5 or current_count - next_count < 2:
+            continue
+        previous_counts = [count for count in counts[:level + 1] if count > 0]
+        rising_steps = sum(
+            1
+            for left, right in zip(previous_counts, previous_counts[1:])
+            if right >= left
+        )
+        rising_score = rising_steps / max(len(previous_counts) - 1, 1)
+        drop_ratio = next_count / current_count
+        score = (1.0 - drop_ratio) + rising_score + math.log1p(current_count) * 0.05
+        if best_candidate is None or score > float(best_candidate["score"]):
+            best_candidate = {
+                "level": int(level),
+                "size": float(quantum * (2.0 ** level)),
+                "count": current_count,
+                "next_level": int(level + 1),
+                "next_size": float(quantum * (2.0 ** (level + 1))),
+                "next_count": next_count,
+                "drop_ratio": float(drop_ratio),
+                "rising_score": float(rising_score),
+                "score": float(score),
+            }
+
+    if best_candidate is None:
+        return {
+            "status": "ambiguous",
+            "confidence": "none",
+            "frequency_table": frequency_table,
+        }
+
+    confidence = "medium"
+    if (
+        float(best_candidate["drop_ratio"]) <= 0.33
+        and float(best_candidate["rising_score"]) >= 0.75
+        and int(best_candidate["count"]) >= 5
+    ):
+        confidence = "high"
+    return {
+        "status": "inferred",
+        "confidence": confidence,
+        "frequency_table": frequency_table,
+        "candidate_level": int(best_candidate["level"]),
+        "candidate_size": float(best_candidate["size"]),
+        "drop_from_count": int(best_candidate["count"]),
+        "drop_to_level": int(best_candidate["next_level"]),
+        "drop_to_size": float(best_candidate["next_size"]),
+        "drop_to_count": int(best_candidate["next_count"]),
+        "drop_ratio": float(best_candidate["drop_ratio"]),
+        "rising_score": float(best_candidate["rising_score"]),
+    }
+
+
+def _infer_axis_base_block_from_centroids(values: np.ndarray, index_tolerance: float) -> dict[str, object]:
+    finite_values = np.asarray(values, dtype=float)
+    finite_values = finite_values[np.isfinite(finite_values)]
+    unique_values = np.unique(finite_values)
+    if len(unique_values) == 0:
+        return {"status": "empty", "confidence": "none"}
+
+    if len(unique_values) < 2:
+        return {
+            "status": "insufficient_axis_variation",
+            "confidence": "none",
+            "unique_centers": int(len(unique_values)),
+            "min_center": float(unique_values[0]),
+            "max_center": float(unique_values[0]),
+        }
+
+    diffs = np.diff(np.sort(unique_values))
+    diffs = diffs[np.isfinite(diffs) & (diffs > max(float(index_tolerance), 1e-9))]
+    if len(diffs) == 0:
+        return {
+            "status": "insufficient_axis_variation",
+            "confidence": "none",
+            "unique_centers": int(len(unique_values)),
+            "min_center": float(unique_values.min()),
+            "max_center": float(unique_values.max()),
+        }
+
+    rounded_diffs = np.round(diffs, decimals=6)
+    quantum = float(np.min(rounded_diffs[rounded_diffs > 0]))
+    hierarchy_diffs, discarded_diffs = _hierarchy_spacing_masks(rounded_diffs, quantum, index_tolerance)
+    frequency_break = _infer_base_size_from_hierarchy_spacing_frequencies(
+        hierarchy_diffs,
+        quantum,
+        index_tolerance,
+    )
+    observed_span = float(unique_values.max() - unique_values.min() + quantum)
+    enclosing_power_of_two_size = float(_next_power_of_two_multiple(observed_span, quantum))
+    base_size = float(frequency_break.get("candidate_size", quantum)) if frequency_break.get("status") == "inferred" else quantum
+    origin = float(unique_values.min() - 0.5 * quantum)
+    base_level = _hierarchy_level_for_multiple(base_size, quantum, index_tolerance)
+
+    confidence = "low"
+    if frequency_break.get("status") == "inferred":
+        confidence = str(frequency_break.get("confidence", "medium"))
+    elif len(unique_values) >= 4 and len(discarded_diffs) == 0:
+        confidence = "medium"
+
+    return {
+        "status": "ok",
+        "confidence": confidence,
+        "unique_centers": int(len(unique_values)),
+        "quantum": float(quantum),
+        "observed_span": float(observed_span),
+        "base_size": float(base_size),
+        "base_level": None if base_level is None else int(base_level),
+        "parent_base_size_ambiguous": frequency_break.get("status") != "inferred",
+        "base_size_inference": frequency_break,
+        "enclosing_power_of_two_size": float(enclosing_power_of_two_size),
+        "origin": float(origin),
+        "min_center": float(unique_values.min()),
+        "max_center": float(unique_values.max()),
+        "spacing_histogram": _spacing_histogram(diffs),
+        "hierarchy_spacing_histogram": _spacing_histogram(hierarchy_diffs),
+        "discarded_spacing_histogram": _spacing_histogram(discarded_diffs),
+    }
+
+
+def infer_base_block_size_from_centroid_statistics(
+    df: pd.DataFrame,
+    xyz_cols: Sequence[str],
+    index_tolerance: float = 1e-3,
+) -> dict[str, object]:
+    clean = _to_numeric_xyz(df, xyz_cols)
+    if clean.empty:
+        return {"status": "empty", "confidence": "none", "axes": {}}
+
+    axis_names = ("x", "y", "z")
+    axes: dict[str, object] = {}
+    cell_size = np.full(3, np.nan, dtype=float)
+    origin = np.full(3, np.nan, dtype=float)
+
+    for axis, (axis_name, coord_col) in enumerate(zip(axis_names, xyz_cols)):
+        axis_report = _infer_axis_base_block_from_centroids(
+            pd.to_numeric(clean[coord_col], errors="coerce").to_numpy(dtype=float),
+            index_tolerance,
+        )
+        axes[axis_name] = axis_report
+        if axis_report.get("status") == "ok":
+            cell_size[axis] = float(axis_report["base_size"])
+            origin[axis] = float(axis_report["origin"])
+
+    good_axes = np.isfinite(cell_size) & (cell_size > 0)
+    if not np.any(good_axes):
+        return {"status": "insufficient_axis_variation", "confidence": "none", "axes": axes}
+
+    peer_size = float(np.median(cell_size[good_axes]))
+    for axis, axis_name in enumerate(axis_names):
+        if good_axes[axis]:
+            continue
+        values = pd.to_numeric(clean[xyz_cols[axis]], errors="coerce").dropna().to_numpy(dtype=float)
+        if len(values) == 0:
+            continue
+        cell_size[axis] = peer_size
+        origin[axis] = float(np.min(values) - 0.5 * peer_size)
+        axis_report = dict(axes.get(axis_name, {}))
+        axis_report.update({
+            "status": "filled_from_peer_axes",
+            "confidence": "low",
+            "base_size": float(peer_size),
+            "origin": float(origin[axis]),
+        })
+        axes[axis_name] = axis_report
+
+    complete = bool(np.all(np.isfinite(cell_size) & (cell_size > 0) & np.isfinite(origin)))
+    axis_confidences = [str(report.get("confidence", "none")) for report in axes.values() if isinstance(report, Mapping)]
+    if not complete:
+        confidence = "none"
+        status = "partial"
+    elif any(value == "low" for value in axis_confidences):
+        confidence = "low"
+        status = "ok"
+    elif any(value == "medium" for value in axis_confidences):
+        confidence = "medium"
+        status = "ok"
+    else:
+        confidence = "high"
+        status = "ok"
+
+    return {
+        "status": status,
+        "confidence": confidence,
+        "cell_size": [float(value) for value in cell_size] if complete else None,
+        "origin": [float(value) for value in origin] if complete else None,
+        "source": "centroid_spacing_statistics",
+        "axes": axes,
+    }
+
+
 def _format_numeric_vector(values: Sequence[float] | np.ndarray, precision: int = 6) -> str:
     formatted = []
     for value in np.asarray(values, dtype=float):
@@ -379,6 +1017,143 @@ def _format_numeric_vector(values: Sequence[float] | np.ndarray, precision: int 
         text = f"{float(value):.{precision}f}".rstrip("0").rstrip(".")
         formatted.append(text or "0")
     return "[" + ", ".join(formatted) + "]"
+
+
+def _summarize_statistical_base_size_inference(statistical_base_geometry: Mapping[str, object]) -> dict[str, object]:
+    axes = statistical_base_geometry.get("axes") if isinstance(statistical_base_geometry, Mapping) else None
+    if not isinstance(axes, Mapping):
+        return {"source": "none", "message": "No centroid-spacing block-size statistics were available."}
+
+    inferred_axes = []
+    ambiguous_axes = []
+    axis_details = {}
+    for axis_name, raw_report in axes.items():
+        if not isinstance(raw_report, Mapping):
+            continue
+        inference = raw_report.get("base_size_inference")
+        inference_status = inference.get("status") if isinstance(inference, Mapping) else None
+        detail = {
+            "status": raw_report.get("status"),
+            "quantum": raw_report.get("quantum"),
+            "base_size": raw_report.get("base_size"),
+            "base_level": raw_report.get("base_level"),
+            "parent_base_size_ambiguous": bool(raw_report.get("parent_base_size_ambiguous", False)),
+            "inference_status": inference_status,
+        }
+        if isinstance(inference, Mapping):
+            detail.update({
+                "candidate_size": inference.get("candidate_size"),
+                "drop_to_size": inference.get("drop_to_size"),
+                "drop_from_count": inference.get("drop_from_count"),
+                "drop_to_count": inference.get("drop_to_count"),
+                "drop_ratio": inference.get("drop_ratio"),
+            })
+        axis_details[str(axis_name)] = detail
+        if inference_status == "inferred":
+            inferred_axes.append(str(axis_name).upper())
+        if raw_report.get("parent_base_size_ambiguous", False):
+            ambiguous_axes.append(str(axis_name).upper())
+
+    if inferred_axes:
+        source = "centroid_spacing_frequency_break"
+        message = (
+            "Base block size inferred from hierarchy-valid centroid spacing frequencies; "
+            f"frequency break detected on axis/axes {', '.join(inferred_axes)}."
+        )
+    elif ambiguous_axes:
+        source = "centroid_spacing_quantum_fallback"
+        message = (
+            "Base block size remains ambiguous from centroid spacing statistics; "
+            "using the smallest hierarchy quantum as a conservative fallback."
+        )
+    else:
+        source = "centroid_spacing_statistics"
+        message = "Base block size inferred from centroid spacing statistics."
+    return {
+        "source": source,
+        "message": message,
+        "axis_details": axis_details,
+        "inferred_axes": inferred_axes,
+        "ambiguous_axes": ambiguous_axes,
+    }
+
+
+def _build_block_size_determination_report(
+    prepared: Mapping[str, object],
+    metadata_geometry: Mapping[str, object],
+    statistical_base_geometry: Mapping[str, object],
+    user_cell_size_provided: bool,
+    user_origin_provided: bool,
+    use_grid_index_columns: bool,
+    regularize_to_base_block: bool,
+) -> dict[str, object]:
+    cell_size = [float(x) for x in np.asarray(prepared["cell"], dtype=float)]
+    origin = [float(x) for x in np.asarray(prepared["origin"], dtype=float)]
+    index_source = str(prepared.get("grid_index_source") or "xyz")
+    width_source = prepared.get("irregular_width_source")
+    statistical_source = prepared.get("statistical_base_block_source")
+
+    if width_source in {"lower_upper_columns", "mapped_lower_upper_columns"}:
+        source = "csv_lower_upper_extent_columns"
+        method = "explicit_row_extents"
+        message = "Block row sizes read directly from CSV lower/upper extent columns."
+        if width_source == "mapped_lower_upper_columns":
+            source = "mapped_csv_lower_upper_extent_columns"
+            message = "Block row sizes read directly from user-mapped CSV lower/upper extent columns."
+    elif width_source == "dimension_columns":
+        source = "csv_dimension_columns"
+        method = "explicit_dimension_columns"
+        message = "Block row sizes read directly from CSV dimension columns and converted to lower/upper extents."
+    elif user_cell_size_provided:
+        source = "user_cell_size"
+        method = "manual_parent_size"
+        message = "Parent/base block size supplied by the user; centroid hierarchy inference used only for missing row extents."
+    elif metadata_geometry.get("cell_size"):
+        source = str(metadata_geometry.get("cell_size_source") or "csv_metadata")
+        method = "metadata_parent_size"
+        message = f"Parent/base block size read from CSV metadata ({source})."
+    elif use_grid_index_columns:
+        source = "grid_index_columns"
+        method = "grid_index_geometry"
+        message = "Block geometry derived from CSV grid_i/grid_j/grid_k columns."
+    elif statistical_source:
+        statistical_report = _summarize_statistical_base_size_inference(statistical_base_geometry)
+        source = str(statistical_report.get("source"))
+        method = "statistical_centroid_spacing"
+        message = str(statistical_report.get("message"))
+    elif regularize_to_base_block:
+        source = "regularized_xyz_grid"
+        method = "regularized_grid"
+        message = "Rows regularized to a base-cell grid before BMF export."
+    elif not prepared.get("is_irregular"):
+        source = "xyz_regular_grid"
+        method = "regular_grid_from_xyz"
+        message = "Regular grid block size inferred from XYZ coordinate spacing."
+    else:
+        source = index_source
+        method = "centroid_hierarchy_inference"
+        message = "Row extents inferred from centroid hierarchy using the selected parent/base block size."
+
+    report = {
+        "method": method,
+        "source": source,
+        "message": message,
+        "cell_size": cell_size,
+        "origin": origin,
+        "index_source": index_source,
+        "irregular_width_source": width_source,
+        "user_cell_size_provided": bool(user_cell_size_provided),
+        "user_origin_provided": bool(user_origin_provided),
+        "metadata_cell_size_source": metadata_geometry.get("cell_size_source"),
+        "metadata_origin_source": metadata_geometry.get("origin_source"),
+    }
+    geometry_mapping = prepared.get("geometry_column_mapping")
+    if geometry_mapping:
+        report["geometry_column_mapping"] = geometry_mapping
+    if statistical_source:
+        report["statistical_base_block_source"] = statistical_source
+        report["statistical_inference"] = _summarize_statistical_base_size_inference(statistical_base_geometry)
+    return report
 
 
 def _build_grid_alignment_error_message(
@@ -427,6 +1202,43 @@ def _build_grid_alignment_error_message(
             f" Inferred cell_size={_format_numeric_vector(cell)}. Set explicit Cell Size X/Y/Z if these coordinates "
             "represent a known regular grid."
         )
+    return message
+
+def _build_centroid_hierarchy_error_message(
+    error: Exception,
+    df: pd.DataFrame,
+    xyz_cols: Sequence[str],
+    parent_size: Sequence[float] | np.ndarray,
+) -> str:
+    message = str(error)
+    try:
+        clean = _to_numeric_xyz(df, xyz_cols)
+        inferred_cell = _infer_cell_size(clean, xyz_cols)
+        parent_arr = np.asarray(parent_size, dtype=float)
+        ratios = np.divide(
+            parent_arr,
+            inferred_cell,
+            out=np.full_like(parent_arr, np.nan, dtype=float),
+            where=inferred_cell > 0,
+        )
+        message += (
+            f" Explicit parent cell_size={_format_numeric_vector(parent_arr)}; smallest CSV coordinate/centroid increment is "
+            f"{_format_numeric_vector(inferred_cell)}; ratio={_format_numeric_vector(ratios, precision=3)}."
+        )
+        coarse_axes = [
+            str(axis_name)
+            for axis_name, ratio in zip(xyz_cols, ratios)
+            if math.isfinite(float(ratio)) and ratio > 1.001
+        ]
+        if coarse_axes:
+            message += (
+                " The selected parent block size is coarser than the actual coordinate spacing on "
+                f"axis/axes {coarse_axes}, so the CSV appears to contain sub-block rows rather than one row per "
+                "parent block. The row extents must form a parent_size, parent_size/2, parent_size/4, ... hierarchy; "
+                "otherwise aggregate or regularize the CSV to one row per exported cell first."
+            )
+    except Exception:
+        pass
     return message
 
 
@@ -506,6 +1318,491 @@ def _prepare_grid(
         "extents": extents,
         "duplicates": dup_count,
         "max_index_error": max_err,
+    }
+
+
+def _infer_cell_size_from_grid_indices(clean: pd.DataFrame, xyz_cols: Sequence[str], idx: np.ndarray) -> np.ndarray:
+    cell = np.full(3, np.nan, dtype=float)
+    for axis, coord_col in enumerate(xyz_cols):
+        pairs = pd.DataFrame({
+            "grid_index": idx[:, axis],
+            "coord": clean[coord_col].to_numpy(dtype=float),
+        })
+        grouped = pairs.groupby("grid_index", sort=True)["coord"].median()
+        if len(grouped) >= 2:
+            index_delta = np.diff(grouped.index.to_numpy(dtype=float))
+            coord_delta = np.diff(grouped.to_numpy(dtype=float))
+            valid = index_delta != 0
+            ratios = coord_delta[valid] / index_delta[valid]
+            ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
+            if len(ratios):
+                cell[axis] = float(np.median(ratios))
+    missing = ~np.isfinite(cell) | (cell <= 0)
+    if np.any(missing):
+        inferred = _infer_cell_size(clean, xyz_cols)
+        cell[missing] = inferred[missing]
+    if np.any(~np.isfinite(cell)) or np.any(cell <= 0):
+        raise ValueError(
+            "Could not infer valid BMF cell size from grid_i/grid_j/grid_k and XYZ columns. "
+            "Set explicit Cell Size X/Y/Z values."
+        )
+    return cell
+
+
+def _prepare_grid_from_index_columns(
+    df: pd.DataFrame,
+    xyz_cols: Sequence[str],
+    cell_size: Sequence[float] | None,
+    origin: Sequence[float] | None,
+) -> Dict[str, object]:
+    required_cols = [*xyz_cols, *GRID_INDEX_COLUMNS]
+    clean = df.copy()
+    for col in required_cols:
+        clean[col] = pd.to_numeric(clean[col], errors="coerce")
+    clean = clean.dropna(subset=required_cols)
+    if clean.empty:
+        raise ValueError("No valid XYZ/grid_i/grid_j/grid_k rows found after numeric conversion.")
+
+    raw_idx = clean[list(GRID_INDEX_COLUMNS)].to_numpy(dtype=float)
+    rounded = np.rint(raw_idx)
+    max_index_error = float(np.max(np.abs(raw_idx - rounded)))
+    if max_index_error > 1e-6:
+        raise ValueError(
+            "CSV grid_i/grid_j/grid_k columns must contain integer grid indices. "
+            f"Maximum index error from an integer is {max_index_error:g}."
+        )
+    idx = rounded.astype(np.int64)
+
+    if cell_size is None:
+        cell = _infer_cell_size_from_grid_indices(clean, xyz_cols, idx)
+    else:
+        cell = np.asarray(cell_size, dtype=float)
+    if cell.shape != (3,) or np.any(cell <= 0):
+        raise ValueError(f"Invalid cell size values: {cell_size}")
+
+    if origin is None:
+        xyz = clean[list(xyz_cols)].to_numpy(dtype=float)
+        origin_candidates = xyz - (idx.astype(float) + 0.5) * cell
+        origin_arr = np.median(origin_candidates, axis=0)
+    else:
+        origin_arr = np.asarray(origin, dtype=float)
+    if origin_arr.shape != (3,):
+        raise ValueError(f"Invalid origin values: {origin}")
+
+    if np.any(idx < 0):
+        shift = idx.min(axis=0)
+        idx = idx - shift
+        origin_arr = origin_arr + shift * cell
+
+    dims = idx.max(axis=0) + 1
+    extents = dims * cell
+    grid_tuples = [tuple(map(int, row)) for row in idx]
+    dup_count = int(len(grid_tuples) - len(set(grid_tuples)))
+
+    return {
+        "df": clean,
+        "idx": idx,
+        "grid_tuples": grid_tuples,
+        "origin": origin_arr,
+        "cell": cell,
+        "dims": dims.astype(int),
+        "extents": extents,
+        "duplicates": dup_count,
+        "max_index_error": max_index_error,
+        "grid_index_source": "grid_i/grid_j/grid_k",
+    }
+
+
+def _cluster_axis_centers(values: np.ndarray, tolerance: float) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    if len(values) == 0:
+        return np.empty(0, dtype=float)
+    sorted_values = np.sort(values)
+    groups: List[List[float]] = [[float(sorted_values[0])]]
+    for value in sorted_values[1:]:
+        current = float(value)
+        if abs(current - groups[-1][-1]) <= tolerance:
+            groups[-1].append(current)
+        else:
+            groups.append([current])
+    return np.asarray([float(np.mean(group)) for group in groups], dtype=float)
+
+
+def _infer_irregular_axis_widths(local_values: np.ndarray, parent_extent: float, tolerance: float) -> np.ndarray:
+    parent_extent = float(parent_extent)
+    local_values = np.asarray(local_values, dtype=float)
+    if len(local_values) == 0:
+        return np.empty(0, dtype=float)
+    if parent_extent <= 0 or not math.isfinite(parent_extent):
+        raise ValueError("Parent block extent must be a finite positive value for irregular width inference.")
+
+    hierarchy_widths: List[float] = []
+    width = parent_extent
+    min_width = max(float(tolerance) * 4.0, abs(parent_extent) * 1e-9, 1e-12)
+    for _ in range(24):
+        hierarchy_widths.append(float(width))
+        width *= 0.5
+        if width < min_width:
+            break
+
+    inferred = np.empty(len(local_values), dtype=float)
+    for row_index, center_value in enumerate(local_values):
+        center = float(center_value)
+        selected_width = None
+        for candidate_width in hierarchy_widths:
+            axis_tolerance = max(float(tolerance), abs(candidate_width) * 1e-6, 1e-9)
+            lower = center - 0.5 * candidate_width
+            upper = center + 0.5 * candidate_width
+            if lower < -axis_tolerance or upper > parent_extent + axis_tolerance:
+                continue
+            lattice_position = (center / candidate_width) - 0.5
+            if abs(lattice_position - round(lattice_position)) <= axis_tolerance / max(candidate_width, 1e-12):
+                selected_width = candidate_width
+                break
+        if selected_width is None:
+            raise ValueError(
+                "Could not infer a hierarchical block width from centroid-only coordinates. "
+                "Valid inferred widths must be parent_size, parent_size/2, parent_size/4, ... along each axis."
+            )
+        inferred[row_index] = selected_width
+    return inferred
+
+
+def _hierarchy_level(value: float, quantum: float, tolerance: float) -> int | None:
+    return _hierarchy_level_for_multiple(value, quantum, tolerance)
+
+
+def _format_hierarchy_size(value: float) -> str:
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        return str(numeric)
+    text = f"{numeric:.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _build_irregular_hierarchy_report(
+    prepared: Mapping[str, object],
+    xyz_cols: Sequence[str],
+    index_tolerance: float,
+) -> Dict[str, object] | None:
+    if not prepared.get("is_irregular") or prepared.get("irregular_widths") is None:
+        return None
+
+    df = prepared.get("df")
+    if not isinstance(df, pd.DataFrame):
+        return None
+
+    widths = np.asarray(prepared["irregular_widths"], dtype=float)
+    parent_size = np.asarray(prepared["cell"], dtype=float)
+    coords = df[list(xyz_cols)].to_numpy(dtype=float)
+    if widths.ndim != 2 or widths.shape[1] != 3 or parent_size.shape != (3,):
+        return None
+
+    axis_reports: Dict[str, object] = {}
+    for axis, axis_name in enumerate(("x", "y", "z")):
+        axis_widths = widths[:, axis]
+        finite_widths = axis_widths[np.isfinite(axis_widths) & (axis_widths > 0)]
+        if len(finite_widths) == 0:
+            continue
+
+        quantum = float(np.min(finite_widths))
+        base = float(parent_size[axis])
+        base_level = _hierarchy_level(base, quantum, index_tolerance)
+        if base_level is None:
+            base_level = max(_hierarchy_level(value, quantum, index_tolerance) or 0 for value in finite_widths)
+
+        row_counts: Counter[int] = Counter()
+        for value in finite_widths:
+            level = _hierarchy_level(float(value), quantum, index_tolerance)
+            if level is not None:
+                row_counts[level] += 1
+
+        spacing_counts: Counter[int] = Counter()
+        unique_coords = np.unique(coords[np.isfinite(coords[:, axis]), axis])
+        diffs = np.diff(np.sort(unique_coords)) if len(unique_coords) >= 2 else np.empty(0, dtype=float)
+        diffs = diffs[np.isfinite(diffs) & (diffs > max(float(index_tolerance), 1e-9))]
+        for value in diffs:
+            level = _hierarchy_level(float(value), quantum, index_tolerance)
+            if level is not None:
+                spacing_counts[level] += 1
+
+        max_level = max([int(base_level), *(row_counts.keys() or [0]), *(spacing_counts.keys() or [0])])
+        rows = []
+        max_row_count = max(row_counts.values(), default=0)
+        max_spacing_count = max(spacing_counts.values(), default=0)
+        for level in range(max_level + 1):
+            size = quantum * (2.0 ** level)
+            row_count = int(row_counts.get(level, 0))
+            spacing_count = int(spacing_counts.get(level, 0))
+            row_bar = "#" * int(round((row_count / max_row_count) * 24)) if max_row_count else ""
+            spacing_bar = "#" * int(round((spacing_count / max_spacing_count) * 24)) if max_spacing_count else ""
+            marker = "base" if level == int(base_level) else ("sub" if level < int(base_level) else "gap")
+            rows.append({
+                "level": int(level),
+                "size": float(size),
+                "multiple": int(2 ** level),
+                "role": marker,
+                "row_count": row_count,
+                "spacing_count": spacing_count,
+                "row_histogram": row_bar,
+                "spacing_histogram": spacing_bar,
+            })
+
+        axis_reports[axis_name] = {
+            "quantum": float(quantum),
+            "base": float(base),
+            "base_level": int(base_level),
+            "levels": rows,
+        }
+
+    return {
+        "source": prepared.get("irregular_width_source"),
+        "axes": axis_reports,
+    }
+
+
+def _format_irregular_hierarchy_report(report: Mapping[str, object] | None) -> str:
+    if not report:
+        return ""
+    axes = report.get("axes")
+    if not isinstance(axes, Mapping) or not axes:
+        return ""
+    lines = ["Inferred irregular block hierarchy:"]
+    for axis_name in ("x", "y", "z"):
+        axis_report = axes.get(axis_name)
+        if not isinstance(axis_report, Mapping):
+            continue
+        quantum = _format_hierarchy_size(float(axis_report.get("quantum", float("nan"))))
+        base = _format_hierarchy_size(float(axis_report.get("base", float("nan"))))
+        lines.append(f"  Axis {axis_name.upper()}: quantum={quantum}, base={base}")
+        levels = axis_report.get("levels", [])
+        if not isinstance(levels, list):
+            continue
+        for row in levels:
+            if not isinstance(row, Mapping):
+                continue
+            size = _format_hierarchy_size(float(row.get("size", 0.0)))
+            role = str(row.get("role", ""))
+            row_count = int(row.get("row_count", 0))
+            spacing_count = int(row.get("spacing_count", 0))
+            row_bar = str(row.get("row_histogram", ""))
+            spacing_bar = str(row.get("spacing_histogram", ""))
+            lines.append(
+                f"    {size:>10} ({role:>4}) rows={row_count:>8} {row_bar} | spacings={spacing_count:>8} {spacing_bar}"
+            )
+    return "\n".join(lines)
+
+
+def _prepare_irregular_blocks(
+    df: pd.DataFrame,
+    xyz_cols: Sequence[str],
+    metadata: Mapping[str, object],
+    cell_size: Sequence[float] | None,
+    origin: Sequence[float] | None,
+    index_tolerance: float,
+    geometry_size_cols: Mapping[str, str] | None = None,
+    geometry_extent_cols: Mapping[str, str] | None = None,
+) -> Dict[str, object]:
+    clean = _to_numeric_xyz(df, xyz_cols)
+    if clean.empty:
+        raise ValueError("No valid XYZ rows found after numeric conversion.")
+
+    extent_col_map = dict(geometry_extent_cols or {})
+    if not extent_col_map and all(column in clean.columns for column in GEOMETRY_EXTENT_COLUMNS):
+        extent_col_map = dict(zip(GEOMETRY_EXTENT_COLUMNS, GEOMETRY_EXTENT_COLUMNS))
+    has_extent_columns = all(extent_col_map.get(role) in clean.columns for role in GEOMETRY_EXTENT_COLUMNS)
+    if has_extent_columns:
+        extent_source_cols = [extent_col_map[role] for role in GEOMETRY_EXTENT_COLUMNS]
+        extent_values = clean[extent_source_cols].apply(pd.to_numeric, errors="coerce")
+        valid_extents = extent_values.notna().all(axis=1)
+        clean = clean.loc[valid_extents].reset_index(drop=True)
+        extent_values = extent_values.loc[valid_extents].reset_index(drop=True)
+        if clean.empty:
+            raise ValueError("No valid irregular lower/upper extent rows found in CSV.")
+        lower = extent_values[[extent_col_map["__lower_x"], extent_col_map["__lower_y"], extent_col_map["__lower_z"]]].to_numpy(dtype=float)
+        upper = extent_values[[extent_col_map["__upper_x"], extent_col_map["__upper_y"], extent_col_map["__upper_z"]]].to_numpy(dtype=float)
+        widths = upper - lower
+        xyz = (lower + upper) * 0.5
+        for axis, col in enumerate(xyz_cols):
+            clean[col] = xyz[:, axis]
+        if np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper)) or np.any(widths <= 0):
+            raise ValueError("Invalid irregular lower/upper extents in CSV.")
+
+        parent_size_source = metadata.get("parent_block_size") or cell_size
+        if parent_size_source is not None:
+            parent_size = np.asarray(parent_size_source, dtype=float)
+        else:
+            parent_size = np.nanmax(widths, axis=0)
+        if parent_size.shape != (3,) or np.any(parent_size <= 0) or np.any(~np.isfinite(parent_size)):
+            raise ValueError(f"Invalid parent block size for irregular export: {parent_size_source}")
+        if origin is not None:
+            origin_arr = np.asarray(origin, dtype=float)
+        elif metadata.get("minimum_corner") is not None:
+            origin_arr = np.asarray(metadata["minimum_corner"], dtype=float)
+        else:
+            origin_arr = np.nanmin(lower, axis=0)
+        if origin_arr.shape != (3,):
+            raise ValueError(f"Invalid origin values for irregular export: {origin_arr}")
+        parent_idx = np.floor((xyz - origin_arr) / parent_size + float(index_tolerance)).astype(np.int64)
+        if metadata.get("size_in_parent_blocks") is not None:
+            dims = np.asarray(metadata["size_in_parent_blocks"], dtype=np.int64)
+        elif len(parent_idx):
+            dims = np.maximum(parent_idx.max(axis=0) + 1, 1)
+        else:
+            dims = np.ones(3, dtype=np.int64)
+        extents = np.maximum(np.nanmax(upper, axis=0) - origin_arr, dims * parent_size)
+        canonical_extent_source = all(extent_col_map[role] == role for role in GEOMETRY_EXTENT_COLUMNS)
+        clean = clean.drop(columns=[col for col in set(extent_source_cols) if col in clean.columns and col not in xyz_cols], errors="ignore")
+        return {
+            "df": clean.reset_index(drop=True),
+            "idx": parent_idx,
+            "grid_tuples": [tuple(map(int, row)) for row in parent_idx],
+            "origin": origin_arr,
+            "cell": parent_size,
+            "dims": dims.astype(int),
+            "extents": extents,
+            "duplicates": 0,
+            "max_index_error": 0.0,
+            "is_irregular": True,
+            "irregular_lower": lower,
+            "irregular_upper": upper,
+            "irregular_widths": widths,
+            "irregular_width_source": "lower_upper_columns" if canonical_extent_source else "mapped_lower_upper_columns",
+            "geometry_column_mapping": {"extent_cols": dict(extent_col_map)},
+            "grid_index_source": "irregular_lower_upper_columns" if canonical_extent_source else "irregular_mapped_lower_upper_columns",
+        }
+
+    size_col_map = dict(geometry_size_cols or {})
+    has_size_columns = all(size_col_map.get(role) in clean.columns for role in GEOMETRY_SIZE_COLUMN_ROLES)
+    if has_size_columns:
+        size_source_cols = [size_col_map[role] for role in GEOMETRY_SIZE_COLUMN_ROLES]
+        size_values = clean[size_source_cols].apply(pd.to_numeric, errors="coerce")
+        valid_sizes = size_values.notna().all(axis=1)
+        clean = clean.loc[valid_sizes].reset_index(drop=True)
+        size_values = size_values.loc[valid_sizes].reset_index(drop=True)
+        if clean.empty:
+            raise ValueError("No valid irregular dimension rows found in CSV.")
+        widths = size_values[size_source_cols].to_numpy(dtype=float)
+        xyz = clean[list(xyz_cols)].to_numpy(dtype=float)
+        lower = xyz - 0.5 * widths
+        upper = xyz + 0.5 * widths
+        if np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper)) or np.any(widths <= 0):
+            raise ValueError("Invalid irregular dimension columns in CSV.")
+
+        parent_size_source = metadata.get("parent_block_size") or cell_size
+        if parent_size_source is not None:
+            parent_size = np.asarray(parent_size_source, dtype=float)
+        else:
+            parent_size = np.nanmax(widths, axis=0)
+        if parent_size.shape != (3,) or np.any(parent_size <= 0) or np.any(~np.isfinite(parent_size)):
+            raise ValueError(f"Invalid parent block size for irregular export: {parent_size_source}")
+        if origin is not None:
+            origin_arr = np.asarray(origin, dtype=float)
+        elif metadata.get("minimum_corner") is not None:
+            origin_arr = np.asarray(metadata["minimum_corner"], dtype=float)
+        else:
+            origin_arr = np.nanmin(lower, axis=0)
+        if origin_arr.shape != (3,):
+            raise ValueError(f"Invalid origin values for irregular export: {origin_arr}")
+        parent_idx = np.floor((xyz - origin_arr) / parent_size + float(index_tolerance)).astype(np.int64)
+        if metadata.get("size_in_parent_blocks") is not None:
+            dims = np.asarray(metadata["size_in_parent_blocks"], dtype=np.int64)
+        elif len(parent_idx):
+            dims = np.maximum(parent_idx.max(axis=0) + 1, 1)
+        else:
+            dims = np.ones(3, dtype=np.int64)
+        extents = np.maximum(np.nanmax(upper, axis=0) - origin_arr, dims * parent_size)
+        clean = clean.drop(columns=[col for col in set(size_source_cols) if col in clean.columns and col not in xyz_cols], errors="ignore")
+        return {
+            "df": clean.reset_index(drop=True),
+            "idx": parent_idx,
+            "grid_tuples": [tuple(map(int, row)) for row in parent_idx],
+            "origin": origin_arr,
+            "cell": parent_size,
+            "dims": dims.astype(int),
+            "extents": extents,
+            "duplicates": 0,
+            "max_index_error": 0.0,
+            "is_irregular": True,
+            "irregular_lower": lower,
+            "irregular_upper": upper,
+            "irregular_widths": widths,
+            "irregular_width_source": "dimension_columns",
+            "geometry_column_mapping": {"size_cols": dict(size_col_map)},
+            "grid_index_source": "irregular_dimension_columns",
+        }
+
+    parent_size_source = metadata.get("parent_block_size") or cell_size
+    if parent_size_source is None:
+        raise ValueError("Irregular tbms-config-text export requires parent block size metadata or explicit Cell Size X/Y/Z.")
+    parent_size = np.asarray(parent_size_source, dtype=float)
+    if parent_size.shape != (3,) or np.any(parent_size <= 0):
+        raise ValueError(f"Invalid parent block size for irregular export: {parent_size_source}")
+
+    if origin is not None:
+        origin_arr = np.asarray(origin, dtype=float)
+    elif metadata.get("minimum_corner") is not None:
+        origin_arr = np.asarray(metadata["minimum_corner"], dtype=float)
+    elif metadata.get("minimum_parent_centroid") is not None:
+        origin_arr = np.asarray(metadata["minimum_parent_centroid"], dtype=float) - 0.5 * parent_size
+    else:
+        xyz_min = clean[list(xyz_cols)].to_numpy(dtype=float).min(axis=0)
+        origin_arr = np.floor(xyz_min / parent_size) * parent_size
+    if origin_arr.shape != (3,):
+        raise ValueError(f"Invalid origin values for irregular export: {origin_arr}")
+
+    xyz = clean[list(xyz_cols)].to_numpy(dtype=float)
+    raw_parent_idx = (xyz - origin_arr) / parent_size
+    parent_idx = np.floor(raw_parent_idx + index_tolerance).astype(np.int64)
+    local = xyz - (origin_arr + parent_idx.astype(float) * parent_size)
+    local = np.clip(local, 0.0, parent_size)
+
+    widths = np.empty_like(xyz, dtype=float)
+    parent_keys, inverse = np.unique(parent_idx, axis=0, return_inverse=True)
+    axis_tolerance = max(float(index_tolerance), 1e-9)
+    for group_index in range(len(parent_keys)):
+        group_positions = np.flatnonzero(inverse == group_index)
+        group_local = local[group_positions]
+        for axis in range(3):
+            widths[group_positions, axis] = _infer_irregular_axis_widths(
+                group_local[:, axis],
+                float(parent_size[axis]),
+                axis_tolerance,
+            )
+
+    lower = xyz - 0.5 * widths
+    upper = xyz + 0.5 * widths
+    if np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper)) or np.any(widths <= 0):
+        raise ValueError("Could not infer valid irregular block extents from CSV coordinates.")
+
+    if metadata.get("size_in_parent_blocks") is not None:
+        dims = np.asarray(metadata["size_in_parent_blocks"], dtype=np.int64)
+    elif len(parent_idx):
+        dims = parent_idx.max(axis=0) + 1
+    else:
+        dims = np.ones(3, dtype=np.int64)
+    dims = np.maximum(dims.astype(np.int64), 1)
+    extents = dims * parent_size
+    grid_tuples = [tuple(map(int, row)) for row in parent_idx]
+    width_source = "centroid_hierarchy_inference"
+    grid_index_source = "irregular_xyz_metadata_parent" if _metadata_supports_tbms_irregular(metadata) else "irregular_xyz_hierarchy_inference"
+
+    return {
+        "df": clean.reset_index(drop=True),
+        "idx": parent_idx,
+        "grid_tuples": grid_tuples,
+        "origin": origin_arr,
+        "cell": parent_size,
+        "dims": dims.astype(int),
+        "extents": extents,
+        "duplicates": 0,
+        "max_index_error": 0.0,
+        "is_irregular": True,
+        "irregular_lower": lower,
+        "irregular_upper": upper,
+        "irregular_widths": widths,
+        "irregular_width_source": width_source,
+        "grid_index_source": grid_index_source,
     }
 
 
@@ -616,12 +1913,13 @@ def _regularize_to_base_cell_grid(
 
 
 def _classify_columns(df: pd.DataFrame, xyz_cols: Sequence[str], value_cols: Sequence[str] | None) -> List[str]:
+    geometry_cols = set(GRID_INDEX_COLUMNS) | set(GEOMETRY_EXTENT_COLUMNS)
     if value_cols:
-        cols = [c for c in value_cols if c in df.columns and c not in xyz_cols]
+        cols = [c for c in value_cols if c in df.columns and c not in xyz_cols and c not in geometry_cols]
         if not cols:
             raise ValueError("No valid value columns were provided.")
         return cols
-    return [c for c in df.columns if c not in xyz_cols]
+    return [c for c in df.columns if c not in xyz_cols and c not in geometry_cols]
 
 
 def _to_builtin(value):
@@ -706,23 +2004,33 @@ def _tbms_dense_field_values(
     series: pd.Series,
     default_value: object,
     dtype: np.dtype,
-) -> np.ndarray:
+) -> Dict[str, object]:
     dims = np.asarray(prepared["dims"], dtype=np.int64)
     row_count = int(np.prod(dims, dtype=np.int64))
-    required_bytes = row_count * np.dtype(dtype).itemsize
-    if required_bytes > MAX_DENSE_EXPORT_BYTES:
-        cell = np.asarray(prepared.get("cell", [1.0, 1.0, 1.0]), dtype=float)
-        raise MemoryError(
-            "BMF export would require a dense grid that is too large for this writer: "
-            f"dimensions={tuple(int(value) for value in dims)}, cells={row_count:,}, "
-            f"field_size={_format_byte_size(required_bytes)}, cell_size={cell.tolist()}. "
-            "This usually means the inferred cell size is too small for the CSV coordinates, or the CSV contains "
-            "irregular/sub-block coordinates. Export a coarser regular-grid CSV or specify an explicit cell size."
-        )
     linear = _tbms_linear_indices(prepared)
-    dense = np.full(row_count, default_value, dtype=dtype)
-    dense[linear] = np.asarray(series, dtype=dtype)
-    return dense
+    if len(linear) != len(series):
+        raise ValueError("BMF field values do not align with prepared grid rows.")
+    order = np.argsort(linear, kind="stable")
+    return {
+        "row_count": row_count,
+        "linear": linear[order].astype(np.int64, copy=False),
+        "source_values": np.asarray(series, dtype=dtype)[order],
+    }
+
+
+def _tbms_export_field_values(
+    prepared: Dict[str, object],
+    series: pd.Series,
+    default_value: object,
+    dtype: np.dtype,
+) -> object:
+    if prepared.get("is_irregular"):
+        return np.asarray(series.reset_index(drop=True), dtype=dtype)
+    return _tbms_dense_field_values(prepared, series, default_value, dtype)
+
+
+def _metadata_supports_tbms_irregular(metadata: Mapping[str, object]) -> bool:
+    return bool(metadata.get("parent_block_size") and metadata.get("subblock_factors"))
 
 
 def _backend_requires_dense_grid(backend: str) -> bool:
@@ -741,11 +2049,13 @@ def _validate_dense_export_size(prepared: Dict[str, object], value_cols: Sequenc
     valid_rows = len(prepared.get("df", []))
     backend_text = f" for backend {backend!r}" if backend else ""
     raise MemoryError(
-        f"BMF export would create an oversized dense grid{backend_text} before writing any values. "
+        f"BMF export would create an oversized dense regular-grid file{backend_text}. "
         f"Inferred dimensions={tuple(int(value) for value in dims)} ({row_count:,} cells) from "
         f"{valid_rows:,} valid CSV rows using cell_size={cell.tolist()}. "
-        f"Estimated dense value storage for {field_count} field(s) is {_format_byte_size(estimated_bytes)}. "
-        "The CSV likely has very fine coordinate spacing, irregular/sub-block coordinates, or an incorrect XYZ/cell-size setup. "
+        f"Estimated uncompressed dense value payload for {field_count} field(s) is {_format_byte_size(estimated_bytes)}. "
+        "This limit is about the dense output implied by the CSV geometry, not just peak RAM. The writer streams pages, "
+        "but a dense Vulcan-style BMF still needs storage for every implied regular-grid cell. The CSV likely has very "
+        "fine coordinate spacing, irregular/sub-block coordinates, or an incorrect XYZ/cell-size setup. "
         "For Vulcan-compatible dense BMF output, export a regular base-block grid or set Cell Size X/Y/Z to the intended "
         "base block dimensions, not sub-block spacing. For a row-indexed Anterpolator container that avoids dense grid "
         "allocation, choose the tbms-experimental backend."
@@ -816,7 +2126,7 @@ def _tbms_encode_export_field(
             "field_type": "boolean",
             "default": 0,
             "dtype": np.dtype("u1"),
-            "values": _tbms_dense_field_values(prepared, encoded, 0, np.dtype("u1")),
+            "values": _tbms_export_field_values(prepared, encoded, 0, np.dtype("u1")),
         }
 
     numeric = pd.to_numeric(series, errors="coerce")
@@ -841,7 +2151,7 @@ def _tbms_encode_export_field(
             "field_type": "int",
             "default": int(null_float),
             "dtype": np.dtype("<i4"),
-            "values": _tbms_dense_field_values(prepared, converted, int(null_float), np.dtype("<i4")),
+            "values": _tbms_export_field_values(prepared, converted, int(null_float), np.dtype("<i4")),
         }
 
     if normalized_forced_type == "double":
@@ -856,7 +2166,7 @@ def _tbms_encode_export_field(
             "field_type": "double",
             "default": float(null_float),
             "dtype": np.dtype("<f8"),
-            "values": _tbms_dense_field_values(prepared, converted, float(null_float), np.dtype("<f8")),
+            "values": _tbms_export_field_values(prepared, converted, float(null_float), np.dtype("<f8")),
         }
 
     if normalized_forced_type == "string":
@@ -869,7 +2179,7 @@ def _tbms_encode_export_field(
             "field_type": "namedshort",
             "default": 0,
             "dtype": np.dtype("<i2"),
-            "values": _tbms_dense_field_values(prepared, codes, 0, np.dtype("<i2")),
+            "values": _tbms_export_field_values(prepared, codes, 0, np.dtype("<i2")),
         }
         for label, code in code_map.items():
             field_info[f"string_{code}"] = label
@@ -882,7 +2192,7 @@ def _tbms_encode_export_field(
             "field_type": "boolean",
             "default": 0,
             "dtype": np.dtype("u1"),
-            "values": _tbms_dense_field_values(prepared, encoded, 0, np.dtype("u1")),
+            "values": _tbms_export_field_values(prepared, encoded, 0, np.dtype("u1")),
         }
 
     if numeric_compatible:
@@ -897,14 +2207,14 @@ def _tbms_encode_export_field(
                     "field_type": "int",
                     "default": int(null_float),
                     "dtype": np.dtype("<i4"),
-                    "values": _tbms_dense_field_values(prepared, converted, int(null_float), np.dtype("<i4")),
+                    "values": _tbms_export_field_values(prepared, converted, int(null_float), np.dtype("<i4")),
                 }
         converted = numeric.fillna(float(null_float)).astype(np.float64)
         return {
             "field_type": "double",
             "default": float(null_float),
             "dtype": np.dtype("<f8"),
-            "values": _tbms_dense_field_values(prepared, converted, float(null_float), np.dtype("<f8")),
+            "values": _tbms_export_field_values(prepared, converted, float(null_float), np.dtype("<f8")),
         }
 
     labels = [str(value) for value in pd.unique(series.dropna())]
@@ -916,7 +2226,7 @@ def _tbms_encode_export_field(
         "field_type": "namedshort",
         "default": 0,
         "dtype": np.dtype("<i2"),
-        "values": _tbms_dense_field_values(prepared, codes, 0, np.dtype("<i2")),
+        "values": _tbms_export_field_values(prepared, codes, 0, np.dtype("<i2")),
     }
     for label, code in code_map.items():
         field_info[f"string_{code}"] = label
@@ -940,16 +2250,40 @@ def _tbms_value_page(values: np.ndarray, dtype: np.dtype, default_value: object)
     return pages
 
 
-def _iter_tbms_value_pages(values: np.ndarray, dtype: np.dtype, default_value: object) -> Iterable[bytes]:
+def _iter_tbms_value_pages(values: object, dtype: np.dtype, default_value: object) -> Iterable[bytes]:
     payload_size = 2048
     capacity = payload_size // dtype.itemsize
-    page_count = max(1, int(math.ceil(len(values) / capacity)))
+    if isinstance(values, dict):
+        row_count = int(values.get("row_count", 0) or 0)
+        linear = np.asarray(values.get("linear", []), dtype=np.int64)
+        source_values = np.asarray(values.get("source_values", []), dtype=dtype)
+        page_count = max(1, int(math.ceil(row_count / capacity)))
+        position = 0
+        source_count = len(linear)
+        for page_index in range(page_count):
+            start = page_index * capacity
+            stop = min(start + capacity, row_count)
+            page_values = np.full(capacity, default_value, dtype=dtype)
+            while position < source_count and linear[position] < start:
+                position += 1
+            page_stop = position
+            while page_stop < source_count and linear[page_stop] < stop:
+                page_stop += 1
+            if page_stop > position:
+                offsets = (linear[position:page_stop] - start).astype(np.int64, copy=False)
+                page_values[offsets] = source_values[position:page_stop]
+            position = page_stop
+            yield struct.pack("<II", 512, 0) + page_values.tobytes(order="C")
+        return
+
+    dense_values = np.asarray(values, dtype=dtype)
+    page_count = max(1, int(math.ceil(len(dense_values) / capacity)))
     for page_index in range(page_count):
         start = page_index * capacity
-        stop = min(start + capacity, len(values))
+        stop = min(start + capacity, len(dense_values))
         page_values = np.full(capacity, default_value, dtype=dtype)
         if stop > start:
-            page_values[: stop - start] = values[start:stop].astype(dtype, copy=False)
+            page_values[: stop - start] = dense_values[start:stop].astype(dtype, copy=False)
         yield struct.pack("<II", 512, 0) + page_values.tobytes(order="C")
 
 
@@ -971,7 +2305,8 @@ def _write_tbms_config_text(
     progress_start: int = 50,
     progress_end: int = 98,
 ) -> Dict[str, object]:
-    if int(prepared.get("duplicates") or 0) > 0:
+    is_irregular = bool(prepared.get("is_irregular"))
+    if not is_irregular and int(prepared.get("duplicates") or 0) > 0:
         raise ValueError("tbms-config-text export requires unique grid cells; duplicate XYZ rows were found.")
 
     df: pd.DataFrame = prepared["df"]  # type: ignore[assignment]
@@ -979,7 +2314,7 @@ def _write_tbms_config_text(
     origin = np.asarray(prepared["origin"], dtype=float)
     cell = np.asarray(prepared["cell"], dtype=float)
     extents = np.asarray(prepared["extents"], dtype=float)
-    row_count = int(np.prod(dims, dtype=np.int64))
+    row_count = int(len(df)) if is_irregular else int(np.prod(dims, dtype=np.int64))
 
     first_page_offset = TBMS_EXPERIMENTAL_FIRST_SECTION_OFFSET
     config_pointer_header_offsets = (24, 40)
@@ -1021,6 +2356,50 @@ def _write_tbms_config_text(
             page_count += 1
             return offset
 
+        geometry_entries: List[Tuple[str, pd.Series]] = []
+        if is_irregular:
+            lower = np.asarray(prepared["irregular_lower"], dtype=float)
+            upper = np.asarray(prepared["irregular_upper"], dtype=float)
+            geometry_entries = [
+                ("__lower_x", pd.Series(lower[:, 0], name="__lower_x")),
+                ("__upper_x", pd.Series(upper[:, 0], name="__upper_x")),
+                ("__lower_y", pd.Series(lower[:, 1], name="__lower_y")),
+                ("__upper_y", pd.Series(upper[:, 1], name="__upper_y")),
+                ("__lower_z", pd.Series(lower[:, 2], name="__lower_z")),
+                ("__upper_z", pd.Series(upper[:, 2], name="__upper_z")),
+            ]
+
+        for geometry_index, (name, values) in enumerate(geometry_entries):
+            encoded = {
+                "field_type": "float",
+                "default": 0.0,
+                "dtype": np.dtype("<f4"),
+                "values": np.asarray(values, dtype="<f4"),
+            }
+            leaf_offsets = [
+                allocate_page(blob)
+                for blob in _iter_tbms_value_pages(encoded["values"], encoded["dtype"], encoded["default"])
+            ]
+            current_offsets = leaf_offsets
+            while len(current_offsets) > 1:
+                next_offsets: List[int] = []
+                for start in range(0, len(current_offsets), 256):
+                    next_offsets.append(allocate_page(_tbms_pointer_page(current_offsets[start:start + 256])))
+                current_offsets = next_offsets
+            field_entries.append({
+                "entry_key": f"var_{geometry_index}",
+                "entry": {
+                    "name": name,
+                    "type": encoded["field_type"],
+                    "location": int(current_offsets[0]),
+                    "default": encoded["default"],
+                    "global": 0,
+                    "read_only": 1,
+                    "description": "Irregular block geometry extent",
+                },
+            })
+
+        value_entry_offset = len(field_entries)
         for field_index, name in enumerate(value_cols):
             field_progress = _scale_progress(progress_start, encode_end, field_index / total_fields)
             _emit_progress(
@@ -1056,7 +2435,7 @@ def _write_tbms_config_text(
                     entry[str(key)] = value
             if encoded["field_type"] == "namedshort":
                 categorical_fields += 1
-            field_entries.append({"entry_key": f"var_{field_index}", "entry": entry})
+            field_entries.append({"entry_key": f"var_{value_entry_offset + field_index}", "entry": entry})
 
         _emit_progress(
             progress_callback,
@@ -1071,7 +2450,7 @@ def _write_tbms_config_text(
         "history_source": "Anterpolator tbms-config-text export",
         "n_blocks": row_count,
         "n_schemas": 1,
-        "is_irregular": 0,
+        "is_irregular": 1 if is_irregular else 0,
         "origin_x": 0.0,
         "origin_y": 0.0,
         "origin_z": 0.0,
@@ -1099,6 +2478,8 @@ def _write_tbms_config_text(
             "max_size_z": float(cell[2]),
         },
     }
+    if is_irregular:
+        config_object["geometry_encoding"] = "row_extents_lower_upper"
     for field in field_entries:
         config_object[str(field["entry_key"])] = field["entry"]
 
@@ -2297,7 +3678,11 @@ def _load_tbms_config_variant(
     else:
         rows_to_load = row_count
 
-    frame = _build_tbms_grid_frame(metadata, rows_to_load)
+    is_irregular = bool(int(parsed.get("is_irregular", 0) or 0))
+    if is_irregular:
+        frame = pd.DataFrame(index=pd.RangeIndex(rows_to_load))
+    else:
+        frame = _build_tbms_grid_frame(metadata, rows_to_load)
     decoded_fields: List[str] = []
     skipped_fields: List[str] = []
     decoded_columns: Dict[str, object] = {}
@@ -2337,6 +3722,11 @@ def _load_tbms_config_variant(
 
     if decoded_columns:
         frame = pd.concat([frame, pd.DataFrame(decoded_columns, index=frame.index)], axis=1)
+
+    if is_irregular and all(column in frame.columns for column in ("__lower_x", "__upper_x", "__lower_y", "__upper_y", "__lower_z", "__upper_z")):
+        frame.insert(0, "x", (pd.to_numeric(frame["__lower_x"], errors="coerce") + pd.to_numeric(frame["__upper_x"], errors="coerce")) * 0.5)
+        frame.insert(1, "y", (pd.to_numeric(frame["__lower_y"], errors="coerce") + pd.to_numeric(frame["__upper_y"], errors="coerce")) * 0.5)
+        frame.insert(2, "z", (pd.to_numeric(frame["__lower_z"], errors="coerce") + pd.to_numeric(frame["__upper_z"], errors="coerce")) * 0.5)
 
     report["config_block"] = {
         "start": config_block["start"],
@@ -2405,6 +3795,8 @@ def export_bmf(
     cell_size: Sequence[float] | None = None,
     origin: Sequence[float] | None = None,
     value_cols: Sequence[str] | None = None,
+    size_cols: Sequence[str] | Mapping[str, str] | str | None = None,
+    extent_cols: Sequence[str] | Mapping[str, str] | str | None = None,
     column_types: Mapping[str, object] | None = None,
     value_exceptions: Mapping[str, Mapping[str, object]] | None = None,
     null_float: float = -99.0,
@@ -2419,15 +3811,65 @@ def export_bmf(
     if not in_csv.exists():
         raise FileNotFoundError(f"Input file not found: {in_csv}")
 
+    user_cell_size_provided = cell_size is not None
+    user_origin_provided = origin is not None
     _emit_progress(progress_callback, 0, 100, "Preparing BMF export...")
+    csv_metadata = parse_leapfrog_block_metadata(in_csv)
+    log_leapfrog_metadata_summary(in_csv, csv_metadata, context="BMF export")
+    effective_header_line = resolve_effective_csv_header_line(in_csv, header_line)
+    metadata_geometry = infer_bmf_export_geometry_from_metadata(
+        csv_metadata,
+        regularize_to_base_block=regularize_to_base_block,
+        dense_regular_grid=_backend_requires_dense_grid(backend),
+    )
+    if cell_size is None and metadata_geometry.get("cell_size"):
+        cell_size = metadata_geometry["cell_size"]  # type: ignore[assignment]
+        _emit_progress(
+            progress_callback,
+            1,
+            100,
+            f"Using CSV metadata cell size from {metadata_geometry.get('cell_size_source')}...",
+        )
+    if origin is None and metadata_geometry.get("origin"):
+        origin = metadata_geometry["origin"]  # type: ignore[assignment]
+        _emit_progress(
+            progress_callback,
+            2,
+            100,
+            f"Using CSV metadata origin from {metadata_geometry.get('origin_source')}...",
+        )
     xyz_cols = [x_col, y_col, z_col]
-    selected_read_cols = list(dict.fromkeys([*xyz_cols, *(value_cols or [])])) if value_cols else None
+    csv_delimiter = delimiter or detect_csv_delimiter(in_csv)
+    csv_header_names = parse_header_line(in_csv, csv_delimiter, effective_header_line)
+    available_grid_index_cols = [col for col in GRID_INDEX_COLUMNS if col in csv_header_names]
+    mapped_extent_cols = _resolve_geometry_column_map(csv_header_names, extent_cols, GEOMETRY_EXTENT_COLUMNS, "lower/upper extent columns")
+    mapped_size_cols = _resolve_geometry_column_map(csv_header_names, size_cols, GEOMETRY_SIZE_COLUMN_ROLES, "dimension columns")
+    if not mapped_extent_cols:
+        mapped_extent_cols = _detect_geometry_extent_columns(csv_header_names)
+    if not mapped_size_cols:
+        mapped_size_cols = _detect_geometry_size_columns(csv_header_names)
+    explicit_geometry_cols = list(dict.fromkeys([*mapped_extent_cols.values(), *mapped_size_cols.values()]))
+    has_explicit_row_geometry = bool(mapped_extent_cols or mapped_size_cols)
+    use_irregular_tbms_config = (
+        backend == "tbms-config-text"
+        and not regularize_to_base_block
+        and (has_explicit_row_geometry or _metadata_supports_tbms_irregular(csv_metadata))
+    )
+    use_grid_index_columns = (
+        len(available_grid_index_cols) == len(GRID_INDEX_COLUMNS)
+        and not regularize_to_base_block
+        and not use_irregular_tbms_config
+    )
+    selected_read_cols = (
+        list(dict.fromkeys([*xyz_cols, *available_grid_index_cols, *(explicit_geometry_cols if use_irregular_tbms_config else []), *(value_cols or [])]))
+        if value_cols else None
+    )
     selected_message = "selected columns" if selected_read_cols else "all columns"
     _validate_selected_csv_read_size(
         in_csv,
-        header_line,
+        effective_header_line,
         selected_read_cols,
-        backend,
+        "tbms-experimental" if use_irregular_tbms_config else backend,
         regularize_to_base_block,
         progress_callback=progress_callback,
     )
@@ -2435,7 +3877,7 @@ def export_bmf(
     df = _auto_read_csv(
         in_csv,
         delimiter=delimiter,
-        header_line=header_line,
+        header_line=effective_header_line,
         usecols=selected_read_cols,
         progress_callback=progress_callback,
         progress_start=5,
@@ -2451,9 +3893,44 @@ def export_bmf(
     if missing:
         raise ValueError(f"Missing coordinate columns: {missing}")
 
+    statistical_base_geometry = {}
+    if cell_size is None:
+        statistical_base_geometry = infer_base_block_size_from_centroid_statistics(
+            df,
+            xyz_cols,
+            index_tolerance=index_tolerance,
+        )
+    statistical_cell_size = statistical_base_geometry.get("cell_size") if isinstance(statistical_base_geometry, Mapping) else None
+    statistical_origin = statistical_base_geometry.get("origin") if isinstance(statistical_base_geometry, Mapping) else None
+    use_provided_parent_irregular_tbms_config = bool(
+        backend == "tbms-config-text"
+        and not regularize_to_base_block
+        and not use_irregular_tbms_config
+        and not use_grid_index_columns
+        and cell_size is not None
+    )
+    use_statistical_irregular_tbms_config = bool(
+        backend == "tbms-config-text"
+        and not regularize_to_base_block
+        and not use_irregular_tbms_config
+        and not use_grid_index_columns
+        and not use_provided_parent_irregular_tbms_config
+        and statistical_cell_size
+    )
+
     normalized_value_exceptions = _normalize_value_exceptions(value_exceptions)
     regularization_summary = {"enabled": False}
     if regularize_to_base_block:
+        if cell_size is None and statistical_base_geometry.get("cell_size"):
+            cell_size = statistical_base_geometry["cell_size"]  # type: ignore[assignment]
+            if origin is None and statistical_base_geometry.get("origin"):
+                origin = statistical_base_geometry["origin"]  # type: ignore[assignment]
+            _emit_progress(
+                progress_callback,
+                31,
+                100,
+                "Using statistically inferred base block size for regularization...",
+            )
         pre_regularization_exceptions = _filter_value_exceptions_for_regularization(
             normalized_value_exceptions,
             include_in_regularization=True,
@@ -2483,35 +3960,125 @@ def export_bmf(
         _emit_progress(progress_callback, 32, 100, "Applying BMF value exception rules...")
         df = _apply_value_exceptions(df, normalized_value_exceptions)
 
-    _emit_progress(progress_callback, 36, 100, "Preparing regular BMF grid from XYZ columns...")
-    prepared = _prepare_grid(
-        df=df,
-        xyz_cols=xyz_cols,
-        cell_size=cell_size,
-        origin=origin,
-        index_tolerance=index_tolerance,
-    )
+    if use_irregular_tbms_config or use_provided_parent_irregular_tbms_config or use_statistical_irregular_tbms_config:
+        _emit_progress(progress_callback, 36, 100, "Preparing irregular BMF blocks from source CSV row extents...")
+        parent_cell_size = cell_size or statistical_cell_size
+        try:
+            prepared = _prepare_irregular_blocks(
+                df=df,
+                xyz_cols=xyz_cols,
+                metadata=csv_metadata,
+                cell_size=parent_cell_size,
+                origin=origin or statistical_origin,
+                index_tolerance=index_tolerance,
+                geometry_size_cols=mapped_size_cols,
+                geometry_extent_cols=mapped_extent_cols,
+            )
+        except ValueError as irregular_error:
+            if use_provided_parent_irregular_tbms_config and parent_cell_size is not None:
+                raise ValueError(
+                    _build_centroid_hierarchy_error_message(irregular_error, df, xyz_cols, parent_cell_size)
+                ) from irregular_error
+            raise
+        if use_statistical_irregular_tbms_config:
+            prepared["statistical_base_block_source"] = "centroid_spacing_statistics"
+    elif use_grid_index_columns and all(col in df.columns for col in GRID_INDEX_COLUMNS):
+        _emit_progress(progress_callback, 36, 100, "Preparing regular BMF grid from CSV grid_i/grid_j/grid_k columns...")
+        prepared = _prepare_grid_from_index_columns(
+            df=df,
+            xyz_cols=xyz_cols,
+            cell_size=cell_size,
+            origin=origin,
+        )
+    else:
+        _emit_progress(progress_callback, 36, 100, "Preparing regular BMF grid from XYZ columns...")
+        try:
+            prepared = _prepare_grid(
+                df=df,
+                xyz_cols=xyz_cols,
+                cell_size=cell_size,
+                origin=origin,
+                index_tolerance=index_tolerance,
+            )
+        except ValueError as regular_grid_error:
+            inferred_cell_size = statistical_base_geometry.get("cell_size") if isinstance(statistical_base_geometry, Mapping) else None
+            inferred_origin = statistical_base_geometry.get("origin") if isinstance(statistical_base_geometry, Mapping) else None
+            can_use_statistical_base = bool(inferred_cell_size and backend == "tbms-config-text" and not regularize_to_base_block)
+            if backend != "tbms-config-text" or regularize_to_base_block or (cell_size is None and not can_use_statistical_base):
+                raise
+            _emit_progress(
+                progress_callback,
+                37,
+                100,
+                "Regular grid alignment failed; inferring irregular row extents from centroid hierarchy...",
+            )
+            try:
+                prepared = _prepare_irregular_blocks(
+                    df=df,
+                    xyz_cols=xyz_cols,
+                    metadata=csv_metadata,
+                    cell_size=cell_size or inferred_cell_size,
+                    origin=origin or inferred_origin,
+                    index_tolerance=index_tolerance,
+                    geometry_size_cols=mapped_size_cols,
+                    geometry_extent_cols=mapped_extent_cols,
+                )
+                if cell_size is None and can_use_statistical_base:
+                    prepared["statistical_base_block_source"] = "centroid_spacing_statistics"
+            except ValueError as irregular_error:
+                raise regular_grid_error from irregular_error
     dims_text = " x ".join(str(int(value)) for value in np.asarray(prepared["dims"], dtype=int))
+    geometry_text = "Irregular blocks prepared" if prepared.get("is_irregular") else "Grid prepared"
     _emit_progress(
         progress_callback,
         45,
         100,
-        f"Grid prepared: {dims_text} cells from {len(prepared['df']):,} valid CSV rows.",
+        f"{geometry_text}: {dims_text} parent cells from {len(prepared['df']):,} valid CSV rows.",
     )
 
     chosen_value_cols = _classify_columns(prepared["df"], xyz_cols, value_cols)
     _emit_progress(progress_callback, 47, 100, f"Selected {len(chosen_value_cols)} BMF value field(s).")
     if backend not in SUPPORTED_EXPORT_BACKENDS:
         raise ValueError(f"Unsupported backend: {backend}")
-    if _backend_requires_dense_grid(backend):
+    if _backend_requires_dense_grid(backend) and not prepared.get("is_irregular"):
         _validate_dense_export_size(prepared, chosen_value_cols, backend=backend)
+    irregular_hierarchy_report = _build_irregular_hierarchy_report(
+        prepared,
+        xyz_cols=xyz_cols,
+        index_tolerance=index_tolerance,
+    )
+    irregular_hierarchy_text = _format_irregular_hierarchy_report(irregular_hierarchy_report)
+    if irregular_hierarchy_text:
+        print(irregular_hierarchy_text)
+    block_size_determination = _build_block_size_determination_report(
+        prepared=prepared,
+        metadata_geometry=metadata_geometry,
+        statistical_base_geometry=statistical_base_geometry,
+        user_cell_size_provided=user_cell_size_provided,
+        user_origin_provided=user_origin_provided,
+        use_grid_index_columns=use_grid_index_columns,
+        regularize_to_base_block=regularize_to_base_block,
+    )
+    block_size_message = (
+        f"Block size determination: {block_size_determination['message']} "
+        f"cell_size={_format_numeric_vector(block_size_determination['cell_size'])}, "
+        f"origin={_format_numeric_vector(block_size_determination['origin'])}."
+    )
+    print(block_size_message)
+    _emit_progress(progress_callback, 46, 100, block_size_message)
     summary = {
         "input_csv": str(in_csv),
         "output_bmf": str(out_bmf),
         "backend": backend,
+        "csv_header_line": int(effective_header_line),
+        "csv_configured_header_line": int(max(int(header_line or 1), 1)),
+        "csv_metadata": csv_metadata,
+        "csv_metadata_geometry": metadata_geometry,
         "rows": int(len(prepared["df"])),
         "value_columns": chosen_value_cols,
         "value_exceptions": normalized_value_exceptions,
+        "csv_statistical_base_block": statistical_base_geometry,
+        "block_size_determination": block_size_determination,
         "regularization": regularization_summary,
         "grid": {
             "origin": [float(x) for x in np.asarray(prepared["origin"], dtype=float)],
@@ -2520,6 +4087,11 @@ def export_bmf(
             "extents": [float(x) for x in np.asarray(prepared["extents"], dtype=float)],
             "duplicate_grid_rows": int(prepared["duplicates"]),
             "max_index_error": float(prepared["max_index_error"]),
+            "index_source": str(prepared.get("grid_index_source") or "xyz"),
+            "is_irregular": bool(prepared.get("is_irregular", False)),
+            "irregular_width_source": prepared.get("irregular_width_source"),
+            "irregular_hierarchy": irregular_hierarchy_report,
+            "irregular_hierarchy_text": irregular_hierarchy_text,
         },
     }
 
@@ -2814,94 +4386,35 @@ def cmd_export(args: argparse.Namespace) -> int:
     if not in_csv.exists():
         print(f"Input file not found: {in_csv}", file=sys.stderr)
         return 2
-
-    df = _auto_read_csv(in_csv)
-    xyz_cols = [args.x_col, args.y_col, args.z_col]
-    missing = [c for c in xyz_cols if c not in df.columns]
-    if missing:
-        print(f"Missing coordinate columns: {missing}", file=sys.stderr)
-        return 2
-
-    regularization_summary = {"enabled": False}
-    if getattr(args, "regularize_to_base_block", False):
-        df, regularization_summary = _regularize_to_base_cell_grid(
-            df=df,
-            xyz_cols=xyz_cols,
+    try:
+        result = export_bmf(
+            input_csv=in_csv,
+            output_bmf=out_bmf,
+            backend=args.backend,
+            x_col=args.x_col,
+            y_col=args.y_col,
+            z_col=args.z_col,
             cell_size=args.cell_size,
             origin=args.origin,
             value_cols=args.value_cols,
-            column_types=None,
+            size_cols=args.size_cols,
+            extent_cols=args.extent_cols,
+            null_float=args.null_float,
+            index_tolerance=args.index_tolerance,
+            regularize_to_base_block=getattr(args, "regularize_to_base_block", False),
+            dry_run=args.dry_run,
+            summary_json=args.summary_json,
         )
-
-    prepared = _prepare_grid(
-        df=df,
-        xyz_cols=xyz_cols,
-        cell_size=args.cell_size,
-        origin=args.origin,
-        index_tolerance=args.index_tolerance,
-    )
-
-    value_cols = _classify_columns(prepared["df"], xyz_cols, args.value_cols)
-
-    summary = {
-        "input_csv": str(in_csv),
-        "output_bmf": str(out_bmf),
-        "backend": args.backend,
-        "rows": int(len(prepared["df"])),
-        "value_columns": value_cols,
-        "regularization": regularization_summary,
-        "grid": {
-            "origin": [float(x) for x in np.asarray(prepared["origin"], dtype=float)],
-            "cell_size": [float(x) for x in np.asarray(prepared["cell"], dtype=float)],
-            "dimensions": [int(x) for x in np.asarray(prepared["dims"], dtype=int)],
-            "extents": [float(x) for x in np.asarray(prepared["extents"], dtype=float)],
-            "duplicate_grid_rows": int(prepared["duplicates"]),
-            "max_index_error": float(prepared["max_index_error"]),
-        },
-    }
-
-    if args.summary_json:
-        summary_path = Path(args.summary_json)
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    print(json.dumps(summary, indent=2))
-
-    if args.dry_run:
-        print("Dry-run mode: no BMF file written.")
-        return 0
-
-    try:
-        out_bmf.parent.mkdir(parents=True, exist_ok=True)
-        if args.backend == "vulcan":
-            _export_with_vulcan(
-                prepared=prepared,
-                xyz_cols=xyz_cols,
-                value_cols=value_cols,
-                out_bmf=out_bmf,
-                null_float=args.null_float,
-            )
-        elif args.backend == "tbms-config-text":
-            config_summary = _write_tbms_config_text(
-                prepared=prepared,
-                xyz_cols=xyz_cols,
-                value_cols=value_cols,
-                out_bmf=out_bmf,
-                null_float=args.null_float,
-            )
-            print(json.dumps(config_summary, indent=2))
-        else:
-            experimental_summary = _write_tbms_experimental(
-                prepared=prepared,
-                xyz_cols=xyz_cols,
-                value_cols=value_cols,
-                out_bmf=out_bmf,
-                null_float=args.null_float,
-            )
-            print(json.dumps(experimental_summary, indent=2))
     except Exception as exc:
         print(f"BMF export failed: {exc}", file=sys.stderr)
         return 1
+
+    print(json.dumps(result["summary"], indent=2))
+    if result.get("backend_summary"):
+        print(json.dumps(result["backend_summary"], indent=2))
+    if args.dry_run:
+        print("Dry-run mode: no BMF file written.")
+        return 0
 
     print(f"BMF export completed: {out_bmf}")
     return 0
@@ -3021,6 +4534,20 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help="Columns to export as variables; default is all non-XYZ columns",
+    )
+    export_p.add_argument(
+        "--size-cols",
+        nargs=3,
+        metavar=("DX_COL", "DY_COL", "DZ_COL"),
+        default=None,
+        help="CSV dimension columns for row sizes; converted to lower/upper irregular extents",
+    )
+    export_p.add_argument(
+        "--extent-cols",
+        nargs=6,
+        metavar=("LOWER_X", "UPPER_X", "LOWER_Y", "UPPER_Y", "LOWER_Z", "UPPER_Z"),
+        default=None,
+        help="CSV lower/upper extent columns, in X/Y/Z lower/upper order",
     )
     export_p.add_argument(
         "--null-float",

@@ -276,47 +276,19 @@ def parse_header_line(path, delimiter, line_number):
         if not tokens:
             raise ValueError(f"BMF file '{os.path.basename(path)}' produced no columns.")
         return tokens
-    try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            for current, line in enumerate(f, start=1):
-                if current == line_number:
-                    raw = line.strip('\n\r')
-                    tokens = [t.strip() for t in raw.split(delimiter)]
-                    tokens = [t for t in tokens if t != '']
-                    if not tokens:
-                        raise ValueError(f"Parsed header line {line_number} in '{os.path.basename(path)}' produced no tokens.")
-                    return tokens
-        raise ValueError(f"Header line {line_number} exceeds total lines in file '{os.path.basename(path)}'.")
-    except UnicodeDecodeError:
-        raise ValueError(f"Could not decode file '{path}' with utf-8 encoding.")
+    return _get_bmf_tools_module().parse_header_line(path, delimiter, line_number)
 
 
 def resolve_effective_csv_header_line(path, configured_line=1):
     if is_bmf_file(path):
         return 1
-    line_number = max(int(configured_line or 1), 1)
-    if not os.path.isfile(path):
-        raise ValueError(f"File not found: {path}")
-    with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
-        for current_line_number, line_text in enumerate(handle, start=1):
-            if current_line_number < line_number:
-                continue
-            stripped = line_text.strip()
-            if not stripped or stripped.startswith('#'):
-                continue
-            if current_line_number != line_number:
-                print(
-                    f"Header line {line_number} in '{os.path.basename(path)}' is metadata/comment; "
-                    f"using first data header line {current_line_number}."
-                )
-            return current_line_number
-    raise ValueError(f"Could not find a non-comment CSV header line in '{os.path.basename(path)}'.")
+    return _get_bmf_tools_module().resolve_effective_csv_header_line(path, configured_line)
 
 
 def parse_effective_header_line(path, delimiter, line_number):
-    metadata = parse_leapfrog_block_metadata(path)
-    log_leapfrog_metadata_summary(path, metadata, context='header scan')
-    return parse_header_line(path, delimiter, resolve_effective_csv_header_line(path, line_number))
+    if is_bmf_file(path):
+        return parse_header_line(path, delimiter, 1)
+    return _get_bmf_tools_module().parse_effective_header_line(path, delimiter, line_number)
 
 
 def _parse_metadata_numeric_values(text, numeric_type=float, stop_at_equals=False):
@@ -328,66 +300,9 @@ def _parse_metadata_numeric_values(text, numeric_type=float, stop_at_equals=Fals
 
 
 def parse_leapfrog_block_metadata(path, max_lines=100):
-    if not path or is_bmf_file(path) or not os.path.isfile(path):
+    if not path or is_bmf_file(path):
         return {}
-
-    metadata = {}
-    raw_lines = []
-    with open(path, 'r', encoding='utf-8', errors='ignore') as handle:
-        for line_number, line_text in enumerate(handle, start=1):
-            if line_number > max_lines:
-                break
-            stripped = line_text.strip()
-            if not stripped:
-                continue
-            if not stripped.startswith('#'):
-                break
-
-            content = stripped.lstrip('#').strip()
-            raw_lines.append(content)
-            if ':' not in content:
-                if 'title' not in metadata and content:
-                    metadata['title'] = content
-                continue
-
-            key, raw_value = content.split(':', 1)
-            normalized_key = re.sub(r'[^a-z0-9]+', '_', key.strip().lower()).strip('_')
-            value = raw_value.strip()
-
-            if normalized_key == 'encoding':
-                metadata['encoding'] = value
-            elif normalized_key == 'rotation_type':
-                metadata['rotation_type'] = value
-            elif normalized_key in {'azimuth', 'dip', 'pitch'}:
-                numbers = _parse_metadata_numeric_values(value)
-                if numbers:
-                    metadata[f'{normalized_key}_degrees'] = float(numbers[0])
-            elif normalized_key == 'parent_block_size':
-                numbers = _parse_metadata_numeric_values(value)
-                if len(numbers) >= 3:
-                    metadata['parent_block_size'] = [float(number) for number in numbers[:3]]
-            elif normalized_key == 'size_in_parent_blocks':
-                numbers = _parse_metadata_numeric_values(value, numeric_type=int, stop_at_equals=True)
-                if len(numbers) >= 3:
-                    metadata['size_in_parent_blocks'] = [int(number) for number in numbers[:3]]
-                total_values = _parse_metadata_numeric_values(value.split('=', 1)[1], numeric_type=int) if '=' in value else []
-                if total_values:
-                    metadata['parent_block_count'] = int(total_values[0])
-            elif normalized_key in {'minimum_parent_centroid', 'maximum_parent_centroid', 'minimum_corner', 'maximum_corner'}:
-                numbers = _parse_metadata_numeric_values(value)
-                if len(numbers) >= 3:
-                    metadata[normalized_key] = [float(number) for number in numbers[:3]]
-            elif normalized_key in {'sub_blocks', 'subblocks'}:
-                parts = value.split()
-                if parts:
-                    metadata['subblock_scheme'] = parts[0]
-                numbers = _parse_metadata_numeric_values(value, numeric_type=int)
-                if len(numbers) >= 3:
-                    metadata['subblock_factors'] = [int(number) for number in numbers[:3]]
-
-    if raw_lines:
-        metadata['raw_lines'] = raw_lines
-    return metadata
+    return _get_bmf_tools_module().parse_leapfrog_block_metadata(path, max_lines=max_lines)
 
 
 def _format_metadata_vector(metadata, key):
@@ -6253,6 +6168,7 @@ def export_csv_grid_to_bmf(input_csv, output_bmf, x_col='x', y_col='y', z_col='z
                            value_cols=None, backend='tbms-config-text', delimiter=None,
                            header_line=1, column_types=None, value_exceptions=None, cell_size=None,
                            origin=None, null_float=-99.0, index_tolerance=1e-3,
+                           size_cols=None, extent_cols=None,
                            regularize_to_base_block=False, summary_json=None, progress_callback=None):
     if progress_callback is not None:
         progress_callback(0, 100, 'Preparing BMF export...')
@@ -6267,6 +6183,8 @@ def export_csv_grid_to_bmf(input_csv, output_bmf, x_col='x', y_col='y', z_col='z
         header_line=header_line,
         cell_size=cell_size,
         origin=origin,
+        size_cols=size_cols,
+        extent_cols=extent_cols,
         value_cols=value_cols,
         column_types=column_types,
         value_exceptions=value_exceptions,
