@@ -32,7 +32,20 @@ from anterpolator3DViewer import (
     normalize_selected_sample_domain_column,
     parse_leapfrog_block_metadata,
     resolve_effective_csv_header_line,
+    sync_csv_header_line_widget,
 )
+
+
+_QT_APP = None
+
+
+def _get_qt_app():
+    global _QT_APP
+    app = viewer_module.QtWidgets.QApplication.instance()
+    if app is None:
+        _QT_APP = viewer_module.QtWidgets.QApplication([])
+        app = _QT_APP
+    return app
 
 
 def _capture_progress_events():
@@ -138,6 +151,27 @@ def test_leapfrog_metadata_parser_tolerates_missing_or_unrecognized_comments():
 
         assert parse_leapfrog_block_metadata(blocks_path) == {}
         assert resolve_effective_csv_header_line(blocks_path, 1) == 1
+
+
+def test_sync_csv_header_line_widget_updates_for_leapfrog_metadata():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "leapfrog_blocks.csv")
+        with open(blocks_path, "w", encoding="utf-8") as handle:
+            handle.write("# arbitrary export note\n")
+            handle.write("# another comment without a known key\n")
+            handle.write("x,y,z,dom\n")
+            handle.write("1,2,3,A\n")
+
+        app = _get_qt_app()
+        spin_box = viewer_module.QtWidgets.QSpinBox()
+        spin_box.setRange(1, 1_000_000)
+        spin_box.setValue(1)
+
+        effective_line = sync_csv_header_line_widget(spin_box, blocks_path)
+        app.processEvents()
+
+        assert effective_line == 3
+        assert spin_box.value() == 3
 
 
 def test_streaming_metadata_uses_leapfrog_minimum_corner_for_parent_indexing():
@@ -579,6 +613,73 @@ def test_export_block_domain_sample_metrics_can_emit_closest_sample_id_from_mult
         assert output_df.loc[0, "dom_Closest_Sample_ID"] == "DDH-01 | 10"
         assert output_df.loc[1, "dom_Closest_Sample_ID"] == "DDH-02 | 20"
         assert output_df.loc[2, "dom_Closest_Sample_ID"] == "DDH-03 | 30"
+
+
+def test_export_block_domain_sample_metrics_can_emit_nearest_sample_value_residual_metrics():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "block_metrics.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 5.0},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 9.0},
+                {"x": 25.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 11.0},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "assay": 4.0},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "assay": 10.0},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_block_domain_sample_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            sample_domain_col="sample_dom",
+            sample_value_col="assay",
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_value_col="block_grade",
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["nearest_sample_value_column"] == "Nearest_Sample_Value"
+        assert result["nearest_sample_group_std_residual_column"] == "Nearest_Sample_Group_StdResidual"
+
+        assert output_df.loc[0, "Nearest_Sample_Value"] == pytest.approx(4.0)
+        assert output_df.loc[0, "Nearest_Sample_Residual"] == pytest.approx(1.0)
+        assert output_df.loc[0, "Nearest_Sample_Abs_Residual"] == pytest.approx(1.0)
+        assert output_df.loc[0, "Nearest_Sample_Group_Block_Count"] == pytest.approx(1.0)
+        assert output_df.loc[0, "Nearest_Sample_Group_Mean_Residual"] == pytest.approx(1.0)
+        assert output_df.loc[0, "Nearest_Sample_Group_RMS_Residual"] == pytest.approx(1.0)
+        assert output_df.loc[0, "Nearest_Sample_Group_StdResidual"] == pytest.approx(1.0)
+
+        assert output_df.loc[1, "Nearest_Sample_Value"] == pytest.approx(10.0)
+        assert output_df.loc[1, "Nearest_Sample_Residual"] == pytest.approx(-1.0)
+        assert output_df.loc[1, "Nearest_Sample_Abs_Residual"] == pytest.approx(1.0)
+        assert output_df.loc[1, "Nearest_Sample_Group_Block_Count"] == pytest.approx(2.0)
+        assert output_df.loc[1, "Nearest_Sample_Group_Mean_Residual"] == pytest.approx(0.0)
+        assert output_df.loc[1, "Nearest_Sample_Group_RMS_Residual"] == pytest.approx(1.0)
+        assert output_df.loc[1, "Nearest_Sample_Group_StdResidual"] == pytest.approx(-1.0)
+
+        assert output_df.loc[2, "Nearest_Sample_Value"] == pytest.approx(10.0)
+        assert output_df.loc[2, "Nearest_Sample_Residual"] == pytest.approx(1.0)
+        assert output_df.loc[2, "Nearest_Sample_Abs_Residual"] == pytest.approx(1.0)
+        assert output_df.loc[2, "Nearest_Sample_Group_Block_Count"] == pytest.approx(2.0)
+        assert output_df.loc[2, "Nearest_Sample_Group_Mean_Residual"] == pytest.approx(0.0)
+        assert output_df.loc[2, "Nearest_Sample_Group_RMS_Residual"] == pytest.approx(1.0)
+        assert output_df.loc[2, "Nearest_Sample_Group_StdResidual"] == pytest.approx(1.0)
 
 
 def test_export_block_domain_sample_metrics_uses_explicit_sample_domains_without_block_size():
