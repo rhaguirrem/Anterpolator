@@ -682,6 +682,66 @@ def test_export_block_domain_sample_metrics_can_emit_nearest_sample_value_residu
         assert output_df.loc[2, "Nearest_Sample_Group_StdResidual"] == pytest.approx(1.0)
 
 
+def test_export_block_domain_sample_metrics_can_select_knn_average_without_exporting_unchecked_metrics():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "block_metrics.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 5.0},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 7.0},
+                {"x": 25.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 9.0},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 0.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "hole": "DDH-01", "assay": 4.0},
+                {"sx": 10.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "hole": "DDH-02", "assay": 6.0},
+                {"sx": 30.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "hole": "DDH-03", "assay": 10.0},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_block_domain_sample_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            sample_domain_col="sample_dom",
+            sample_value_col="assay",
+            selected_metrics=["nearest_distance", "average_distance_knn"],
+            average_distance_knn_k=2,
+            closest_sample_id_cols=["hole"],
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_value_col="block_grade",
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["selected_metrics"] == ["nearest_distance", "average_distance_knn"]
+        assert result["average_distance_column"] is None
+        assert result["average_distance_knn_column"] == "dom_Avg_Distance_KNN"
+        assert result["average_distance_knn_k"] == 2
+        assert result["closest_sample_id_column"] is None
+        assert result["nearest_sample_value_column"] is None
+
+        assert "dom_NN_Distance" in output_df.columns
+        assert "dom_Avg_Distance_KNN" in output_df.columns
+        assert "dom_Avg_Distance" not in output_df.columns
+        assert "dom_Closest_Sample_ID" not in output_df.columns
+        assert "Nearest_Sample_Value" not in output_df.columns
+
+        assert output_df["dom_NN_Distance"].tolist() == pytest.approx([5.0, 5.0, 5.0])
+        assert output_df["dom_Avg_Distance_KNN"].tolist() == pytest.approx([5.0, 10.0, 10.0])
+
+
 def test_export_block_domain_sample_metrics_uses_explicit_sample_domains_without_block_size():
     with tempfile.TemporaryDirectory() as td:
         blocks_path = os.path.join(td, "blocks.csv")
