@@ -509,6 +509,47 @@ def test_export_samples_with_block_values_from_blocks_transfers_multiple_columns
         assert output_df.loc[1, "lith"] == "waste"
 
 
+def test_export_domained_samples_preserves_empty_columns():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "domained.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A"},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": "B"},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 5.0, "sy": 5.0, "sz": 5.0, "empty_col": ""},
+                {"sx": 15.0, "sy": 5.0, "sz": 5.0, "empty_col": ""},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_domained_samples_from_blocks(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_size=(10, 10, 10),
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["matched_samples"] == 2
+        assert "empty_col" in output_df.columns
+        assert output_df["empty_col"].isna().all()
+
+
 def test_export_block_domain_sample_metrics_applies_sample_filters():
     with tempfile.TemporaryDirectory() as td:
         blocks_path = os.path.join(td, "blocks.csv")
@@ -539,6 +580,7 @@ def test_export_block_domain_sample_metrics_applies_sample_filters():
             sample_x_col="sx",
             sample_y_col="sy",
             sample_z_col="sz",
+            sample_value_col="grade",
             block_x_col="x",
             block_y_col="y",
             block_z_col="z",
@@ -551,6 +593,7 @@ def test_export_block_domain_sample_metrics_applies_sample_filters():
         )
 
         output_df = pd.read_csv(output_path)
+        nearest_distance_column = result["nearest_distance_column"]
 
         assert result["filtered_samples"] == 2
         assert result["matched_samples"] == 2
@@ -558,13 +601,13 @@ def test_export_block_domain_sample_metrics_applies_sample_filters():
         assert "sample_count_column" not in result
         assert "dom_Sample_Count" not in output_df.columns
 
-        assert output_df.loc[0, "dom_NN_Distance"] == 13.0
+        assert output_df.loc[0, nearest_distance_column] == 13.0
         assert output_df.loc[0, "dom_Avg_Distance"] == 13.0
 
-        assert output_df.loc[1, "dom_NN_Distance"] == 3.0
+        assert output_df.loc[1, nearest_distance_column] == 3.0
         assert output_df.loc[1, "dom_Avg_Distance"] == 3.0
 
-        assert output_df.loc[2, "dom_NN_Distance"] == 0.0
+        assert output_df.loc[2, nearest_distance_column] == 0.0
         assert output_df.loc[2, "dom_Avg_Distance"] == 0.0
 
 
@@ -576,17 +619,17 @@ def test_export_block_domain_sample_metrics_can_emit_closest_sample_id_from_mult
 
         pd.DataFrame(
             [
-                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A"},
-                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": "A"},
-                {"x": 25.0, "y": 5.0, "z": 5.0, "dom": "B"},
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 1.0},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 2.0},
+                {"x": 25.0, "y": 5.0, "z": 5.0, "dom": "B", "block_grade": 3.0},
             ]
         ).to_csv(blocks_path, index=False)
 
         pd.DataFrame(
             [
-                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "hole": "DDH-01", "from_m": 10, "lith": "A"},
-                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "hole": "DDH-02", "from_m": 20, "lith": "A"},
-                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "hole": "DDH-03", "from_m": 30, "lith": "B"},
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "hole": "DDH-01", "from_m": 10, "lith": "A", "assay": 1.5},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "hole": "DDH-02", "from_m": 20, "lith": "A", "assay": 2.5},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "hole": "DDH-03", "from_m": 30, "lith": "B", "assay": 3.5},
             ]
         ).to_csv(samples_path, index=False)
 
@@ -598,21 +641,112 @@ def test_export_block_domain_sample_metrics_can_emit_closest_sample_id_from_mult
             sample_y_col="sy",
             sample_z_col="sz",
             sample_domain_col="lith",
+            sample_value_col="assay",
             closest_sample_id_cols=["hole", "from_m"],
             block_x_col="x",
             block_y_col="y",
             block_z_col="z",
             block_domain_col="dom",
+            block_value_col="block_grade",
             block_size=(10, 10, 10),
         )
 
         output_df = pd.read_csv(output_path)
 
-        assert result["closest_sample_id_column"] == "dom_Closest_Sample_ID"
+        assert result["closest_sample_id_column"] == "block_grade_dom_Closest_Sample_ID"
         assert result["closest_sample_id_source_columns"] == ["hole", "from_m"]
-        assert output_df.loc[0, "dom_Closest_Sample_ID"] == "DDH-01 | 10"
-        assert output_df.loc[1, "dom_Closest_Sample_ID"] == "DDH-02 | 20"
-        assert output_df.loc[2, "dom_Closest_Sample_ID"] == "DDH-03 | 30"
+        assert output_df.loc[0, "block_grade_dom_Closest_Sample_ID"] == "DDH-01 | 10"
+        assert output_df.loc[1, "block_grade_dom_Closest_Sample_ID"] == "DDH-02 | 20"
+        assert output_df.loc[2, "block_grade_dom_Closest_Sample_ID"] == "DDH-03 | 30"
+
+
+def test_export_block_domain_sample_metrics_can_disable_prefix_for_closest_sample_id_column():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "block_metrics.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 1.0},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "hole": "DDH-01", "lith": "A", "assay": 1.5},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_block_domain_sample_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            sample_domain_col="lith",
+            sample_value_col="assay",
+            selected_metrics=["closest_sample_id"],
+            closest_sample_id_cols=["hole"],
+            use_block_value_prefix=False,
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_value_col="block_grade",
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["closest_sample_id_column"] == "dom_Closest_Sample_ID"
+        assert "dom_Closest_Sample_ID" in output_df.columns
+        assert "block_grade_dom_Closest_Sample_ID" not in output_df.columns
+        assert output_df.loc[0, "dom_Closest_Sample_ID"] == "DDH-01"
+
+
+def test_export_block_domain_sample_metrics_closest_sample_id_ignores_nearer_samples_without_values():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "block_metrics.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 1.0},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 4.0, "sy": 5.0, "sz": 5.0, "hole": "DDH-NULL", "lith": "A", "assay": np.nan},
+                {"sx": 9.0, "sy": 5.0, "sz": 5.0, "hole": "DDH-VALID", "lith": "A", "assay": 9.0},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_block_domain_sample_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            sample_domain_col="lith",
+            sample_value_col="assay",
+            selected_metrics=["closest_sample_id"],
+            closest_sample_id_cols=["hole"],
+            use_block_value_prefix=False,
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_value_col="block_grade",
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["closest_sample_id_column"] == "dom_Closest_Sample_ID"
+        assert output_df.loc[0, "dom_Closest_Sample_ID"] == "DDH-VALID"
 
 
 def test_export_block_domain_sample_metrics_can_emit_nearest_sample_value_residual_metrics():
@@ -653,33 +787,90 @@ def test_export_block_domain_sample_metrics_can_emit_nearest_sample_value_residu
         )
 
         output_df = pd.read_csv(output_path)
+        nearest_sample_value_column = result["nearest_sample_value_column"]
+        nearest_sample_residual_column = result["nearest_sample_residual_column"]
+        nearest_sample_abs_residual_column = result["nearest_sample_abs_residual_column"]
+        nearest_sample_group_block_count_column = result["nearest_sample_group_block_count_column"]
+        nearest_sample_group_mean_residual_column = result["nearest_sample_group_mean_residual_column"]
+        nearest_sample_group_rms_residual_column = result["nearest_sample_group_rms_residual_column"]
+        nearest_sample_group_std_residual_column = result["nearest_sample_group_std_residual_column"]
 
-        assert result["nearest_sample_value_column"] == "Nearest_Sample_Value"
-        assert result["nearest_sample_group_std_residual_column"] == "Nearest_Sample_Group_StdResidual"
+        assert nearest_sample_value_column == "block_grade_Nearest_Sample_Value"
+        assert nearest_sample_group_std_residual_column == "block_grade_Nearest_Sample_Group_StdResidual"
 
-        assert output_df.loc[0, "Nearest_Sample_Value"] == pytest.approx(4.0)
-        assert output_df.loc[0, "Nearest_Sample_Residual"] == pytest.approx(1.0)
-        assert output_df.loc[0, "Nearest_Sample_Abs_Residual"] == pytest.approx(1.0)
-        assert output_df.loc[0, "Nearest_Sample_Group_Block_Count"] == pytest.approx(1.0)
-        assert output_df.loc[0, "Nearest_Sample_Group_Mean_Residual"] == pytest.approx(1.0)
-        assert output_df.loc[0, "Nearest_Sample_Group_RMS_Residual"] == pytest.approx(1.0)
-        assert output_df.loc[0, "Nearest_Sample_Group_StdResidual"] == pytest.approx(1.0)
+        assert output_df.loc[0, nearest_sample_value_column] == pytest.approx(4.0)
+        assert output_df.loc[0, nearest_sample_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[0, nearest_sample_abs_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[0, nearest_sample_group_block_count_column] == pytest.approx(1.0)
+        assert output_df.loc[0, nearest_sample_group_mean_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[0, nearest_sample_group_rms_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[0, nearest_sample_group_std_residual_column] == pytest.approx(1.0)
 
-        assert output_df.loc[1, "Nearest_Sample_Value"] == pytest.approx(10.0)
-        assert output_df.loc[1, "Nearest_Sample_Residual"] == pytest.approx(-1.0)
-        assert output_df.loc[1, "Nearest_Sample_Abs_Residual"] == pytest.approx(1.0)
-        assert output_df.loc[1, "Nearest_Sample_Group_Block_Count"] == pytest.approx(2.0)
-        assert output_df.loc[1, "Nearest_Sample_Group_Mean_Residual"] == pytest.approx(0.0)
-        assert output_df.loc[1, "Nearest_Sample_Group_RMS_Residual"] == pytest.approx(1.0)
-        assert output_df.loc[1, "Nearest_Sample_Group_StdResidual"] == pytest.approx(-1.0)
+        assert output_df.loc[1, nearest_sample_value_column] == pytest.approx(10.0)
+        assert output_df.loc[1, nearest_sample_residual_column] == pytest.approx(-1.0)
+        assert output_df.loc[1, nearest_sample_abs_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[1, nearest_sample_group_block_count_column] == pytest.approx(2.0)
+        assert output_df.loc[1, nearest_sample_group_mean_residual_column] == pytest.approx(0.0)
+        assert output_df.loc[1, nearest_sample_group_rms_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[1, nearest_sample_group_std_residual_column] == pytest.approx(-1.0)
 
-        assert output_df.loc[2, "Nearest_Sample_Value"] == pytest.approx(10.0)
-        assert output_df.loc[2, "Nearest_Sample_Residual"] == pytest.approx(1.0)
-        assert output_df.loc[2, "Nearest_Sample_Abs_Residual"] == pytest.approx(1.0)
-        assert output_df.loc[2, "Nearest_Sample_Group_Block_Count"] == pytest.approx(2.0)
-        assert output_df.loc[2, "Nearest_Sample_Group_Mean_Residual"] == pytest.approx(0.0)
-        assert output_df.loc[2, "Nearest_Sample_Group_RMS_Residual"] == pytest.approx(1.0)
-        assert output_df.loc[2, "Nearest_Sample_Group_StdResidual"] == pytest.approx(1.0)
+        assert output_df.loc[2, nearest_sample_value_column] == pytest.approx(10.0)
+        assert output_df.loc[2, nearest_sample_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[2, nearest_sample_abs_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[2, nearest_sample_group_block_count_column] == pytest.approx(2.0)
+        assert output_df.loc[2, nearest_sample_group_mean_residual_column] == pytest.approx(0.0)
+        assert output_df.loc[2, nearest_sample_group_rms_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[2, nearest_sample_group_std_residual_column] == pytest.approx(1.0)
+
+
+def test_export_block_domain_sample_metrics_skips_closer_samples_without_values_for_value_metrics():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "block_metrics.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A", "block_grade": 5.0},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        pd.DataFrame(
+            [
+                {"sx": 4.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "assay": np.nan, "hole": "DDH-NULL"},
+                {"sx": 9.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "assay": 9.0, "hole": "DDH-VALID"},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_block_domain_sample_metrics(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            sample_domain_col="sample_dom",
+            sample_value_col="assay",
+            selected_metrics=["nearest_distance", "closest_sample_id", "nearest_sample_value", "nearest_sample_residual"],
+            closest_sample_id_cols=["hole"],
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            block_value_col="block_grade",
+        )
+
+        output_df = pd.read_csv(output_path)
+        nearest_sample_value_column = result["nearest_sample_value_column"]
+        nearest_sample_residual_column = result["nearest_sample_residual_column"]
+        nearest_distance_column = result["nearest_distance_column"]
+
+        assert nearest_distance_column == "block_grade_dom_NN_Distance"
+        assert output_df.loc[0, nearest_distance_column] == pytest.approx(4.0)
+        assert output_df.loc[0, "block_grade_dom_Closest_Sample_ID"] == "DDH-VALID"
+        assert output_df.loc[0, nearest_sample_value_column] == pytest.approx(9.0)
+        assert output_df.loc[0, nearest_sample_residual_column] == pytest.approx(-4.0)
+        assert nearest_sample_value_column == "block_grade_Nearest_Sample_Value"
 
 
 def test_export_block_domain_sample_metrics_can_select_knn_average_without_exporting_unchecked_metrics():
@@ -724,6 +915,7 @@ def test_export_block_domain_sample_metrics_can_select_knn_average_without_expor
         )
 
         output_df = pd.read_csv(output_path)
+        nearest_distance_column = result["nearest_distance_column"]
 
         assert result["selected_metrics"] == ["nearest_distance", "average_distance_knn"]
         assert result["average_distance_column"] is None
@@ -732,13 +924,14 @@ def test_export_block_domain_sample_metrics_can_select_knn_average_without_expor
         assert result["closest_sample_id_column"] is None
         assert result["nearest_sample_value_column"] is None
 
-        assert "dom_NN_Distance" in output_df.columns
+        assert nearest_distance_column == "block_grade_dom_NN_Distance"
+        assert nearest_distance_column in output_df.columns
         assert "dom_Avg_Distance_KNN" in output_df.columns
         assert "dom_Avg_Distance" not in output_df.columns
         assert "dom_Closest_Sample_ID" not in output_df.columns
         assert "Nearest_Sample_Value" not in output_df.columns
 
-        assert output_df["dom_NN_Distance"].tolist() == pytest.approx([5.0, 5.0, 5.0])
+        assert output_df[nearest_distance_column].tolist() == pytest.approx([5.0, 5.0, 5.0])
         assert output_df["dom_Avg_Distance_KNN"].tolist() == pytest.approx([5.0, 10.0, 10.0])
 
 
@@ -758,10 +951,10 @@ def test_export_block_domain_sample_metrics_uses_explicit_sample_domains_without
 
         pd.DataFrame(
             [
-                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A"},
-                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A"},
-                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B"},
-                {"sx": 30.0, "sy": 5.0, "sz": 5.0, "sample_dom": "C"},
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "sample_grade": 1.0},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "sample_grade": 2.0},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B", "sample_grade": 3.0},
+                {"sx": 30.0, "sy": 5.0, "sz": 5.0, "sample_dom": "C", "sample_grade": 4.0},
             ]
         ).to_csv(samples_path, index=False)
 
@@ -773,6 +966,7 @@ def test_export_block_domain_sample_metrics_uses_explicit_sample_domains_without
             sample_y_col="sy",
             sample_z_col="sz",
             sample_domain_col="sample_dom",
+            sample_value_col="sample_grade",
             block_x_col="x",
             block_y_col="y",
             block_z_col="z",
@@ -781,12 +975,13 @@ def test_export_block_domain_sample_metrics_uses_explicit_sample_domains_without
         )
 
         output_df = pd.read_csv(output_path)
+        nearest_distance_column = result["nearest_distance_column"]
 
         assert result["matched_samples"] == 3
         assert result["unmatched_samples"] == 1
-        assert output_df.loc[0, "dom_NN_Distance"] == 3.0
-        assert output_df.loc[1, "dom_NN_Distance"] == 3.0
-        assert output_df.loc[2, "dom_NN_Distance"] == 0.0
+        assert output_df.loc[0, nearest_distance_column] == 3.0
+        assert output_df.loc[1, nearest_distance_column] == 3.0
+        assert output_df.loc[2, nearest_distance_column] == 0.0
 
 
 def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_explicit_domains():
@@ -805,11 +1000,11 @@ def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_ex
 
         pd.DataFrame(
             [
-                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A"},
-                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A"},
-                {"sx": 40.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A"},
-                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B"},
-                {"sx": 31.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B"},
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "assay": 1.0},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "assay": 2.0},
+                {"sx": 40.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "assay": 3.0},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B", "assay": 4.0},
+                {"sx": 31.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B", "assay": 5.0},
             ]
         ).to_csv(samples_path, index=False)
 
@@ -821,6 +1016,7 @@ def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_ex
             sample_y_col="sy",
             sample_z_col="sz",
             sample_domain_col="sample_dom",
+            sample_value_col="assay",
             distance_count_step=5.0,
             distance_count_max_factor=2,
             block_x_col="x",
@@ -877,10 +1073,10 @@ def test_export_block_domain_sample_metrics_summary_works_for_inferred_domains()
 
         pd.DataFrame(
             [
-                {"sx": 2.0, "sy": 5.0, "sz": 5.0},
-                {"sx": 18.0, "sy": 5.0, "sz": 5.0},
-                {"sx": 25.0, "sy": 5.0, "sz": 5.0},
-                {"sx": 28.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "assay": 1.0},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "assay": 2.0},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "assay": 3.0},
+                {"sx": 28.0, "sy": 5.0, "sz": 5.0, "assay": 4.0},
             ]
         ).to_csv(samples_path, index=False)
 
@@ -891,6 +1087,7 @@ def test_export_block_domain_sample_metrics_summary_works_for_inferred_domains()
             sample_x_col="sx",
             sample_y_col="sy",
             sample_z_col="sz",
+            sample_value_col="assay",
             distance_count_step=5.0,
             distance_count_max_factor=2,
             block_x_col="x",
@@ -929,10 +1126,10 @@ def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_in
 
         pd.DataFrame(
             [
-                {"sx": 2.0, "sy": 5.0, "sz": 5.0},
-                {"sx": 18.0, "sy": 5.0, "sz": 5.0},
-                {"sx": 25.0, "sy": 5.0, "sz": 5.0},
-                {"sx": 28.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "assay": 1.0},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "assay": 2.0},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "assay": 3.0},
+                {"sx": 28.0, "sy": 5.0, "sz": 5.0, "assay": 4.0},
             ]
         ).to_csv(samples_path, index=False)
 
@@ -943,6 +1140,7 @@ def test_export_block_domain_sample_metrics_can_emit_distance_band_counts_for_in
             sample_x_col="sx",
             sample_y_col="sy",
             sample_z_col="sz",
+            sample_value_col="assay",
             distance_count_step=5.0,
             distance_count_max_factor=2,
             block_x_col="x",
@@ -1699,9 +1897,9 @@ def test_export_block_domain_sample_metrics_can_infer_blank_explicit_sample_doma
 
         pd.DataFrame(
             [
-                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A"},
-                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "sample_dom": ""},
-                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B"},
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "sample_dom": "A", "assay": 1.0},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "sample_dom": "", "assay": 2.0},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "sample_dom": "B", "assay": 3.0},
             ]
         ).to_csv(samples_path, index=False)
 
@@ -1713,6 +1911,7 @@ def test_export_block_domain_sample_metrics_can_infer_blank_explicit_sample_doma
             sample_y_col="sy",
             sample_z_col="sz",
             sample_domain_col="sample_dom",
+            sample_value_col="assay",
             block_x_col="x",
             block_y_col="y",
             block_z_col="z",
@@ -1785,9 +1984,9 @@ def test_export_block_domain_sample_metrics_reports_progress():
 
         pd.DataFrame(
             [
-                {"sx": 2.0, "sy": 5.0, "sz": 5.0},
-                {"sx": 18.0, "sy": 5.0, "sz": 5.0},
-                {"sx": 25.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 2.0, "sy": 5.0, "sz": 5.0, "assay": 1.0},
+                {"sx": 18.0, "sy": 5.0, "sz": 5.0, "assay": 2.0},
+                {"sx": 25.0, "sy": 5.0, "sz": 5.0, "assay": 3.0},
             ]
         ).to_csv(samples_path, index=False)
 
@@ -1798,6 +1997,7 @@ def test_export_block_domain_sample_metrics_reports_progress():
             sample_x_col="sx",
             sample_y_col="sy",
             sample_z_col="sz",
+            sample_value_col="assay",
             block_x_col="x",
             block_y_col="y",
             block_z_col="z",

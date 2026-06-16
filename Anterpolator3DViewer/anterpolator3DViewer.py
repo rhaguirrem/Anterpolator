@@ -689,7 +689,8 @@ def read_selected_columns_with_header(path, delimiter, header_line, selected_col
 
 def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_line=1,
                           sample_x_col=None, sample_y_col=None, sample_z_col=None, sample_value_col=None,
-                          sample_domain_col=None, sample_filters=None, progress_label=None):
+                          sample_domain_col=None, sample_filters=None, progress_label=None,
+                          extra_columns=None):
     explicit_mapping = all([sample_x_col, sample_y_col, sample_z_col, sample_value_col])
     if explicit_mapping:
         delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
@@ -697,6 +698,10 @@ def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_
         selected_domain_col = str(sample_domain_col or '').strip()
         if selected_domain_col and selected_domain_col != '(None)':
             selected_columns.append(selected_domain_col)
+        for column_name in extra_columns or []:
+            normalized = str(column_name or '').strip()
+            if normalized and normalized != '(None)':
+                selected_columns.append(normalized)
         selected_columns.extend(collect_filter_fields(sample_filters))
         selected_columns = list(dict.fromkeys(selected_columns))
         df, parsed_cols = read_selected_columns_with_header(
@@ -750,6 +755,30 @@ def normalize_selected_sample_domain_column(df, sample_domain_col=None):
             break
     if domain_like and domain_like != 'Domain':
         df = df.rename(columns={domain_like: 'Domain'})
+    return df
+
+
+def normalize_selected_sample_weight_column(df, sample_weight_col=None, sample_value_col=None):
+    selected_weight_col = str(sample_weight_col or '').strip()
+    if not selected_weight_col or selected_weight_col == '(None)':
+        return df
+
+    selected_value_col = str(sample_value_col or '').strip()
+    if selected_weight_col == 'Weight' and 'Weight' in df.columns:
+        return df
+
+    weight_source = selected_weight_col
+    if weight_source not in df.columns:
+        if selected_value_col and selected_weight_col == selected_value_col and 'Value' in df.columns:
+            weight_source = 'Value'
+        else:
+            raise ValueError(f"Selected sample weight column not found in samples file: {selected_weight_col}")
+
+    if weight_source == 'Weight':
+        return df
+
+    df = df.copy()
+    df['Weight'] = df[weight_source]
     return df
 
 
@@ -1209,6 +1238,224 @@ def compute_domain_sensitive_assignment_mask(block_indices, allowed_grid, domain
         domain_match_mask[index] = sample_domain == block_domain
     return allowed_mask & domain_match_mask
 
+
+def aggregate_samples_into_blocks(points, values, grid_index_origin, unified_dims,
+                                  allowed_grid=None, domain_mapping=None, sample_domains=None,
+                                  sample_ids=None, sample_weights=None,
+                                  progress_label='Assigning points to blocks'):
+    points_array = np.asarray(points, dtype=float)
+    values_array = np.asarray(values, dtype=float)
+    grid_origin = np.asarray(grid_index_origin, dtype=float)
+    block_dims = np.asarray(unified_dims, dtype=float)
+
+    if len(points_array) != len(values_array):
+        raise ValueError('Points and values must have the same length for sample-block aggregation.')
+    if sample_ids is not None and len(sample_ids) != len(points_array):
+        raise ValueError('Sample IDs must have the same length as points for sample-block aggregation.')
+    if sample_weights is not None and len(sample_weights) != len(points_array):
+        raise ValueError('Sample weights must have the same length as points for sample-block aggregation.')
+
+    weights_array = None
+    if sample_weights is not None:
+        weights_array = np.asarray(sample_weights, dtype=float)
+        if np.any(~np.isfinite(weights_array)):
+            raise ValueError('Sample weights must be finite numeric values for sample-block aggregation.')
+        if np.any(weights_array <= 0.0):
+            raise ValueError('Sample weights must be greater than zero for sample-block aggregation.')
+
+    block_indices = np.floor((points_array - grid_origin) / block_dims + 1e-6).astype(int)
+    if allowed_grid is None:
+        assigned_mask = np.ones(len(points_array), dtype=bool)
+        domain_mismatch_count = 0
+    else:
+        allowed_mask = np.array([tuple(idx) in allowed_grid for idx in block_indices], dtype=bool)
+        assigned_mask = compute_domain_sensitive_assignment_mask(
+            block_indices,
+            allowed_grid,
+            domain_mapping=domain_mapping,
+            sample_domains=sample_domains,
+        )
+        domain_mismatch_count = int(np.count_nonzero(allowed_mask & ~assigned_mask))
+
+    sample_block_sums = {}
+    sample_block_counts = {}
+    sample_block_weight_sums = {}
+    sample_block_domain_counts = {}
+    sample_block_ids = {}
+    for index in tqdm(range(len(points_array)), desc=progress_label):
+        if not assigned_mask[index]:
+            continue
+
+        block_idx = tuple(int(v) for v in block_indices[index])
+        sample_weight = 1.0 if weights_array is None else float(weights_array[index])
+        sample_block_sums[block_idx] = sample_block_sums.get(block_idx, 0.0) + float(values_array[index]) * sample_weight
+        sample_block_counts[block_idx] = sample_block_counts.get(block_idx, 0) + 1
+        sample_block_weight_sums[block_idx] = sample_block_weight_sums.get(block_idx, 0.0) + sample_weight
+
+        if sample_domains is not None:
+            sample_domain = str(sample_domains[index]).strip() if sample_domains[index] is not None else ''
+            if sample_domain and sample_domain.lower() != 'nan':
+                domain_counts = sample_block_domain_counts.setdefault(block_idx, {})
+                domain_counts[sample_domain] = domain_counts.get(sample_domain, 0) + 1
+
+        if sample_ids is not None:
+            sample_id = '' if sample_ids[index] is None else str(sample_ids[index]).strip()
+            if sample_id:
+                sample_block_ids.setdefault(block_idx, []).append(sample_id)
+
+    sample_block_values = {
+        block_idx: sample_block_sums[block_idx] / float(sample_block_weight_sums[block_idx])
+        for block_idx in sample_block_counts
+        if sample_block_weight_sums.get(block_idx, 0.0) > 0.0
+    }
+
+    return {
+        'block_indices': block_indices,
+        'assigned_mask': assigned_mask,
+        'domain_mismatch_count': domain_mismatch_count,
+        'sample_block_values': sample_block_values,
+        'sample_block_counts': sample_block_counts,
+        'sample_block_weight_sums': sample_block_weight_sums,
+        'sample_block_domain_counts': sample_block_domain_counts,
+        'sample_block_ids': sample_block_ids,
+    }
+
+
+def _select_majority_sample_block_domains(sample_block_domain_counts):
+    resolved_domains = {}
+    for block_idx, domain_counts in (sample_block_domain_counts or {}).items():
+        if not domain_counts:
+            continue
+        max_count = max(domain_counts.values())
+        tied_domains = sorted(domain for domain, count in domain_counts.items() if count == max_count)
+        if tied_domains:
+            resolved_domains[block_idx] = tied_domains[0]
+    return resolved_domains
+
+
+def _build_sample_block_rows(sample_block_values, sample_block_counts, reference_origin, block_size,
+                             rotation_matrix=None, rotation_center=None, domain_mapping=None,
+                             sample_count_column_name='Sample_Count', sample_ids_by_block=None,
+                             sample_ids_column_name='SampleIDs'):
+    rows = []
+    origin = np.asarray(reference_origin, dtype=float)
+    dims = np.asarray(block_size, dtype=float)
+    for block_idx in sorted(sample_block_values):
+        point = origin + (np.asarray(block_idx, dtype=float) + 0.5) * dims
+        if rotation_matrix is not None and rotation_center is not None:
+            point = point @ rotation_matrix + rotation_center
+
+        row = {
+            'x': float(point[0]),
+            'y': float(point[1]),
+            'z': float(point[2]),
+            'Value': float(sample_block_values[block_idx]),
+            sample_count_column_name: int(sample_block_counts.get(block_idx, 0)),
+        }
+        if sample_ids_by_block is not None:
+            ordered_unique_ids = list(dict.fromkeys(sample_ids_by_block.get(block_idx, [])))
+            row[sample_ids_column_name] = ' ; '.join(ordered_unique_ids)
+        if domain_mapping is not None:
+            domain_value = str(domain_mapping.get(block_idx, '')).strip()
+            if domain_value:
+                row['Domain'] = domain_value
+        rows.append(row)
+    return rows
+
+
+def _load_block_assignment_metadata(blocks_file, block_size, blocks_delimiter=None, blocks_header_line=1,
+                                    block_x_col=None, block_y_col=None, block_z_col=None,
+                                    block_domain_col=None, block_filters=None, config=None,
+                                    progress_callback=None):
+    if not blocks_file or not os.path.isfile(blocks_file):
+        raise ValueError('Please select a valid blocks file.')
+    if block_size is None:
+        raise ValueError('Block size must be specified for sample-block export.')
+
+    if not is_bmf_file(blocks_file):
+        delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
+        metadata = load_large_blocks_metadata(
+            blocks_file,
+            delimiter,
+            blocks_header_line or 1,
+            block_size,
+            None,
+            block_x_col=block_x_col,
+            block_y_col=block_y_col,
+            block_z_col=block_z_col,
+            block_domain_col=block_domain_col,
+            block_filters=block_filters,
+            config=config,
+            progress_callback=progress_callback,
+        )
+        metadata['allowed_grid'] = set(metadata['domain_mapping'].keys())
+        return metadata
+
+    df_blocks, _ = load_full_blocks_dataframe(
+        blocks_file,
+        blocks_delimiter=blocks_delimiter,
+        blocks_header_line=blocks_header_line,
+        block_filters=block_filters,
+        progress_label='Reading blocks file',
+        progress_callback=progress_callback,
+    )
+    block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
+        list(df_blocks.columns),
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+    )
+    coord_frame = df_blocks[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
+    valid_mask = coord_frame.notna().all(axis=1)
+    if not valid_mask.any():
+        raise ValueError('No valid block coordinates remain after numeric coercion.')
+
+    aligned_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
+    rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(aligned_coords, block_size_hint=block_size)
+    if is_rotated:
+        aligned_coords = (aligned_coords - rotation_center) @ rotation_matrix.T
+
+    if isinstance(block_size, (list, tuple, np.ndarray)):
+        unified_dims = np.asarray(block_size, dtype=float)
+    else:
+        unified_dims = np.array([block_size, block_size, block_size], dtype=float)
+
+    all_min_bounds = np.min(aligned_coords, axis=0)
+    all_max_bounds = np.max(aligned_coords, axis=0)
+    grid_indices = np.floor((aligned_coords - all_min_bounds) / unified_dims + 1e-6).astype(int)
+    grid_index_origin = all_min_bounds - (unified_dims / 2.0)
+
+    if block_domain_col and str(block_domain_col).strip() and str(block_domain_col).strip() != '(None)':
+        if block_domain_col not in df_blocks.columns:
+            raise ValueError(f'Selected domain column not found in blocks file: {block_domain_col}')
+        domains = df_blocks.loc[valid_mask, block_domain_col].fillna('Undomained').astype(str).str.strip()
+        domains = domains.replace('', 'Undomained')
+    else:
+        domains = pd.Series(['Undomained'] * int(valid_mask.sum()))
+
+    domain_mapping, subblock_counts, mixed_domain_blocks = resolve_base_block_domains(
+        grid_indices,
+        domains,
+        policy='majority',
+    )
+    return {
+        'all_min_bounds': np.array(all_min_bounds, copy=True),
+        'all_max_bounds': np.array(all_max_bounds, copy=True),
+        'unified_dims': np.array(unified_dims, copy=True),
+        'domain_mapping': domain_mapping,
+        'subblock_counts': subblock_counts,
+        'mixed_domain_blocks': mixed_domain_blocks,
+        'rotation_matrix': rotation_matrix,
+        'rotation_center': rotation_center,
+        'is_rotated': is_rotated,
+        'grid_reference': np.array(grid_index_origin, copy=True),
+        'min_quantized_idx': np.min(grid_indices, axis=0),
+        'grid_index_origin': np.array(grid_index_origin, copy=True),
+        'leapfrog_metadata': {},
+        'source_blocks_header_line': blocks_header_line,
+        'allowed_grid': set(domain_mapping.keys()),
+    }
+
 def build_domain_catalog_cache_signature(blocks_file, delimiter, header_line, domain_col, block_filters=None):
     stats = os.stat(blocks_file)
     return {
@@ -1298,8 +1545,17 @@ def quantize_grid_indices(coords, reference_origin, block_size):
     rounded = np.rint(scaled)
     return rounded.astype(np.int64)
 
+
+def _series_is_all_empty(series):
+    return series.isna().all() or (series.astype(str).str.strip() == '').all()
+
+
+def _list_all_empty_columns(df):
+    return [column_name for column_name in df.columns if _series_is_all_empty(df[column_name])]
+
 def read_csv_with_selected_header(path, delimiter, header_line, expected_min_cols=1,
-                                  progress_label=None, progress_callback=None):
+                                  progress_label=None, progress_callback=None,
+                                  preserve_empty_columns=False):
     """Read CSV using a specific header line (1-based). Returns DataFrame.
     Uses manual header parsing to build names and then pandas read_csv with skiprows.
     """
@@ -1327,12 +1583,11 @@ def read_csv_with_selected_header(path, delimiter, header_line, expected_min_col
     if df.shape[0] and all(str(df.iloc[0, i]).strip() == final_names[i] for i in range(min(len(final_names), df.shape[1]))):
         df = df.iloc[1:].reset_index(drop=True)
     df = strip_leading_non_data_rows(df)
-    def is_all_empty(series):
-        return series.isna().all() or (series.astype(str).str.strip() == '').all()
-    empty_cols = [c for c in df.columns if is_all_empty(df[c])]
-    if empty_cols:
+    empty_cols = _list_all_empty_columns(df)
+    non_empty_column_count = int(df.shape[1] - len(empty_cols))
+    if empty_cols and not preserve_empty_columns:
         df = df.drop(columns=empty_cols)
-    if df.shape[1] < expected_min_cols:
+    if non_empty_column_count < expected_min_cols:
         raise ValueError(f"File '{path}' has fewer than {expected_min_cols} non-empty columns after cleanup.")
     df._detected_delimiter = delimiter
     return df, final_names
@@ -1362,7 +1617,7 @@ def detect_csv_delimiter(path):
     return delim if counts[delim] > 0 else ','
 
 def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=None,
-            progress_callback=None):
+            progress_callback=None, preserve_empty_columns=False):
     """Read a CSV file detecting delimiter (comma, semicolon, tab, pipe) unless forced.
     Drops empty columns. Returns DataFrame."""
     if not os.path.isfile(path):
@@ -1409,12 +1664,11 @@ def read_autodetect_csv(path, min_cols=1, forced_delimiter=None, progress_label=
                 except Exception:
                     pass
     df = strip_leading_non_data_rows(df)
-    def is_all_empty(series):
-        return series.isna().all() or (series.astype(str).str.strip() == '').all()
-    empty_cols = [c for c in df.columns if is_all_empty(df[c])]
-    if empty_cols:
+    empty_cols = _list_all_empty_columns(df)
+    non_empty_column_count = int(df.shape[1] - len(empty_cols))
+    if empty_cols and not preserve_empty_columns:
         df = df.drop(columns=empty_cols)
-    if df.shape[1] < min_cols:
+    if non_empty_column_count < min_cols:
         raise ValueError(f"File '{path}' has fewer than {min_cols} non-empty columns after cleanup.")
     df._detected_delimiter = delim
     return df
@@ -2066,11 +2320,13 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                   blocks_header_line=1,
                   block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
                   config=None,
-                  sample_domains=None):
+                  sample_domains=None,
+                  sample_weights=None):
     pv = _require_pyvista()
     original_points_array = np.array(points, copy=True)
     original_values_array = np.array(values, copy=True)
     original_domains_array = np.array(sample_domains, copy=True) if sample_domains is not None else None
+    original_weights_array = np.array(sample_weights, copy=True) if sample_weights is not None else None
     # Domain interpolation in String Theory must ignore blocks_file as input.
     st_target = None
     if config and config.get('algorithm') in ('string_theory', 'net_connector'):
@@ -2232,8 +2488,6 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             else:
                 print(f"No significant rotation detected (Azimuth: {azimuth:.2f}°).")
 
-            all_min_bounds = np.min(centroids_all, axis=0)
-            all_max_bounds = np.max(centroids_all, axis=0)
             load_pbar.update(1)
             load_pbar.set_postfix_str("mapping domains")
 
@@ -2254,6 +2508,11 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 unified_dims = np.array(dims_all)
                 print(f"Auto-detected block dimensions: {unified_dims}")
 
+            observed_min_centroid = np.min(centroids_all, axis=0)
+            observed_max_centroid = np.max(centroids_all, axis=0)
+            grid_index_origin = observed_min_centroid - (unified_dims / 2.0)
+            all_min_bounds = np.array(grid_index_origin, copy=True)
+            all_max_bounds = observed_max_centroid + (unified_dims / 2.0)
             dims_grid = np.ceil((all_max_bounds - all_min_bounds) / unified_dims).astype(int)
             print("Calculated grid dimensions:", dims_grid)
             print("Building domain mapping...")
@@ -2287,7 +2546,6 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 domains,
                 policy=subblock_domain_policy,
             )
-            grid_index_origin = all_min_bounds
             source_blocks_header_line = blocks_header_line
 
             print(
@@ -2318,59 +2576,49 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         load_pbar.update(1)
         load_pbar.set_postfix_str("assigning points")
 
-        # Group sample points using the same all_min_bounds (VECTORIZED)
+        # Group sample points using the same grid origin used to index the block model.
         print("Assigning points to blocks...")
-        # Compute all block indices at once
-        points_array = np.array(points)
-        values_array = np.array(values)
-        block_indices = np.floor((points_array - np.asarray(grid_index_origin, dtype=float)) / unified_dims + 1e-6).astype(int)
-        allowed_mask = np.array([tuple(idx) in allowed_grid for idx in block_indices], dtype=bool)
-        assigned_mask = compute_domain_sensitive_assignment_mask(
-            block_indices,
-            allowed_grid,
+        sample_block_data = aggregate_samples_into_blocks(
+            points,
+            values,
+            grid_index_origin,
+            unified_dims,
+            allowed_grid=allowed_grid,
             domain_mapping=domain_mapping,
             sample_domains=sample_domains,
+            sample_weights=sample_weights,
+            progress_label='Assigning points to blocks',
         )
-        domain_mismatch_count = int(np.count_nonzero(allowed_mask & ~assigned_mask))
+        block_indices = sample_block_data['block_indices']
+        assigned_mask = sample_block_data['assigned_mask']
+        sample_block_values = sample_block_data['sample_block_values']
+        sample_block_counts = sample_block_data['sample_block_counts']
+        domain_mismatch_count = sample_block_data['domain_mismatch_count']
         if domain_mismatch_count:
             print(f"Rejected {domain_mismatch_count:,} samples whose domain does not match their target block domain.")
         
-        # Create lookup for allowed blocks
-        sample_blocks_dict = {}
-        block_values = {}
-        
-        # Group by block index
-        for i in tqdm(range(len(points_array)), desc="Assigning points to blocks"):
-            block_idx = tuple(block_indices[i])
-            if assigned_mask[i]:
-                if block_idx not in sample_blocks_dict:
-                    sample_blocks_dict[block_idx] = []
-                    block_values[block_idx] = []
-                sample_blocks_dict[block_idx].append(points_array[i])
-                block_values[block_idx].append(values_array[i])
-        
         # Count sample blocks per domain
         sample_domain_counts = {}
-        for idx in sample_blocks_dict.keys():
+        for idx in sample_block_values.keys():
             domain = domain_mapping.get(idx, "Undomained")
             sample_domain_counts[domain] = sample_domain_counts.get(domain, 0) + 1
         
         print(f"\nSample block distribution (samples assigned to blocks):")
         for domain, count in sorted(sample_domain_counts.items()):
             print(f"  {domain}: {count} sample blocks")
-        print(f"  Total sample blocks: {len(sample_blocks_dict)}")
+        print(f"  Total sample blocks: {len(sample_block_values)}")
         load_pbar.update(1)
         load_pbar.set_postfix_str("creating blocks")
 
         block_data = []
-        for idx in tqdm(sample_blocks_dict.keys(), desc="Creating blocks"):
+        for idx in tqdm(sample_block_values.keys(), desc="Creating blocks"):
             corner = all_min_bounds + np.array(idx) * unified_dims
             cell = pv.Box(bounds=(
                 corner[0], corner[0] + unified_dims[0],
                 corner[1], corner[1] + unified_dims[1],
                 corner[2], corner[2] + unified_dims[2]
             ))
-            avg_value = np.mean(block_values[idx])
+            avg_value = sample_block_values[idx]
             cell.cell_data['Value'] = np.full(cell.n_cells, avg_value)
             cell.cell_data['Raw_Value'] = np.full(cell.n_cells, avg_value)
             cell.cell_data['Is_Sample'] = np.full(cell.n_cells, True)
@@ -2401,7 +2649,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         multiblock = pv.MultiBlock(block_data)
         # Store metadata on multiblock with private-style names to avoid PyVista attribute restrictions
         multiblock._block_info = block_info
-        multiblock._sample_blocks = {idx: np.mean(vals) for idx, vals in block_values.items()}
+        multiblock._sample_blocks = dict(sample_block_values)
         multiblock._sample_assignment_data = {
             'points': original_points_array,
             'values': original_values_array,
@@ -2663,6 +2911,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         dims = np.maximum(dims, 1)
         blocks = {}
         block_values = {}
+        block_weights = {}
         block_domains = {}
         block_info = {
             'min_bounds': min_bounds,
@@ -2681,8 +2930,15 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         points_array = np.array(points)
         values_array = np.array(values)
         domains_array = None
+        weights_array = None
         if sample_domains is not None:
             domains_array = np.array(sample_domains)
+        if sample_weights is not None:
+            weights_array = np.array(sample_weights, dtype=float)
+            if len(weights_array) != len(points_array):
+                raise ValueError('Sample weights must have the same length as sample points.')
+            if np.any(~np.isfinite(weights_array)) or np.any(weights_array <= 0.0):
+                raise ValueError('Sample weights must be finite values greater than zero.')
         block_indices = ((points_array - min_bounds) // np.array(block_size)).astype(int)
         assigned_mask = np.ones(len(points_array), dtype=bool)
         
@@ -2691,10 +2947,14 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             if block_idx not in blocks:
                 blocks[block_idx] = []
                 block_values[block_idx] = []
+                if weights_array is not None:
+                    block_weights[block_idx] = []
                 if domains_array is not None:
                     block_domains[block_idx] = []
             blocks[block_idx].append(points_array[i])
             block_values[block_idx].append(values_array[i])
+            if weights_array is not None:
+                block_weights[block_idx].append(weights_array[i])
             if domains_array is not None:
                 block_domains[block_idx].append(domains_array[i])
         block_data = []
@@ -2768,7 +3028,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 corner[1], corner[1] + block_size[1],
                 corner[2], corner[2] + block_size[2]
             ))
-            avg_value = np.mean(block_values[idx])
+            avg_value = np.average(block_values[idx], weights=block_weights[idx]) if weights_array is not None else np.mean(block_values[idx])
             cell.cell_data['Value'] = np.full(cell.n_cells, avg_value)
             cell.cell_data['Is_Sample'] = np.full(cell.n_cells, True)
             cell.cell_data['Block_ID'] = np.full(cell.n_cells, next_block_id)
@@ -2777,7 +3037,10 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 dom = sample_block_domain_mapping.get(idx, "")
                 cell.cell_data['Domain'] = np.full(cell.n_cells, dom)
             block_data.append(cell)
-        sample_blocks = {idx: np.mean(vals) for idx, vals in block_values.items()}
+        sample_blocks = {
+            idx: np.average(vals, weights=block_weights[idx]) if weights_array is not None else np.mean(vals)
+            for idx, vals in block_values.items()
+        }
         multiblock = pv.MultiBlock(block_data)
         multiblock._block_info = block_info
         multiblock._sample_blocks = sample_blocks
@@ -2785,6 +3048,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'points': original_points_array,
             'values': original_values_array,
             'domains': original_domains_array,
+            'weights': original_weights_array,
             'block_indices': block_indices,
             'assigned_mask': assigned_mask,
         }
@@ -3284,6 +3548,21 @@ def _sanitize_filename_fragment(value, fallback='Domain'):
     return text.translate(INVALID_FILENAME_CHARS)
 
 
+def resolve_sample_blocks_export_path(configured_path=None, samples_file=None):
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    if samples_file and str(samples_file).strip():
+        reference_path = str(samples_file).strip()
+    else:
+        reference_path = 'samples.csv'
+
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'samples'
+    return os.path.join(output_dir, f"{base_name}_SampleBlocks.csv")
+
+
 def resolve_domain_samples_export_path(configured_path=None, samples_file=None, domain_col=None):
     configured_path = str(configured_path or '').strip()
     if configured_path:
@@ -3442,10 +3721,7 @@ def load_samples_preview_dataframe(samples_file, samples_delimiter=None, samples
 
     df = strip_leading_non_data_rows(df)
 
-    def is_all_empty(series):
-        return series.isna().all() or (series.astype(str).str.strip() == '').all()
-
-    empty_cols = [column_name for column_name in df.columns if is_all_empty(df[column_name])]
+    empty_cols = _list_all_empty_columns(df)
     if empty_cols:
         df = df.drop(columns=empty_cols)
 
@@ -3790,7 +4066,8 @@ def export_domain_symbolic_regression_equations(samples_file, output_file=None,
 
 
 def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_header_line=1,
-                                sample_filters=None, progress_label=None, progress_callback=None):
+                                sample_filters=None, progress_label=None, progress_callback=None,
+                                preserve_empty_columns=False):
     delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
     if samples_header_line and samples_header_line != 1:
         df, _ = read_csv_with_selected_header(
@@ -3800,6 +4077,7 @@ def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_he
             expected_min_cols=3,
             progress_label=progress_label,
             progress_callback=progress_callback,
+            preserve_empty_columns=preserve_empty_columns,
         )
         if sample_filters:
             df, _ = apply_sample_filters(df, sample_filters=sample_filters)
@@ -3810,6 +4088,7 @@ def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_he
         forced_delimiter=delimiter,
         progress_label=progress_label,
         progress_callback=progress_callback,
+        preserve_empty_columns=preserve_empty_columns,
     )
     if sample_filters:
         df, _ = apply_sample_filters(df, sample_filters=sample_filters)
@@ -4647,7 +4926,7 @@ def build_concatenated_sample_ids(sample_df, id_columns):
         if not normalized or normalized == '(None)' or normalized in selected_columns:
             continue
         if normalized not in sample_df.columns:
-            raise ValueError(f'Selected closest-sample ID column not found in samples file: {normalized}')
+            raise ValueError(f'Selected sample ID column not found in samples file: {normalized}')
         selected_columns.append(normalized)
 
     if not selected_columns:
@@ -4669,9 +4948,9 @@ BLOCK_DOMAIN_METRIC_DEFINITIONS = (
     {
         'id': 'nearest_distance',
         'label': 'Nearest sample distance',
-        'description': 'Exact distance from each block to its nearest same-domain sample.',
+        'description': 'Exact distance from each block to its nearest same-domain sample with a valid value.',
         'cost_label': 'Low',
-        'cost_note': 'Exact nearest-neighbor query using cKDTree.',
+        'cost_note': 'Exact nearest valid-valued neighbor query using cKDTree; requires a sample value column.',
         'default_checked': True,
     },
     {
@@ -4693,9 +4972,9 @@ BLOCK_DOMAIN_METRIC_DEFINITIONS = (
     {
         'id': 'closest_sample_id',
         'label': 'Closest sample ID',
-        'description': 'Export the configured sample ID columns from the nearest same-domain sample.',
+        'description': 'Export the configured sample ID columns from the nearest same-domain sample with a valid value.',
         'cost_label': 'Low',
-        'cost_note': 'Reuses the nearest-neighbor query.',
+        'cost_note': 'Reuses the nearest valid-valued sample query; requires a sample value column.',
         'default_checked': False,
     },
     {
@@ -4822,6 +5101,21 @@ def _normalize_block_domain_metric_selection(selected_metrics, include_legacy_de
     return normalized
 
 
+def _build_block_domain_metric_column_name(base_name, block_value_column_name='', use_block_value_prefix=True):
+    base_label = str(base_name or '').strip()
+    if not base_label:
+        return ''
+
+    if not use_block_value_prefix:
+        return base_label
+
+    prefix = str(block_value_column_name or '').strip()
+    if not prefix or prefix == '(None)':
+        return base_label
+
+    return f'{prefix}_{base_label}'
+
+
 def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=None,
                                        samples_delimiter=None, blocks_delimiter=None,
                                        samples_header_line=1, blocks_header_line=1,
@@ -4833,6 +5127,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
                                        closest_sample_id_cols=None,
                                        distance_count_step=None,
                                        distance_count_max_factor=None,
+                                       use_block_value_prefix=True,
                                        block_x_col=None, block_y_col=None, block_z_col=None,
                                        block_domain_col=None, block_size=None,
                                        block_value_col=None,
@@ -4884,9 +5179,14 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
     wants_distance_band_summary = 'distance_band_summary' in selected_metric_set
     wants_any_nearest_sample_metric = bool(selected_metric_set & BLOCK_DOMAIN_SAMPLE_VALUE_METRICS)
     wants_block_value_metrics = bool(selected_metric_set & BLOCK_DOMAIN_BLOCK_VALUE_METRICS)
+    wants_value_aware_nearest_sample = wants_nearest_distance_metric or wants_closest_sample_id or wants_any_nearest_sample_metric
 
-    if wants_any_nearest_sample_metric and not sample_value_column_name:
-        raise ValueError('Select a sample value column or uncheck nearest-sample value metrics.')
+    if wants_value_aware_nearest_sample and not sample_value_column_name:
+        if wants_closest_sample_id and not (wants_nearest_distance_metric or wants_any_nearest_sample_metric):
+            raise ValueError('Select a sample value column or uncheck "Closest sample ID".')
+        if wants_nearest_distance_metric and not (wants_closest_sample_id or wants_any_nearest_sample_metric):
+            raise ValueError('Select a sample value column or uncheck "Nearest sample distance".')
+        raise ValueError('Select a sample value column or uncheck nearest-sample metrics.')
     if wants_block_value_metrics and not block_value_column_name:
         raise ValueError('Select a block value column or uncheck residual-based nearest-sample metrics.')
     if wants_average_distance_knn:
@@ -4982,7 +5282,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
             raise ValueError('Select one or more closest-sample ID columns or uncheck "Closest sample ID".')
         if candidate_sample_ids is not None:
             candidate_sample_ids = np.asarray(candidate_sample_ids, dtype=object)[valid_sample_mask.to_numpy()]
-    if wants_any_nearest_sample_metric:
+    if wants_value_aware_nearest_sample:
         if sample_value_column_name not in filtered_samples_df.columns:
             raise ValueError(f'Selected sample value column not found in samples file: {sample_value_column_name}')
         candidate_sample_values = pd.to_numeric(
@@ -5016,7 +5316,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
         candidate_sample_coords = valid_sample_coords
         if wants_closest_sample_id and candidate_sample_ids is not None:
             candidate_sample_ids = np.asarray(build_concatenated_sample_ids(filtered_samples_df, closest_sample_id_cols)[0], dtype=object)[valid_sample_mask.to_numpy()]
-        if wants_any_nearest_sample_metric:
+        if wants_value_aware_nearest_sample:
             candidate_sample_values = pd.to_numeric(
                 filtered_samples_df.loc[valid_sample_mask, sample_value_column_name],
                 errors='coerce',
@@ -5103,23 +5403,69 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
     samples_by_domain = {}
     for domain in np.unique(matched_sample_domains):
         domain_mask = matched_sample_domains == domain
+        domain_values = None if matched_sample_values is None else matched_sample_values[domain_mask]
+        valid_value_mask = None if domain_values is None else np.isfinite(domain_values)
         samples_by_domain[str(domain)] = {
             'coords': matched_sample_coords[domain_mask],
             'ids': None if matched_sample_ids is None else matched_sample_ids[domain_mask],
-            'values': None if matched_sample_values is None else matched_sample_values[domain_mask],
+            'values': domain_values,
+            'value_coords': (
+                matched_sample_coords[domain_mask][valid_value_mask]
+                if valid_value_mask is not None else None
+            ),
+            'value_values': (
+                domain_values[valid_value_mask]
+                if valid_value_mask is not None else None
+            ),
+            'value_ids': (
+                matched_sample_ids[domain_mask][valid_value_mask]
+                if valid_value_mask is not None and matched_sample_ids is not None else None
+            ),
         }
 
-    nn_column = f'{domain_column_name}_NN_Distance'
+    nn_column = _build_block_domain_metric_column_name(
+        f'{domain_column_name}_NN_Distance',
+        block_value_column_name,
+        use_block_value_prefix,
+    )
     avg_column = f'{domain_column_name}_Avg_Distance'
     avg_knn_column = f'{domain_column_name}_Avg_Distance_KNN'
-    closest_id_column = f'{domain_column_name}_Closest_Sample_ID' if wants_closest_sample_id and selected_id_columns else None
-    nearest_sample_value_column = 'Nearest_Sample_Value' if 'nearest_sample_value' in selected_metric_set else None
-    nearest_sample_residual_column = 'Nearest_Sample_Residual' if 'nearest_sample_residual' in selected_metric_set else None
-    nearest_sample_abs_residual_column = 'Nearest_Sample_Abs_Residual' if 'nearest_sample_abs_residual' in selected_metric_set else None
-    nearest_sample_group_block_count_column = 'Nearest_Sample_Group_Block_Count' if 'nearest_sample_group_block_count' in selected_metric_set else None
-    nearest_sample_group_mean_residual_column = 'Nearest_Sample_Group_Mean_Residual' if 'nearest_sample_group_mean_residual' in selected_metric_set else None
-    nearest_sample_group_rms_residual_column = 'Nearest_Sample_Group_RMS_Residual' if 'nearest_sample_group_rms_residual' in selected_metric_set else None
-    nearest_sample_group_std_residual_column = 'Nearest_Sample_Group_StdResidual' if 'nearest_sample_group_std_residual' in selected_metric_set else None
+    closest_id_column = (
+        _build_block_domain_metric_column_name(
+            f'{domain_column_name}_Closest_Sample_ID',
+            block_value_column_name,
+            use_block_value_prefix,
+        )
+        if wants_closest_sample_id and selected_id_columns else None
+    )
+    nearest_sample_value_column = (
+        _build_block_domain_metric_column_name('Nearest_Sample_Value', block_value_column_name, use_block_value_prefix)
+        if 'nearest_sample_value' in selected_metric_set else None
+    )
+    nearest_sample_residual_column = (
+        _build_block_domain_metric_column_name('Nearest_Sample_Residual', block_value_column_name, use_block_value_prefix)
+        if 'nearest_sample_residual' in selected_metric_set else None
+    )
+    nearest_sample_abs_residual_column = (
+        _build_block_domain_metric_column_name('Nearest_Sample_Abs_Residual', block_value_column_name, use_block_value_prefix)
+        if 'nearest_sample_abs_residual' in selected_metric_set else None
+    )
+    nearest_sample_group_block_count_column = (
+        _build_block_domain_metric_column_name('Nearest_Sample_Group_Block_Count', block_value_column_name, use_block_value_prefix)
+        if 'nearest_sample_group_block_count' in selected_metric_set else None
+    )
+    nearest_sample_group_mean_residual_column = (
+        _build_block_domain_metric_column_name('Nearest_Sample_Group_Mean_Residual', block_value_column_name, use_block_value_prefix)
+        if 'nearest_sample_group_mean_residual' in selected_metric_set else None
+    )
+    nearest_sample_group_rms_residual_column = (
+        _build_block_domain_metric_column_name('Nearest_Sample_Group_RMS_Residual', block_value_column_name, use_block_value_prefix)
+        if 'nearest_sample_group_rms_residual' in selected_metric_set else None
+    )
+    nearest_sample_group_std_residual_column = (
+        _build_block_domain_metric_column_name('Nearest_Sample_Group_StdResidual', block_value_column_name, use_block_value_prefix)
+        if 'nearest_sample_group_std_residual' in selected_metric_set else None
+    )
 
     output_df = df_blocks.copy()
     if wants_nearest_distance_metric or wants_distance_band_summary:
@@ -5190,6 +5536,8 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
         average_distances = None
         average_knn_distances = None
         nearest_sample_indices = None
+        nearest_value_sample_indices = None
+        nearest_value_distances = None
         needs_nearest_index = bool(closest_id_column or wants_any_nearest_sample_metric)
         progress_fn = (
             None if total_domain_blocks <= 0 else
@@ -5230,26 +5578,53 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
             if nearest_distances is None:
                 nearest_distances = kd_nearest_distances
 
+        if wants_value_aware_nearest_sample:
+            domain_value_coords = domain_samples.get('value_coords')
+            if domain_value_coords is not None and len(domain_value_coords) > 0:
+                value_tree_stats = _compute_point_to_set_kdtree_metrics(
+                    query_points,
+                    domain_value_coords,
+                    progress_callback=progress_fn,
+                    progress_label='Computing nearest valued-sample statistics',
+                    return_nearest_index=needs_nearest_index,
+                )
+                if needs_nearest_index:
+                    nearest_value_distances, _, nearest_value_sample_indices = value_tree_stats
+                else:
+                    nearest_value_distances, _ = value_tree_stats
+            else:
+                nearest_value_distances = np.full(len(domain_block_indices), np.nan, dtype=float)
+                nearest_value_sample_indices = np.full(len(domain_block_indices), -1, dtype=int)
+
         if wants_nearest_distance_metric or wants_distance_band_summary:
+            if wants_nearest_distance_metric and wants_value_aware_nearest_sample:
+                nearest_distances = nearest_value_distances
             output_df.loc[domain_block_indices, nn_column] = nearest_distances
         if wants_average_distance_exact:
             output_df.loc[domain_block_indices, avg_column] = average_distances
         if wants_average_distance_knn:
             output_df.loc[domain_block_indices, avg_knn_column] = average_knn_distances
         if closest_id_column:
-            domain_ids = domain_samples['ids']
-            closest_ids = [domain_ids[index] if index >= 0 else '' for index in nearest_sample_indices]
+            domain_ids = domain_samples.get('value_ids')
+            closest_id_indices = nearest_value_sample_indices
+            if domain_ids is None or closest_id_indices is None:
+                domain_ids = domain_samples['ids']
+                closest_id_indices = nearest_sample_indices
+            if wants_value_aware_nearest_sample and nearest_value_sample_indices is not None:
+                domain_ids = domain_samples.get('value_ids')
+                closest_id_indices = nearest_value_sample_indices
+            closest_ids = [domain_ids[index] if index >= 0 else '' for index in closest_id_indices]
             output_df.loc[domain_block_indices, closest_id_column] = closest_ids
         if wants_any_nearest_sample_metric:
-            domain_sample_values = domain_samples['values']
+            domain_sample_values = domain_samples.get('value_values')
             nearest_sample_values = np.full(len(domain_block_indices), np.nan, dtype=float)
             valid_nearest_mask = (
-                (nearest_sample_indices >= 0)
+                (nearest_value_sample_indices >= 0)
                 & (domain_sample_values is not None)
-                & (nearest_sample_indices < len(domain_sample_values))
+                & (nearest_value_sample_indices < len(domain_sample_values))
             )
             if np.any(valid_nearest_mask):
-                nearest_sample_values[valid_nearest_mask] = domain_sample_values[nearest_sample_indices[valid_nearest_mask]]
+                nearest_sample_values[valid_nearest_mask] = domain_sample_values[nearest_value_sample_indices[valid_nearest_mask]]
             if nearest_sample_value_column:
                 output_df.loc[domain_block_indices, nearest_sample_value_column] = nearest_sample_values
 
@@ -5263,13 +5638,13 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
                 group_rms_residual_values = np.full(len(domain_block_indices), np.nan, dtype=float)
                 group_std_residual_values = np.full(len(domain_block_indices), np.nan, dtype=float)
 
-                valid_group_residual_mask = np.isfinite(residual_values) & (nearest_sample_indices >= 0)
+                valid_group_residual_mask = np.isfinite(residual_values) & (nearest_value_sample_indices >= 0)
                 if np.any(valid_group_residual_mask):
                     group_counts = {}
                     group_residual_sums = {}
                     group_residual_square_sums = {}
                     for nearest_index, residual_value in zip(
-                        nearest_sample_indices[valid_group_residual_mask],
+                        nearest_value_sample_indices[valid_group_residual_mask],
                         residual_values[valid_group_residual_mask],
                     ):
                         nearest_index = int(nearest_index)
@@ -5280,7 +5655,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
                         )
 
                     for nearest_index, group_count in group_counts.items():
-                        group_mask = nearest_sample_indices == nearest_index
+                        group_mask = nearest_value_sample_indices == nearest_index
                         mean_residual = group_residual_sums[nearest_index] / float(group_count)
                         rms_residual = math.sqrt(group_residual_square_sums[nearest_index] / float(group_count))
                         group_count_values[group_mask] = float(group_count)
@@ -5374,6 +5749,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
         'average_distance_knn_k': int(average_distance_knn_k) if wants_average_distance_knn else None,
         'closest_sample_id_column': closest_id_column,
         'closest_sample_id_source_columns': list(selected_id_columns),
+        'use_block_value_prefix': bool(use_block_value_prefix),
         'nearest_sample_value_column': nearest_sample_value_column,
         'nearest_sample_residual_column': nearest_sample_residual_column,
         'nearest_sample_abs_residual_column': nearest_sample_abs_residual_column,
@@ -5878,6 +6254,240 @@ def export_block_volume_weighted_average(blocks_file, value_col, output_file=Non
     }
 
 
+def export_sample_blocks_from_samples_and_blocks(samples_file, blocks_file, output_file=None,
+                                                 samples_delimiter=None, blocks_delimiter=None,
+                                                 samples_header_line=1, blocks_header_line=1,
+                                                 sample_x_col=None, sample_y_col=None, sample_z_col=None,
+                                                 sample_value_col=None, sample_domain_col=None,
+                                                 sample_weight_col=None,
+                                                 include_sample_ids=False,
+                                                 sample_id_cols=None,
+                                                 block_x_col=None, block_y_col=None, block_z_col=None,
+                                                 block_domain_col=None, block_size=None,
+                                                 sample_filters=None, block_filters=None,
+                                                 blank_sample_domain_behavior='skip',
+                                                 progress_callback=None):
+    if not samples_file or not os.path.isfile(samples_file):
+        raise ValueError('Please select a valid samples file.')
+    if not blocks_file or not os.path.isfile(blocks_file):
+        raise ValueError('Please select a valid blocks file.')
+
+    value_column_name = str(sample_value_col or '').strip()
+    if not value_column_name or value_column_name == '(None)':
+        raise ValueError('Please select a value column in "Samples Columns" first.')
+    if block_size is None:
+        raise ValueError('Block size must be specified for sample-block export.')
+
+    output_file = resolve_sample_blocks_export_path(output_file, samples_file=samples_file)
+    sample_delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
+    selected_weight_column = str(sample_weight_col or '').strip()
+    use_sample_weights = bool(selected_weight_column and selected_weight_column != '(None)')
+    use_domain_matching = bool(
+        str(sample_domain_col or '').strip()
+        and str(sample_domain_col).strip() != '(None)'
+        and str(block_domain_col or '').strip()
+        and str(block_domain_col).strip() != '(None)'
+    )
+
+    _emit_progress(progress_callback, 0, 100, 'Preparing sample-block export...')
+    print(f"Loading block assignment metadata from {blocks_file}...")
+    block_metadata = _load_block_assignment_metadata(
+        blocks_file,
+        block_size,
+        blocks_delimiter=blocks_delimiter,
+        blocks_header_line=blocks_header_line,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=block_domain_col,
+        block_filters=block_filters,
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 40, 'Loading block assignment metadata...'),
+    )
+
+    print(f"Loading samples from {samples_file}...")
+    df_samples, parsed_cols, explicit_sample_map = load_samples_dataframe(
+        samples_file,
+        samples_delimiter=samples_delimiter,
+        samples_header_line=samples_header_line,
+        sample_x_col=sample_x_col,
+        sample_y_col=sample_y_col,
+        sample_z_col=sample_z_col,
+        sample_value_col=sample_value_col,
+        sample_domain_col=sample_domain_col,
+        sample_filters=sample_filters,
+        progress_label='Reading sample file',
+        extra_columns=[
+            *([selected_weight_column] if use_sample_weights else []),
+            *([column_name for column_name in (sample_id_cols or [])] if include_sample_ids else []),
+        ],
+    )
+    if parsed_cols is not None:
+        print(f"Samples file (custom header line {samples_header_line}) parsed columns: {parsed_cols}")
+    elif hasattr(df_samples, '_detected_delimiter'):
+        print(f"Samples file delimiter used: '{df_samples._detected_delimiter}'")
+
+    df_samples = normalize_selected_sample_domain_column(df_samples, sample_domain_col=sample_domain_col)
+    df_samples = normalize_selected_sample_weight_column(
+        df_samples,
+        sample_weight_col=sample_weight_col,
+        sample_value_col=sample_value_col,
+    )
+    if explicit_sample_map:
+        print(f"Applied user sample column mapping: {explicit_sample_map}")
+    elif sample_x_col and sample_y_col and sample_z_col and sample_value_col:
+        rename_map = {
+            sample_x_col: 'x',
+            sample_y_col: 'y',
+            sample_z_col: 'z',
+            sample_value_col: 'Value',
+        }
+        df_samples = df_samples.rename(columns=rename_map)
+        print(f"Applied user sample column mapping: {rename_map}")
+    else:
+        expected = ['x', 'y', 'z', 'Value']
+        if any(column_name not in df_samples.columns for column_name in expected):
+            if 'Value' not in df_samples.columns:
+                for column_name in df_samples.columns:
+                    if str(column_name).strip().lower() == 'value':
+                        df_samples = df_samples.rename(columns={column_name: 'Value'})
+                        break
+            if any(column_name not in df_samples.columns for column_name in expected):
+                first_four = list(df_samples.columns[:4])
+                if len(first_four) != 4:
+                    raise ValueError('Samples file must have at least four columns for automatic mapping (x, y, z, Value).')
+                rename_map = {original: mapped for original, mapped in zip(first_four, expected)}
+                df_samples = df_samples.rename(columns=rename_map)
+                print(f"Mapped first four sample columns to {expected}: {rename_map}")
+
+    if use_domain_matching:
+        df_samples, _ = apply_blank_sample_domain_behavior(
+            df_samples,
+            blank_domain_behavior=blank_sample_domain_behavior,
+            domain_col='Domain',
+            x_col='x',
+            y_col='y',
+            z_col='z',
+            blocks_file=blocks_file,
+            blocks_delimiter=blocks_delimiter,
+            blocks_header_line=blocks_header_line,
+            block_x_col=block_x_col,
+            block_y_col=block_y_col,
+            block_z_col=block_z_col,
+            block_domain_col=block_domain_col,
+            block_size=block_size,
+            block_filters=block_filters,
+        )
+
+    coord_frame = df_samples[['x', 'y', 'z']].apply(pd.to_numeric, errors='coerce')
+    value_series = pd.to_numeric(df_samples['Value'], errors='coerce')
+    weight_series = None
+    if use_sample_weights:
+        weight_series = pd.to_numeric(df_samples['Weight'], errors='coerce')
+    valid_mask = coord_frame.notna().all(axis=1) & value_series.notna()
+    if weight_series is not None:
+        valid_mask &= weight_series.notna() & np.isfinite(weight_series) & (weight_series > 0.0)
+    if not valid_mask.any():
+        if use_sample_weights:
+            raise ValueError('No samples remain with valid numeric coordinates, values, and positive weights after preprocessing.')
+        raise ValueError('No samples remain with valid numeric coordinates and values after preprocessing.')
+
+    valid_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
+    valid_values = value_series.loc[valid_mask].to_numpy(dtype=float, copy=False)
+    valid_weights = None if weight_series is None else weight_series.loc[valid_mask].to_numpy(dtype=float, copy=False)
+    sample_ids = None
+    selected_sample_id_columns = []
+    if include_sample_ids:
+        sample_ids, selected_sample_id_columns = build_concatenated_sample_ids(df_samples, sample_id_cols)
+        if not selected_sample_id_columns:
+            raise ValueError('Select one or more sample ID columns or disable sample ID export.')
+        if sample_ids is not None:
+            sample_ids = np.asarray(sample_ids, dtype=object)[valid_mask.to_numpy()]
+    sample_domains = None
+    if use_domain_matching:
+        sample_domains = df_samples.loc[valid_mask, 'Domain'].fillna('').astype(str).str.strip().replace('nan', '')
+        sample_domains = sample_domains.to_numpy(dtype=object, copy=False)
+
+    coords_for_assignment = np.array(valid_coords, copy=True)
+    if block_metadata.get('is_rotated') and len(coords_for_assignment) > 0:
+        rotation_center = block_metadata['rotation_center']
+        rotation_matrix = block_metadata['rotation_matrix']
+        coords_for_assignment = (coords_for_assignment - rotation_center) @ rotation_matrix.T
+
+    sample_block_data = aggregate_samples_into_blocks(
+        coords_for_assignment,
+        valid_values,
+        block_metadata.get('grid_index_origin', block_metadata['all_min_bounds']),
+        block_metadata['unified_dims'],
+        allowed_grid=block_metadata.get('allowed_grid'),
+        domain_mapping=block_metadata['domain_mapping'] if use_domain_matching else None,
+        sample_domains=sample_domains if use_domain_matching else None,
+        sample_ids=sample_ids,
+        sample_weights=valid_weights,
+        progress_label='Assigning samples to blocks',
+    )
+
+    sample_block_values = sample_block_data['sample_block_values']
+    sample_block_counts = sample_block_data['sample_block_counts']
+    if not sample_block_values:
+        raise ValueError('No sample blocks were generated. Check block size, filters, and domain matching configuration.')
+
+    row_domain_mapping = None
+    selected_block_domain_col = str(block_domain_col or '').strip()
+    if selected_block_domain_col and selected_block_domain_col != '(None)':
+        row_domain_mapping = block_metadata['domain_mapping']
+    elif sample_domains is not None:
+        row_domain_mapping = _select_majority_sample_block_domains(sample_block_data['sample_block_domain_counts'])
+
+    sample_count_column_name = f'{value_column_name}_SampleCount' if value_column_name else 'Value_SampleCount'
+    sample_ids_column_name = f'{value_column_name}_SampleIDs' if value_column_name else 'Value_SampleIDs'
+    rows = _build_sample_block_rows(
+        sample_block_values,
+        sample_block_counts,
+        block_metadata.get('grid_index_origin', block_metadata['all_min_bounds']),
+        block_metadata['unified_dims'],
+        rotation_matrix=block_metadata.get('rotation_matrix') if block_metadata.get('is_rotated') else None,
+        rotation_center=block_metadata.get('rotation_center') if block_metadata.get('is_rotated') else None,
+        domain_mapping=row_domain_mapping,
+        sample_count_column_name=sample_count_column_name,
+        sample_ids_by_block=sample_block_data.get('sample_block_ids') if include_sample_ids else None,
+        sample_ids_column_name=sample_ids_column_name,
+    )
+    output_df = pd.DataFrame(rows)
+
+    output_dir = os.path.dirname(output_file) or '.'
+    os.makedirs(output_dir, exist_ok=True)
+    _emit_progress(progress_callback, 95, 100, 'Writing sample-block export...')
+    output_df.to_csv(output_file, index=False, sep=sample_delimiter)
+    _emit_progress(progress_callback, 100, 100, 'Sample-block export complete.')
+
+    assigned_sample_count = int(np.count_nonzero(sample_block_data['assigned_mask']))
+    valid_sample_count = int(valid_mask.sum())
+    invalid_coordinate_or_value_count = int((~valid_mask).sum())
+    rejected_sample_count = valid_sample_count - assigned_sample_count
+    print(f"Exported {len(output_df):,} sample blocks to {output_file}")
+    print(
+        f"Sample-block export summary: input rows={len(df_samples):,}; valid rows={valid_sample_count:,}; "
+        f"assigned samples={assigned_sample_count:,}; sample blocks={len(output_df):,}."
+    )
+    if use_sample_weights:
+        print(f"Sample-block values were computed as weighted averages using sample column '{selected_weight_column}'.")
+
+    return {
+        'output_file': output_file,
+        'total_samples': int(len(df_samples)),
+        'valid_samples': valid_sample_count,
+        'assigned_samples': assigned_sample_count,
+        'rejected_samples': int(rejected_sample_count),
+        'invalid_coordinate_or_value_samples': invalid_coordinate_or_value_count,
+        'domain_mismatch_samples': int(sample_block_data['domain_mismatch_count']),
+        'sample_block_count': int(len(output_df)),
+        'weight_column': selected_weight_column if use_sample_weights else None,
+        'sample_ids_column': sample_ids_column_name if include_sample_ids else None,
+        'sample_id_source_columns': list(selected_sample_id_columns),
+        'columns': list(output_df.columns),
+    }
+
+
 def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=None,
                                         samples_delimiter=None, blocks_delimiter=None,
                                         samples_header_line=1, blocks_header_line=1,
@@ -5931,10 +6541,19 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
         sample_filters=sample_filters,
         progress_label='Reading sample file',
         progress_callback=_make_scaled_progress_callback(progress_callback, 45, 80, 'Reading sample file...'),
+        preserve_empty_columns=True,
     )
 
+    sample_coordinate_columns = list(df_samples.columns)
+    if not (sample_x_col and sample_y_col and sample_z_col):
+        empty_sample_columns = set(_list_all_empty_columns(df_samples))
+        sample_coordinate_columns = [
+            column_name for column_name in sample_coordinate_columns
+            if column_name not in empty_sample_columns
+        ]
+
     sample_x_col, sample_y_col, sample_z_col = resolve_sample_coordinate_columns(
-        list(df_samples.columns),
+        sample_coordinate_columns,
         sample_x_col=sample_x_col,
         sample_y_col=sample_y_col,
         sample_z_col=sample_z_col,
@@ -7243,6 +7862,7 @@ def build_taichi_viewer_state_from_config(config):
         sample_domain_col=config.get('sample_domain_col'),
         sample_filters=sample_filters,
         progress_label='Reading sample file',
+        extra_columns=[config.get('sample_weight_col')],
     )
     if parsed_cols is not None:
         print(f"Samples file (custom header line {config.get('samples_header_line', 1)}) parsed columns: {parsed_cols}")
@@ -7272,6 +7892,11 @@ def build_taichi_viewer_state_from_config(config):
 
     if needs_sample_domains:
         df = normalize_selected_sample_domain_column(df, sample_domain_col=config.get('sample_domain_col'))
+    df = normalize_selected_sample_weight_column(
+        df,
+        sample_weight_col=config.get('sample_weight_col'),
+        sample_value_col=config.get('sample_value_col'),
+    )
 
     if explicit_sample_map:
         print(f"Applied user sample column mapping: {explicit_sample_map}")
@@ -7318,6 +7943,19 @@ def build_taichi_viewer_state_from_config(config):
     else:
         df = df.dropna(subset=['Value'])
 
+    sample_weights = None
+    selected_weight_column = str(config.get('sample_weight_col') or '').strip()
+    if selected_weight_column and selected_weight_column != '(None)':
+        df['Weight'] = pd.to_numeric(df['Weight'], errors='coerce')
+        invalid_weight_mask = (~np.isfinite(df['Weight'])) | (df['Weight'] <= 0.0)
+        invalid_weight_count = int(invalid_weight_mask.sum())
+        if invalid_weight_count:
+            print(f"Detected {invalid_weight_count} sample rows with blank/non-numeric/non-positive weights; these will be excluded from samples.")
+            df = df.loc[~invalid_weight_mask].copy()
+        if len(df) == 0:
+            raise ValueError("After removing invalid sample weights, no samples remain. Check the configured 'sample_weight_col'.")
+        sample_weights = df['Weight'].to_numpy(dtype=float, copy=False)
+
     points = df[['x', 'y', 'z']].values
     values = df['Value'].values
     sample_domains = df['Domain'].values if 'Domain' in df.columns else None
@@ -7345,6 +7983,7 @@ def build_taichi_viewer_state_from_config(config):
         block_domain_col=config.get('block_domain_col'),
         config=config,
         sample_domains=sample_domains,
+        sample_weights=sample_weights,
     )
 
     lfc_colormap, lfc_bins, lfc_labels = load_lfc_colormap(config.get('color_file'))
@@ -7574,6 +8213,7 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             sample_domain_col=config.get('sample_domain_col') if config else None,
             sample_filters=sample_filters,
             progress_label='Reading sample file',
+            extra_columns=[config.get('sample_weight_col') if config else None],
         )
         if parsed_cols is not None:
             print(f"Samples file (custom header line {samples_header_line}) parsed columns: {parsed_cols}")
@@ -7603,6 +8243,11 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
 
         if wants_domain_any:
             df = normalize_selected_sample_domain_column(df, sample_domain_col=config.get('sample_domain_col') if config else None)
+        df = normalize_selected_sample_weight_column(
+            df,
+            sample_weight_col=config.get('sample_weight_col') if config else None,
+            sample_value_col=sample_value_col,
+        )
 
         if explicit_sample_map:
             print(f"Applied user sample column mapping: {explicit_sample_map}")
@@ -7679,6 +8324,19 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             if len(df) == 0:
                 raise ValueError("After removing blank/non-numeric sample values, no samples remain. Check the configured 'sample_value_col'.")
 
+        sample_weights = None
+        selected_weight_column = str(config.get('sample_weight_col') if config else '').strip()
+        if selected_weight_column and selected_weight_column != '(None)':
+            df['Weight'] = pd.to_numeric(df['Weight'], errors='coerce')
+            invalid_weight_mask = (~np.isfinite(df['Weight'])) | (df['Weight'] <= 0.0)
+            invalid_weight_count = int(invalid_weight_mask.sum())
+            if invalid_weight_count:
+                print(f"Detected {invalid_weight_count} sample rows with blank/non-numeric/non-positive weights; these will be excluded from samples.")
+                df = df.loc[~invalid_weight_mask].copy()
+            if len(df) == 0:
+                raise ValueError("After removing invalid sample weights, no samples remain. Check the configured 'sample_weight_col'.")
+            sample_weights = df['Weight'].to_numpy(dtype=float, copy=False)
+
         print(f"Cleaned sample count: {len(df)} (removed {nan_before} blank value rows)")
         points = df[['x','y','z']].values
         values = df['Value'].values
@@ -7736,7 +8394,8 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
             blocks_header_line=blocks_header_line,
             block_x_col=block_x_col, block_y_col=block_y_col, block_z_col=block_z_col, block_domain_col=block_domain_col,
             config=config,
-            sample_domains=sample_domains
+            sample_domains=sample_domains,
+            sample_weights=sample_weights,
         )
 
         # Store settings in plotter
@@ -8574,18 +9233,34 @@ if __name__ == "__main__":
                 combo_box.view().setMinimumWidth(popup_width)
 
             # Column mapping combo boxes for samples
-            self.sample_x_col = QtWidgets.QComboBox(); self.sample_y_col = QtWidgets.QComboBox(); self.sample_z_col = QtWidgets.QComboBox(); self.sample_value_col = QtWidgets.QComboBox(); self.sample_domain_col = QtWidgets.QComboBox()
+            self.sample_x_col = QtWidgets.QComboBox(); self.sample_y_col = QtWidgets.QComboBox(); self.sample_z_col = QtWidgets.QComboBox(); self.sample_value_col = QtWidgets.QComboBox(); self.sample_domain_col = QtWidgets.QComboBox(); self.sample_weight_col = QtWidgets.QComboBox()
+            self.sample_blocks_include_ids = QtWidgets.QCheckBox('Include concatenated sample IDs')
+            self.sample_blocks_include_ids.setToolTip(
+                'When enabled, export a text metadata column listing the contributing sample IDs for each sample block.'
+            )
+            self.sample_blocks_id_cols = [QtWidgets.QComboBox(), QtWidgets.QComboBox(), QtWidgets.QComboBox()]
             self.block_domain_metrics_id_cols = [QtWidgets.QComboBox(), QtWidgets.QComboBox(), QtWidgets.QComboBox()]
-            for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col]:
+            self.block_domain_metrics_prefix_with_block_value = QtWidgets.QCheckBox('Prefix closest-sample ID and nearest-sample value metrics with block value column')
+            self.block_domain_metrics_prefix_with_block_value.setChecked(True)
+            self.block_domain_metrics_prefix_with_block_value.setToolTip(
+                'When enabled, closest-sample ID and nearest-sample value/residual metrics are exported as <Block Value Column>_<Metric Name>.'
+            )
+            for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col, self.sample_weight_col]:
                 configure_column_combo(cb)
+            for cb in self.sample_blocks_id_cols:
+                configure_column_combo(cb)
+                cb.addItem('(None)')
             for cb in self.block_domain_metrics_id_cols:
                 configure_column_combo(cb)
                 cb.addItem('(None)')
             self.sample_domain_col.addItem('(None)')
+            self.sample_weight_col.addItem('(None)')
             sample_map_layout = QtWidgets.QHBoxLayout(); sample_map_layout.addWidget(self.sample_x_col); sample_map_layout.addWidget(self.sample_y_col); sample_map_layout.addWidget(self.sample_z_col); sample_map_layout.addWidget(self.sample_value_col); sample_map_layout.addWidget(self.sample_domain_col)
             for index in range(5):
                 sample_map_layout.setStretch(index, 1)
             files_form.addRow('Samples Columns (X Y Z Value Domain)', sample_map_layout)
+            self.sample_weight_col.setToolTip('Optional weight column for block-level sample averaging. When selected, Sample Blocks export and interpolation preprocessing use weighted averages instead of plain means.')
+            files_form.addRow('Sample Weight Column', self.sample_weight_col)
 
             # Column mapping combo boxes for blocks
             self.block_x_col = QtWidgets.QComboBox(); self.block_y_col = QtWidgets.QComboBox(); self.block_z_col = QtWidgets.QComboBox(); self.block_domain_col = QtWidgets.QComboBox(); self.block_domain_metrics_value_col = QtWidgets.QComboBox(); self.block_volume_weighted_value_col = QtWidgets.QComboBox(); self.block_weight_metric_col = QtWidgets.QComboBox()
@@ -8624,17 +9299,24 @@ if __name__ == "__main__":
                 delim = self.samples_delim.currentText()
                 header_line = self.samples_header_line.value()
                 current_domain = self.sample_domain_col.currentText()
+                current_weight = self.sample_weight_col.currentText()
+                current_sample_blocks_id_cols = [cb.currentText() for cb in self.sample_blocks_id_cols]
                 current_metrics_id_cols = [cb.currentText() for cb in self.block_domain_metrics_id_cols]
                 for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col]:
                     cb.clear()
                 self.sample_domain_col.clear(); self.sample_domain_col.addItem('(None)')
+                self.sample_weight_col.clear(); self.sample_weight_col.addItem('(None)')
+                for cb in self.sample_blocks_id_cols:
+                    cb.clear(); cb.addItem('(None)')
                 for cb in self.block_domain_metrics_id_cols:
                     cb.clear(); cb.addItem('(None)')
                 if not os.path.isfile(path):
                     return
                 try:
                     cols = parse_effective_header_line(path, delim, header_line)
-                    for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col]:
+                    for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col, self.sample_weight_col]:
+                        cb.addItems(cols)
+                    for cb in self.sample_blocks_id_cols:
                         cb.addItems(cols)
                     for cb in self.block_domain_metrics_id_cols:
                         cb.addItems(cols)
@@ -8649,10 +9331,20 @@ if __name__ == "__main__":
                     suggest(self.sample_z_col, ['z','elevation','rl'])
                     suggest(self.sample_value_col, ['value','grade'])
                     suggest(self.sample_domain_col, ['domain','dom','dg'])
+                    suggest(self.sample_weight_col, ['length','interval_length','sample_length','weight'])
                     if current_domain and current_domain != '(None)':
                         idx = self.sample_domain_col.findText(current_domain)
                         if idx >= 0:
                             self.sample_domain_col.setCurrentIndex(idx)
+                    if current_weight and current_weight != '(None)':
+                        idx = self.sample_weight_col.findText(current_weight)
+                        if idx >= 0:
+                            self.sample_weight_col.setCurrentIndex(idx)
+                    for cb, current_value in zip(self.sample_blocks_id_cols, current_sample_blocks_id_cols):
+                        if current_value and current_value != '(None)':
+                            idx = cb.findText(current_value)
+                            if idx >= 0:
+                                cb.setCurrentIndex(idx)
                     for cb, current_value in zip(self.block_domain_metrics_id_cols, current_metrics_id_cols):
                         if current_value and current_value != '(None)':
                             idx = cb.findText(current_value)
@@ -8740,6 +9432,12 @@ if __name__ == "__main__":
                 filename = f"{base_name}+{domain_suffix}.csv" if base_name else f"samples+{domain_suffix}.csv"
                 return os.path.join(output_dir or '.', filename)
 
+            def suggested_sample_blocks_path():
+                return resolve_sample_blocks_export_path(
+                    None,
+                    samples_file=self.samples_edit.text().strip(),
+                )
+
             def suggested_block_domain_metrics_path():
                 return resolve_block_domain_metrics_export_path(
                     None,
@@ -8793,6 +9491,9 @@ if __name__ == "__main__":
                 output_dir = os.path.dirname(input_path) if input_path else '.'
                 return os.path.join(output_dir or '.', f"{base_name}.bmf")
 
+            self.sample_blocks_output_edit = QtWidgets.QLineEdit('')
+            self.sample_blocks_browse = QtWidgets.QPushButton('Browse')
+            self.start_sample_blocks_btn = QtWidgets.QPushButton('Export Sample Blocks')
             self.domain_samples_output_edit = QtWidgets.QLineEdit('')
             self.domain_samples_browse = QtWidgets.QPushButton('Browse')
             self.start_domaining_btn = QtWidgets.QPushButton('Start Domaining')
@@ -8876,6 +9577,7 @@ if __name__ == "__main__":
             self.equation_finder_output_edit = QtWidgets.QLineEdit('')
             self.equation_finder_browse = QtWidgets.QPushButton('Browse')
             self.start_equation_finder_btn = QtWidgets.QPushButton('Find Equations')
+            self._sample_blocks_auto_path = ''
             self._domain_samples_auto_path = ''
             self._block_value_transfer_auto_path = ''
             self._block_domain_metrics_auto_path = ''
@@ -8889,6 +9591,13 @@ if __name__ == "__main__":
             self._pending_bmf_export_column_types = None
             self._bmf_export_value_cols_initialized = False
             self._bmf_export_columns_source_path = ''
+
+            def refresh_sample_blocks_output_path(force=False):
+                suggested = suggested_sample_blocks_path()
+                current = self.sample_blocks_output_edit.text().strip()
+                if force or not current or current == self._sample_blocks_auto_path:
+                    self.sample_blocks_output_edit.setText(suggested)
+                self._sample_blocks_auto_path = suggested
 
             def refresh_domain_samples_output_path(force=False):
                 suggested = suggested_domain_samples_path()
@@ -8955,6 +9664,17 @@ if __name__ == "__main__":
                 if force or not current or current == self._equation_finder_auto_path:
                     self.equation_finder_output_edit.setText(suggested)
                 self._equation_finder_auto_path = suggested
+
+            def browse_sample_blocks_output():
+                initial_path = self.sample_blocks_output_edit.text().strip() or suggested_sample_blocks_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Sample Blocks Output File',
+                    initial_path,
+                    'CSV Files (*.csv)'
+                )
+                if path:
+                    self.sample_blocks_output_edit.setText(path)
 
             def browse_domain_samples_output():
                 initial_path = self.domain_samples_output_edit.text().strip() or suggested_domain_samples_path()
@@ -9091,6 +9811,26 @@ if __name__ == "__main__":
                 section_layout.addWidget(content_widget)
                 return section_widget, content_layout
 
+            sample_blocks_group, sample_blocks_form = create_collapsible_operation_section(
+                'Sample Blocks',
+                'Aggregate samples into their containing blocks and export one row per sampled block with the assigned mean sample value, or a weighted average when a sample weight column is configured.',
+            )
+            sample_blocks_output_layout = QtWidgets.QHBoxLayout()
+            sample_blocks_output_layout.addWidget(self.sample_blocks_output_edit)
+            sample_blocks_output_layout.addWidget(self.sample_blocks_browse)
+            sample_blocks_form.addRow('Output File', sample_blocks_output_layout)
+            sample_blocks_form.addRow('Sample ID Metadata', self.sample_blocks_include_ids)
+            sample_blocks_id_layout = QtWidgets.QHBoxLayout()
+            for index, cb in enumerate(self.sample_blocks_id_cols):
+                sample_blocks_id_layout.addWidget(cb)
+                sample_blocks_id_layout.setStretch(index, 1)
+            sample_blocks_form.addRow('Sample ID Columns', sample_blocks_id_layout)
+            self.start_sample_blocks_btn.setToolTip(
+                'Export one row per grid block that contains samples, using the same sample-block aggregation created at the start of interpolation, including weighted averages when a sample weight column is configured.'
+            )
+            sample_blocks_form.addRow('', self.start_sample_blocks_btn)
+            operations_form.addRow(sample_blocks_group)
+
             domain_samples_group, domain_samples_form = create_collapsible_operation_section(
                 'Domain Samples',
                 'Assign a domain to each sample row from the blocks model and export the domained samples to a new CSV.',
@@ -9134,6 +9874,7 @@ if __name__ == "__main__":
             block_metrics_output_layout.addWidget(self.block_domain_metrics_browse)
             block_metrics_form.addRow('Output File', block_metrics_output_layout)
             block_metrics_form.addRow('Block Value Column', self.block_domain_metrics_value_col)
+            block_metrics_form.addRow('Metric Name Prefix', self.block_domain_metrics_prefix_with_block_value)
             self.block_domain_metrics_metric_list = QtWidgets.QListWidget()
             self.block_domain_metrics_metric_list.setAlternatingRowColors(True)
             self.block_domain_metrics_metric_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
@@ -9326,6 +10067,9 @@ if __name__ == "__main__":
             equation_finder_form.addRow('', self.start_equation_finder_btn)
             operations_form.addRow(equation_finder_group)
 
+            self.sample_blocks_browse.clicked.connect(browse_sample_blocks_output)
+            self.start_sample_blocks_btn.clicked.connect(self.run_sample_blocks_only)
+            self.sample_blocks_include_ids.toggled.connect(lambda _: self._update_sample_blocks_id_controls())
             self.domain_samples_browse.clicked.connect(browse_domain_samples_output)
             self.start_domaining_btn.clicked.connect(self.run_domain_samples_only)
             self.block_value_transfer_browse.clicked.connect(browse_block_value_transfer_output)
@@ -9376,6 +10120,7 @@ if __name__ == "__main__":
             self.equation_clear_predictors_btn.clicked.connect(self._update_equation_finder_predictor_summary)
             self.equation_predictor_list.itemSelectionChanged.connect(self._update_equation_finder_predictor_summary)
             self.equation_include_coords.toggled.connect(lambda _: self._refresh_equation_finder_predictor_columns())
+            self.samples_edit.textChanged.connect(lambda _: refresh_sample_blocks_output_path())
             self.samples_edit.textChanged.connect(lambda _: refresh_domain_samples_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_domain_interpolation_confidence_output_path())
@@ -9407,6 +10152,8 @@ if __name__ == "__main__":
             self.sample_z_col.currentTextChanged.connect(lambda _: self._refresh_equation_finder_predictor_columns())
             self.block_domain_metrics_value_col.currentTextChanged.connect(lambda _: self._update_block_domain_metrics_metric_summary())
             self.sample_value_col.currentTextChanged.connect(lambda _: self._update_block_domain_metrics_metric_summary())
+            refresh_sample_blocks_output_path(force=True)
+            self._update_sample_blocks_id_controls()
             refresh_domain_samples_output_path(force=True)
             self._refresh_block_value_transfer_columns()
             refresh_block_value_transfer_output_path(force=True)
@@ -9858,6 +10605,9 @@ if __name__ == "__main__":
                 'interpolation_file': resolve_interpolation_csv_export_path(self.interp_edit.text()),
                 'export_block_evaluated_samples': self.block_evaluated_samples_enabled.isChecked(),
                 'block_evaluated_samples_file': self.block_evaluated_samples_edit.text(),
+                'sample_blocks_file': self.sample_blocks_output_edit.text(),
+                'sample_blocks_include_ids': self.sample_blocks_include_ids.isChecked(),
+                'sample_blocks_id_cols': [cb.currentText() for cb in self.sample_blocks_id_cols],
                 'domain_samples_file': self.domain_samples_output_edit.text(),
                 'block_value_transfer_file': self.block_value_transfer_output_edit.text(),
                 'block_value_transfer_cols': self._get_selected_block_value_transfer_columns(),
@@ -9881,6 +10631,7 @@ if __name__ == "__main__":
                 'bmf_export_value_exceptions': self._get_bmf_export_value_exceptions(),
                 'equation_finder_file': self.equation_finder_output_edit.text(),
                 'block_domain_metrics_closest_sample_id_cols': [cb.currentText() for cb in self.block_domain_metrics_id_cols],
+                'block_domain_metrics_use_block_value_prefix': self.block_domain_metrics_prefix_with_block_value.isChecked(),
                 'block_domain_metrics_distance_counts_enabled': 'distance_band_summary' in self._get_selected_block_domain_metrics(),
                 'block_domain_metrics_distance_step': self.block_domain_metrics_distance_step.value(),
                 'block_domain_metrics_max_factor': self.block_domain_metrics_max_factor.value(),
@@ -9903,6 +10654,7 @@ if __name__ == "__main__":
                 'sample_z_col': self.sample_z_col.currentText(),
                 'sample_value_col': self.sample_value_col.currentText(),
                 'sample_domain_col': self.sample_domain_col.currentText(),
+                'sample_weight_col': self.sample_weight_col.currentText(),
                 'block_x_col': self.block_x_col.currentText(),
                 'block_y_col': self.block_y_col.currentText(),
                 'block_z_col': self.block_z_col.currentText(),
@@ -9989,6 +10741,8 @@ if __name__ == "__main__":
                 if 'interpolation_file' in config: self.interp_edit.setText(resolve_interpolation_csv_export_path(config['interpolation_file']))
                 if 'export_block_evaluated_samples' in config: self.block_evaluated_samples_enabled.setChecked(bool(config['export_block_evaluated_samples']))
                 if 'block_evaluated_samples_file' in config: self.block_evaluated_samples_edit.setText(config['block_evaluated_samples_file'])
+                if 'sample_blocks_file' in config: self.sample_blocks_output_edit.setText(config['sample_blocks_file'])
+                if 'sample_blocks_include_ids' in config: self.sample_blocks_include_ids.setChecked(bool(config['sample_blocks_include_ids']))
                 self.block_domain_metrics_output_edit.setText('')
                 if 'algorithm' in config: self.algorithm_combo.setCurrentText(config['algorithm'])
                 if 'second_pass_algorithm' in config: self.second_pass_combo.setCurrentText(config['second_pass_algorithm'])
@@ -10002,6 +10756,7 @@ if __name__ == "__main__":
                 if 'sample_z_col' in config: self.sample_z_col.setCurrentText(config['sample_z_col'])
                 if 'sample_value_col' in config: self.sample_value_col.setCurrentText(config['sample_value_col'])
                 if 'sample_domain_col' in config: self.sample_domain_col.setCurrentText(config['sample_domain_col'])
+                if 'sample_weight_col' in config: self.sample_weight_col.setCurrentText(config['sample_weight_col'])
                 if 'block_x_col' in config: self.block_x_col.setCurrentText(config['block_x_col'])
                 if 'block_y_col' in config: self.block_y_col.setCurrentText(config['block_y_col'])
                 if 'block_z_col' in config: self.block_z_col.setCurrentText(config['block_z_col'])
@@ -10070,11 +10825,16 @@ if __name__ == "__main__":
                 self._pending_block_value_transfer_cols = list(config.get('block_value_transfer_cols', []))
                 if hasattr(self, '_refresh_block_value_transfer_columns'):
                     self._refresh_block_value_transfer_columns()
+                if 'sample_blocks_id_cols' in config:
+                    for cb, column_name in zip(self.sample_blocks_id_cols, config['sample_blocks_id_cols']):
+                        cb.setCurrentText(column_name)
                 if 'block_domain_metrics_closest_sample_id_cols' in config:
                     for cb, column_name in zip(self.block_domain_metrics_id_cols, config['block_domain_metrics_closest_sample_id_cols']):
                         cb.setCurrentText(column_name)
                 if 'block_domain_metrics_avg_distance_knn_k' in config:
                     self.block_domain_metrics_knn_k.setValue(int(config['block_domain_metrics_avg_distance_knn_k']))
+                if 'block_domain_metrics_use_block_value_prefix' in config:
+                    self.block_domain_metrics_prefix_with_block_value.setChecked(bool(config['block_domain_metrics_use_block_value_prefix']))
                 if 'block_domain_metrics_distance_step' in config:
                     self.block_domain_metrics_distance_step.setValue(float(config['block_domain_metrics_distance_step']))
                 if 'block_domain_metrics_max_factor' in config:
@@ -10430,6 +11190,11 @@ if __name__ == "__main__":
                 BLOCK_DOMAIN_METRIC_DEFINITION_ORDER if checked else []
             )
 
+        def _update_sample_blocks_id_controls(self):
+            enabled = bool(getattr(self, 'sample_blocks_include_ids', None) and self.sample_blocks_include_ids.isChecked())
+            for cb in getattr(self, 'sample_blocks_id_cols', []):
+                cb.setEnabled(enabled)
+
         def _update_block_domain_metrics_metric_summary(self):
             if not hasattr(self, 'block_domain_metrics_metric_summary'):
                 return
@@ -10460,6 +11225,8 @@ if __name__ == "__main__":
                 cb.setEnabled(closest_id_enabled)
             if hasattr(self, 'block_domain_metrics_value_col'):
                 self.block_domain_metrics_value_col.setEnabled(bool(selected_set & BLOCK_DOMAIN_BLOCK_VALUE_METRICS))
+            if hasattr(self, 'block_domain_metrics_prefix_with_block_value'):
+                self.block_domain_metrics_prefix_with_block_value.setEnabled(bool(selected_set & BLOCK_DOMAIN_SAMPLE_VALUE_METRICS))
 
         def _get_bmf_export_cell_size(self):
             if not all(hasattr(self, name) for name in ['bmf_export_cell_x', 'bmf_export_cell_y', 'bmf_export_cell_z']):
@@ -11187,6 +11954,93 @@ if __name__ == "__main__":
                 if cursor_set:
                     QtWidgets.QApplication.restoreOverrideCursor()
 
+        def _prompt_to_replace_samples_file(self, samples_file_path, title='Use Generated Samples File'):
+            target_path = str(samples_file_path or '').strip()
+            if not target_path:
+                return False
+
+            response = QtWidgets.QMessageBox.question(
+                self,
+                title,
+                (
+                    f"Do you want to set this file as the current Samples File?\n\n"
+                    f"{target_path}"
+                ),
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes,
+            )
+            if response == QtWidgets.QMessageBox.Yes:
+                self.samples_edit.setText(target_path)
+                return True
+            return False
+
+        def run_sample_blocks_only(self):
+            """Aggregate samples into their containing blocks and export the sampled block subset."""
+            try:
+                cfg = self.to_dict()
+                output_file = resolve_sample_blocks_export_path(
+                    cfg.get('sample_blocks_file'),
+                    samples_file=cfg.get('samples_file'),
+                )
+                self.sample_blocks_output_edit.setText(output_file)
+
+                print("=" * 60)
+                print("Exporting sample blocks from samples + blocks...")
+                print("=" * 60)
+
+                def handle_success(result):
+                    print("=" * 60)
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"Sample-block export complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Average mode: {'Weighted by ' + result['weight_column'] if result.get('weight_column') else 'Unweighted mean'}\n"
+                            f"Sample blocks: {result['sample_block_count']:,}\n"
+                            f"Assigned samples: {result['assigned_samples']:,}\n"
+                            f"Rejected samples: {result['rejected_samples']:,}\n"
+                            f"Invalid coordinate/value rows: {result['invalid_coordinate_or_value_samples']:,}"
+                        ),
+                    )
+                    self._prompt_to_replace_samples_file(result['output_file'], title='Use Sample Blocks As Samples File')
+
+                self._run_operation_with_progress(
+                    'Sample Blocks Export',
+                    'Preparing sample-block export...',
+                    export_sample_blocks_from_samples_and_blocks,
+                    {
+                        'samples_file': cfg.get('samples_file'),
+                        'blocks_file': cfg.get('blocks_file'),
+                        'output_file': output_file,
+                        'samples_delimiter': cfg.get('samples_delimiter'),
+                        'blocks_delimiter': cfg.get('blocks_delimiter'),
+                        'samples_header_line': cfg.get('samples_header_line', 1),
+                        'blocks_header_line': cfg.get('blocks_header_line', 1),
+                        'sample_x_col': cfg.get('sample_x_col'),
+                        'sample_y_col': cfg.get('sample_y_col'),
+                        'sample_z_col': cfg.get('sample_z_col'),
+                        'sample_value_col': cfg.get('sample_value_col'),
+                        'sample_domain_col': cfg.get('sample_domain_col'),
+                        'sample_weight_col': cfg.get('sample_weight_col'),
+                        'include_sample_ids': cfg.get('sample_blocks_include_ids', False),
+                        'sample_id_cols': cfg.get('sample_blocks_id_cols'),
+                        'block_x_col': cfg.get('block_x_col'),
+                        'block_y_col': cfg.get('block_y_col'),
+                        'block_z_col': cfg.get('block_z_col'),
+                        'block_domain_col': cfg.get('block_domain_col'),
+                        'block_size': cfg.get('block_size'),
+                        'sample_filters': cfg.get('block_domain_sample_filters'),
+                        'block_filters': cfg.get('block_volume_weighted_filters'),
+                        'blank_sample_domain_behavior': cfg.get('blank_sample_domain_behavior', 'skip'),
+                    },
+                    handle_success,
+                    'An error occurred during sample-block export',
+                )
+            except Exception as e:
+                print(f"Error during sample-block export: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during sample-block export:\n{str(e)}')
+
         def run_domain_samples_only(self):
             """Assign block domains directly to the samples file and export the result."""
             try:
@@ -11348,6 +12202,7 @@ if __name__ == "__main__":
                         nearest_sample_value_metrics_text = ', '.join(
                             column_name for column_name in nearest_sample_value_columns if column_name
                         )
+                    prefix_text = 'Enabled' if result.get('use_block_value_prefix', False) else 'Disabled'
                     distance_bands_text = 'Disabled'
                     if result.get('distance_summary_thresholds'):
                         threshold_tokens = ', '.join(
@@ -11388,6 +12243,7 @@ if __name__ == "__main__":
                             f"Selected metrics: {selected_metric_text}\n"
                             f"Average-distance outputs: {avg_distance_text}\n"
                             f"Closest sample ID columns: {closest_id_text}\n"
+                            f"Block-value column prefix: {prefix_text}\n"
                             f"Nearest-sample value metrics: {nearest_sample_value_metrics_text}\n"
                             f"Distance bands: {distance_bands_text}\n\n"
                             f"Filters:\n{filters_text}"
@@ -11416,6 +12272,7 @@ if __name__ == "__main__":
                         'closest_sample_id_cols': cfg.get('block_domain_metrics_closest_sample_id_cols'),
                         'distance_count_step': cfg.get('block_domain_metrics_distance_step') if cfg.get('block_domain_metrics_distance_counts_enabled') else None,
                         'distance_count_max_factor': cfg.get('block_domain_metrics_max_factor') if cfg.get('block_domain_metrics_distance_counts_enabled') else None,
+                        'use_block_value_prefix': cfg.get('block_domain_metrics_use_block_value_prefix', True),
                         'block_x_col': cfg.get('block_x_col'),
                         'block_y_col': cfg.get('block_y_col'),
                         'block_z_col': cfg.get('block_z_col'),
@@ -11865,6 +12722,7 @@ if __name__ == "__main__":
                     sample_domain_col=sample_domain_col,
                     sample_filters=sample_filters,
                     progress_label='Reading sample file',
+                    extra_columns=[cfg.get('sample_weight_col')],
                 )
 
                 if needs_sample_domains and explicit_sample_map:
@@ -11888,6 +12746,11 @@ if __name__ == "__main__":
 
                 if needs_sample_domains:
                     df = normalize_selected_sample_domain_column(df, sample_domain_col=sample_domain_col)
+                df = normalize_selected_sample_weight_column(
+                    df,
+                    sample_weight_col=cfg.get('sample_weight_col'),
+                    sample_value_col=sample_value_col,
+                )
 
                 if explicit_sample_map:
                     pass
@@ -11928,6 +12791,19 @@ if __name__ == "__main__":
                         df['Value'] = df['Value'].fillna(0.0)
                 else:
                     df = df.dropna(subset=['Value'])
+
+                sample_weights = None
+                selected_weight_column = str(cfg.get('sample_weight_col') or '').strip()
+                if selected_weight_column and selected_weight_column != '(None)':
+                    df['Weight'] = pd.to_numeric(df['Weight'], errors='coerce')
+                    invalid_weight_mask = (~np.isfinite(df['Weight'])) | (df['Weight'] <= 0.0)
+                    invalid_weight_count = int(invalid_weight_mask.sum())
+                    if invalid_weight_count:
+                        print(f"Detected {invalid_weight_count} sample rows with blank/non-numeric/non-positive weights; these will be excluded from samples.")
+                        df = df.loc[~invalid_weight_mask].copy()
+                    if len(df) == 0:
+                        raise ValueError("After removing invalid sample weights, no samples remain. Check the configured 'sample_weight_col'.")
+                    sample_weights = df['Weight'].to_numpy(dtype=float, copy=False)
                 
                 points = df[['x','y','z']].values
                 values = df['Value'].values
@@ -11956,7 +12832,8 @@ if __name__ == "__main__":
                     block_z_col=cfg.get('block_z_col'),
                     block_domain_col=cfg.get('block_domain_col'),
                     config=cfg,
-                    sample_domains=sample_domains
+                    sample_domains=sample_domains,
+                    sample_weights=sample_weights,
                 )
                 
                 # Run interpolation (handle both single and sequential domain processing)
