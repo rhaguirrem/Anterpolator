@@ -7,6 +7,7 @@ Caserones Categorizacion.csv
 *.xlsm
 *.xlsx
 *.csv
+*.bmf
 
 # Python
 __pycache__/
