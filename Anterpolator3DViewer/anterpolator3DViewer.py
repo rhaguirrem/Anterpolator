@@ -1335,6 +1335,7 @@ def _select_majority_sample_block_domains(sample_block_domain_counts):
 
 def _build_sample_block_rows(sample_block_values, sample_block_counts, reference_origin, block_size,
                              rotation_matrix=None, rotation_center=None, domain_mapping=None,
+                             value_column_name='Value', domain_column_name='Domain',
                              sample_count_column_name='Sample_Count', sample_ids_by_block=None,
                              sample_ids_column_name='SampleIDs'):
     rows = []
@@ -1349,7 +1350,7 @@ def _build_sample_block_rows(sample_block_values, sample_block_counts, reference
             'x': float(point[0]),
             'y': float(point[1]),
             'z': float(point[2]),
-            'Value': float(sample_block_values[block_idx]),
+            value_column_name: float(sample_block_values[block_idx]),
             sample_count_column_name: int(sample_block_counts.get(block_idx, 0)),
         }
         if sample_ids_by_block is not None:
@@ -1358,7 +1359,7 @@ def _build_sample_block_rows(sample_block_values, sample_block_counts, reference
         if domain_mapping is not None:
             domain_value = str(domain_mapping.get(block_idx, '')).strip()
             if domain_value:
-                row['Domain'] = domain_value
+                row[domain_column_name] = domain_value
         rows.append(row)
     return rows
 
@@ -6438,6 +6439,14 @@ def export_sample_blocks_from_samples_and_blocks(samples_file, blocks_file, outp
     elif sample_domains is not None:
         row_domain_mapping = _select_majority_sample_block_domains(sample_block_data['sample_block_domain_counts'])
 
+    output_value_column_name = f'BLK_{value_column_name}' if value_column_name else 'BLK_Value'
+    output_domain_column_name = 'Domain'
+    selected_sample_domain_col = str(sample_domain_col or '').strip()
+    if selected_sample_domain_col and selected_sample_domain_col != '(None)':
+        output_domain_column_name = selected_sample_domain_col
+    elif selected_block_domain_col and selected_block_domain_col != '(None)':
+        output_domain_column_name = selected_block_domain_col
+
     sample_count_column_name = f'{value_column_name}_SampleCount' if value_column_name else 'Value_SampleCount'
     sample_ids_column_name = f'{value_column_name}_SampleIDs' if value_column_name else 'Value_SampleIDs'
     rows = _build_sample_block_rows(
@@ -6448,6 +6457,8 @@ def export_sample_blocks_from_samples_and_blocks(samples_file, blocks_file, outp
         rotation_matrix=block_metadata.get('rotation_matrix') if block_metadata.get('is_rotated') else None,
         rotation_center=block_metadata.get('rotation_center') if block_metadata.get('is_rotated') else None,
         domain_mapping=row_domain_mapping,
+        value_column_name=output_value_column_name,
+        domain_column_name=output_domain_column_name,
         sample_count_column_name=sample_count_column_name,
         sample_ids_by_block=sample_block_data.get('sample_block_ids') if include_sample_ids else None,
         sample_ids_column_name=sample_ids_column_name,
