@@ -1,8 +1,8 @@
 # Anterpolator
 
-**Numeric Interpolator based on Ant Colony Optimization and Molecular Clock Phylogeography**
+**3D geological interpolation and block-model operations toolkit**
 
-Anterpolator is a novel 3D spatial interpolation tool designed for geological modeling. It moves beyond traditional geostatistical methods (kriging, IDW) and implicit modeling (RBF) by applying bio-inspired algorithms to solve complex connectivity problems in geological structures.
+Anterpolator is a 3D geological modeling tool focused on interpolation, domain-aware workflows, and block-model operations. It combines experimental bio-inspired interpolators with practical data-preparation utilities for samples and blocks, making it useful both for generating interpolated models and for auditing, exporting, and transforming geological datasets.
 
 ## Key Features
 
@@ -20,13 +20,41 @@ A groundbreaking approach that treats spatial dispersion as evolutionary diverge
 - **Multi-Event Detection:** Automatically separates distinct geological events (pulses) using DBSCAN clustering.
 - **Tree-Based Connectivity:** Builds minimum spanning trees to connect samples, ideal for magmatic intrusions, dikes, and hydrothermal systems.
 
+### 3. Gaussian Kernel Interpolator
+A non-iterative interpolation mode that fills blocks from nearby sample influence using configurable kernel bandwidth, cutoff distance, and nearest-sample fallback behavior.
+
+### 4. String Theory Interpolator
+A connectivity-driven interpolator that builds "strings" between compatible samples.
+- Supports configurable distance threshold, grade-difference control, collision policy, and processing order.
+- Can interpolate either numeric values or categorical domains.
+- Includes optional azimuth and dip frequency filtering to keep dominant structural trends.
+
+### 5. Two-Pass and Domain-Specific Workflows
+Interpolation is not limited to a single algorithm run.
+- Configure a first-pass and second-pass algorithm in one workflow.
+- Use the output of pass 1 as the input of pass 2.
+- Override algorithms per domain so different geological domains can use different interpolation strategies.
+
+### 6. Operations Panel for Samples, Blocks, and Exports
+Beyond interpolation, Anterpolator includes a dedicated operations workflow for common geological data tasks:
+- **Sample Blocks:** aggregate samples into their containing blocks.
+- **Domain Samples:** assign block-model domains back onto sample rows.
+- **Assign Block Columns To Samples:** transfer selected block attributes onto samples.
+- **Block Domain Sample Metrics:** export nearest-distance, k-nearest, residual, and summary metrics by domain.
+- **Domain Interpolation Confidence:** summarize spacing and support metrics for each domain.
+- **Block Volume Weighted Average:** compute weighted summaries using inferred block volumes or a chosen weight field.
+- **CSV Grid To BMF:** export regular CSV grids to the experimental TBMS2.0 BMF backend.
+- **Equation Finder By Domain:** run symbolic regression per domain to search for candidate equations.
+
+### 7. Viewer and Export Utilities
+- Interactive 3D viewer for blocks, samples, and interpolation output.
+- CSV export of interpolation results.
+- Optional sub-block-aware export expansion.
+- Standalone BMF export tooling for grid conversion workflows.
+
 ## Project Structure
 
-- **Anterpolator3DViewer/**: Core Python application and viewer.
-  - `anterpolator3DViewer.py`: Main entry point and GUI.
-  - `ant_colony.py`: Implementation of the Ant Colony Optimization algorithm.
-  - `molecular_clock_interpolator.py`: Implementation of the Phylogeographic/Molecular Clock algorithm.
-  - `interpolator_base.py`: Abstract base class for interpolators.
+- **Anterpolator3DViewer/**: Core Python application and viewer, including the main GUI, interpolation engines, and BMF export backend.
 - **Ant Hill/**: Legacy/Alternative implementations and data.
 - **utils/**: Utility scripts (e.g., backup management).
 - **DOCS/**: Documentation.
@@ -60,13 +88,17 @@ python Anterpolator3DViewer/anterpolator3DViewer.py
 
 ## Configuration
 
-The application uses `config.json` files to manage parameters for both algorithms. You can customize:
-- **Ant Colony:** Pheromone levels, ant count, range size.
-- **Molecular Clock:** Spatial vs. attribute weights, event detection sensitivity, ancestor depth bias.
+The application uses `config.json` files to manage interpolation, workflow, and export parameters. You can customize:
+- **Ant Colony:** Pheromone levels, ant count, sampling percentage, range size, visited-threshold behavior, and interpolation target.
+- **Molecular Clock:** Spatial vs. attribute weights, event detection sensitivity, ancestor depth bias, and interpolation method.
+- **Gaussian Kernel:** Bandwidth, cutoff sigma, nearest fallback, and background handling.
+- **String Theory:** Distance threshold, grade difference, connection limits, collision policy, processing order, interpolation target, and structural frequency filtering.
+- **Workflow:** Default algorithm, second-pass algorithm, and domain-specific algorithm overrides.
+- **Operations:** Filters, selected columns, metrics, export paths, and BMF export settings.
 
 ## Author
 
 **Roberto Aguirre Maturana, Geologist**
 
 ---
-*This project explores the intersection of biology and geostatistics to solve complex geological modeling challenges.*
+*This project explores geology-focused interpolation, connectivity analysis, and block-model operations through a mix of experimental and production-oriented tooling.*
