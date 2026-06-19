@@ -102,10 +102,62 @@ def run_domain_separation_case():
     assert values[(1, 0, 0)] == 25.0
 
 
+def run_support_density_alpha_case():
+    allowed_positions = {
+        (x, y, z)
+        for x in (0, 1)
+        for y in (0, 1)
+        for z in (0, 1)
+    }
+    allowed_positions.update({(2, 0, 0), (0, 2, 0)})
+    domain_mapping = {pos: "A" for pos in allowed_positions}
+    sample_blocks = {
+        (0, 0, 0): 0.0,
+        (2, 0, 0): 10.0,
+    }
+    sample_domains = {pos: "A" for pos in sample_blocks}
+
+    baseline = OctreeDomainInterpolator(output_mode="dense_blocks_cover", support_density_alpha=0.0)
+    baseline.allowed_grid_override = set(allowed_positions)
+    baseline.domain_mapping = dict(domain_mapping)
+    baseline.initialize_blocks(
+        sample_blocks,
+        (4, 4, 4),
+        (0, 0, 0),
+        (1, 1, 1),
+        use_domain_mapping=True,
+        sample_domain_mapping=sample_domains,
+    )
+    baseline.run_iteration((4, 4, 4))
+
+    density_weighted = OctreeDomainInterpolator(output_mode="dense_blocks_cover", support_density_alpha=1.0)
+    density_weighted.allowed_grid_override = set(allowed_positions)
+    density_weighted.domain_mapping = dict(domain_mapping)
+    density_weighted.initialize_blocks(
+        sample_blocks,
+        (4, 4, 4),
+        (0, 0, 0),
+        (1, 1, 1),
+        use_domain_mapping=True,
+        sample_domain_mapping=sample_domains,
+    )
+    density_weighted.run_iteration((4, 4, 4))
+
+    inherited_pos = (0, 2, 0)
+    baseline_value = baseline.get_interpolated_values()[inherited_pos]
+    density_weighted_value = density_weighted.get_interpolated_values()[inherited_pos]
+
+    assert abs(baseline_value - 5.0) < 1e-9
+    assert abs(density_weighted_value - (80.0 / 9.0)) < 1e-9
+    assert density_weighted_value > baseline_value
+    assert density_weighted.get_metadata()["support_density_alpha"] == 1.0
+
+
 def run_regression_suite():
     run_dense_cover_case()
     run_adaptive_leaf_cover_case()
     run_domain_separation_case()
+    run_support_density_alpha_case()
     print("Adaptive octree regression suite passed")
 
 

@@ -30,6 +30,7 @@ class OctreeDomainInterpolator(InterpolatorBase):
         self,
         output_mode: str = "dense_blocks_cover",
         max_levels: int = 0,
+        support_density_alpha: float = 0.0,
         include_dense_provenance: bool = True,
         verbose: bool = False,
     ):
@@ -42,6 +43,10 @@ class OctreeDomainInterpolator(InterpolatorBase):
 
         self.output_mode = normalized_mode
         self.max_levels = max(int(max_levels or 0), 0)
+        alpha_value = float(support_density_alpha or 0.0)
+        if not math.isfinite(alpha_value) or alpha_value < 0.0 or alpha_value > 1.0:
+            raise ValueError("support_density_alpha must be a finite value between 0 and 1")
+        self.support_density_alpha = alpha_value
         self.include_dense_provenance = bool(include_dense_provenance)
 
         self.min_bounds = None
@@ -158,7 +163,7 @@ class OctreeDomainInterpolator(InterpolatorBase):
                 continue
 
             valid_levels = self._build_valid_levels(allowed_positions)
-            sample_levels = self._build_sample_levels(domain_name)
+            sample_levels = self._build_sample_levels(domain_name, valid_levels)
             self.valid_counts_by_domain_level = self.valid_counts_by_domain_level or {}
             self.sample_stats_by_domain_level = self.sample_stats_by_domain_level or {}
             self.valid_counts_by_domain_level[domain_name] = valid_levels
@@ -201,6 +206,7 @@ class OctreeDomainInterpolator(InterpolatorBase):
         self._metadata = {
             "algorithm": self.get_algorithm_name(),
             "output_mode": self.output_mode,
+            "support_density_alpha": self.support_density_alpha,
             "include_dense_provenance": self.include_dense_provenance,
             "domains": len(self.output_blocks_by_domain),
             "total_blocks": len(self.blocks),
@@ -243,17 +249,26 @@ class OctreeDomainInterpolator(InterpolatorBase):
             current = levels[level]
         return levels
 
-    def _build_sample_levels(self, domain_name: str) -> Dict[int, Dict[GridIndex, Dict[str, float]]]:
+    def _build_sample_levels(
+        self,
+        domain_name: str,
+        valid_levels: Dict[int, Dict[GridIndex, int]],
+    ) -> Dict[int, Dict[GridIndex, Dict[str, float]]]:
         level_zero: Dict[GridIndex, Dict[str, float]] = {}
         for pos, value in self.sample_blocks.items():
             if self._resolve_sample_domain(pos) != domain_name:
                 continue
             base_block = self.blocks.get(pos, {})
-            support_weight = float(base_block.get("support_weight", 1.0))
+            raw_support = float(base_block.get("support_weight", 1.0))
             sample_count = float(base_block.get("sample_count", 1.0))
+            effective_weight = self._compute_effective_support(
+                raw_support,
+                int(valid_levels.get(0, {}).get(pos, 1)),
+            )
             level_zero[pos] = {
-                "sum_w": support_weight,
-                "sum_wv": float(value) * support_weight,
+                "value": float(value),
+                "raw_support": raw_support,
+                "effective_weight": effective_weight,
                 "sample_count": sample_count,
             }
 
@@ -267,15 +282,44 @@ class OctreeDomainInterpolator(InterpolatorBase):
                 parent_pos = self._parent_pos(pos)
                 parent = parent_stats.setdefault(
                     parent_pos,
-                    {"sum_w": 0.0, "sum_wv": 0.0, "sample_count": 0.0},
+                    {
+                        "value_weight_sum": 0.0,
+                        "effective_weight_sum": 0.0,
+                        "raw_support": 0.0,
+                        "sample_count": 0.0,
+                    },
                 )
-                parent["sum_w"] += float(stats.get("sum_w", 0.0))
-                parent["sum_wv"] += float(stats.get("sum_wv", 0.0))
+                child_effective_weight = float(stats.get("effective_weight", 0.0))
+                parent["value_weight_sum"] += float(stats.get("value", 0.0)) * child_effective_weight
+                parent["effective_weight_sum"] += child_effective_weight
+                parent["raw_support"] += float(stats.get("raw_support", 0.0))
                 parent["sample_count"] += float(stats.get("sample_count", 0.0))
             level += 1
-            levels[level] = parent_stats
-            current = parent_stats
+            finalized_parent_stats: Dict[GridIndex, Dict[str, float]] = {}
+            for parent_pos, stats in parent_stats.items():
+                effective_weight_sum = float(stats.get("effective_weight_sum", 0.0))
+                if effective_weight_sum <= 0.0:
+                    continue
+                raw_support = float(stats.get("raw_support", 0.0))
+                finalized_parent_stats[parent_pos] = {
+                    "value": float(stats["value_weight_sum"] / effective_weight_sum),
+                    "raw_support": raw_support,
+                    "effective_weight": self._compute_effective_support(
+                        raw_support,
+                        int(valid_levels.get(level, {}).get(parent_pos, 0)),
+                    ),
+                    "sample_count": float(stats.get("sample_count", 0.0)),
+                }
+            levels[level] = finalized_parent_stats
+            current = finalized_parent_stats
         return levels
+
+    def _compute_effective_support(self, raw_support: float, represented_volume: int) -> float:
+        raw_support_value = float(raw_support)
+        if raw_support_value <= 0.0:
+            return 0.0
+        volume = max(int(represented_volume), 1)
+        return raw_support_value / (float(volume) ** self.support_density_alpha)
 
     def _build_domain_roots(self, valid_levels: Dict[int, Dict[GridIndex, int]]) -> Tuple[list[NodeKey], int]:
         max_level = max(valid_levels.keys()) if valid_levels else 0
@@ -305,9 +349,9 @@ class OctreeDomainInterpolator(InterpolatorBase):
         support_weight = 0.0
         sample_count = 0
         has_samples = False
-        if node_stats and float(node_stats.get("sum_w", 0.0)) > 0.0:
-            support_weight = float(node_stats["sum_w"])
-            node_value = float(node_stats["sum_wv"] / node_stats["sum_w"])
+        if node_stats and float(node_stats.get("effective_weight", 0.0)) > 0.0:
+            support_weight = float(node_stats["effective_weight"])
+            node_value = float(node_stats["value"])
             sample_count = int(round(float(node_stats.get("sample_count", 0.0))))
             has_samples = True
 
@@ -343,7 +387,7 @@ class OctreeDomainInterpolator(InterpolatorBase):
                 self.sample_stats_by_domain_level.get(domain_name, {})
                 .get(child_key[0], {})
                 .get((child_key[1], child_key[2], child_key[3]), {})
-                .get("sum_w", 0.0)
+                .get("effective_weight", 0.0)
             ) > 0.0
         ]
 
@@ -370,8 +414,8 @@ class OctreeDomainInterpolator(InterpolatorBase):
                     (child_key[1], child_key[2], child_key[3]),
                     {},
                 )
-                if float(child_stats.get("sum_w", 0.0)) > 0.0:
-                    sibling_values.append(float(child_stats["sum_wv"] / child_stats["sum_w"]))
+                if float(child_stats.get("effective_weight", 0.0)) > 0.0:
+                    sibling_values.append(float(child_stats["value"]))
             if sibling_values:
                 node_value = float(np.mean(sibling_values))
 
@@ -381,7 +425,7 @@ class OctreeDomainInterpolator(InterpolatorBase):
                 self.sample_stats_by_domain_level.get(domain_name, {})
                 .get(child_key[0], {})
                 .get(child_pos, {})
-                .get("sum_w", 0.0)
+                .get("effective_weight", 0.0)
             ) > 0.0
             if child_has_samples:
                 next_leaf_id = self._emit_cover_for_node(

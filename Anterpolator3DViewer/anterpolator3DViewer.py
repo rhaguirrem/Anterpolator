@@ -229,6 +229,7 @@ def create_interpolator(config, domain=None, current_algorithm=None):
         return OctreeDomainInterpolator(
             output_mode=octree_params.get('output_mode', 'dense_blocks_cover'),
             max_levels=octree_params.get('max_levels', 0),
+            support_density_alpha=octree_params.get('support_density_alpha', 0.0),
             include_dense_provenance=octree_params.get('include_dense_provenance', True),
             verbose=config.get('verbose', False),
         )
@@ -10425,6 +10426,10 @@ if __name__ == "__main__":
             self.octree_max_levels.setValue(0)
             self.octree_max_levels.setToolTip('Maximum number of aggregation levels. Set to 0 to aggregate all the way to the domain root implied by the current block grid.')
 
+            self.octree_support_density_alpha = dbl_spin(0.0, 0.0, 1.0, 0.05)
+            self.octree_support_density_alpha.setDecimals(2)
+            self.octree_support_density_alpha.setToolTip('Controls how strongly larger represented volumes are penalized when a parent octree node averages child values. Effective support is computed as s / (V^alpha), where s is sample support and V is the represented finest-cell volume. Set 0 for pure sample support or values closer to 1 to favor denser, smaller supported regions.')
+
             self.octree_include_dense_provenance = QtWidgets.QCheckBox()
             self.octree_include_dense_provenance.setChecked(True)
             self.octree_include_dense_provenance.setToolTip('When Dense Blocks Cover is selected, include adaptive leaf lineage columns on each dense output block for filtering and debugging.')
@@ -10438,6 +10443,7 @@ if __name__ == "__main__":
 
             octree_form.addRow('Output Mode', self.octree_output_mode)
             octree_form.addRow('Max Levels (0 = auto)', self.octree_max_levels)
+            octree_form.addRow('Support Density Alpha', self.octree_support_density_alpha)
             octree_form.addRow('Dense Provenance Columns', self.octree_include_dense_provenance)
 
             # === STRING THEORY TAB ===
@@ -10846,6 +10852,7 @@ if __name__ == "__main__":
                 'adaptive_octree_params': {
                     'output_mode': 'dense_blocks_cover' if self.octree_output_mode.currentText().strip().lower() == 'dense blocks cover' else 'adaptive_leaf_cover',
                     'max_levels': self.octree_max_levels.value(),
+                    'support_density_alpha': self.octree_support_density_alpha.value(),
                     'include_dense_provenance': self.octree_include_dense_provenance.isChecked(),
                 },
                 'string_theory_params': {
@@ -11088,6 +11095,7 @@ if __name__ == "__main__":
                         mode = str(octree['output_mode']).strip().lower()
                         self.octree_output_mode.setCurrentText('Adaptive Leaf Cover' if mode == 'adaptive_leaf_cover' else 'Dense Blocks Cover')
                     if 'max_levels' in octree: self.octree_max_levels.setValue(int(octree['max_levels']))
+                    if 'support_density_alpha' in octree: self.octree_support_density_alpha.setValue(float(octree['support_density_alpha']))
                     if 'include_dense_provenance' in octree: self.octree_include_dense_provenance.setChecked(bool(octree['include_dense_provenance']))
                 if 'string_theory_params' in config:
                     st = config['string_theory_params']
