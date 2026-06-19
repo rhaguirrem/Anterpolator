@@ -222,6 +222,17 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             verbose=config.get('verbose', False),
         )
 
+    elif algo_type == 'adaptive_octree':
+        from octree_domain_interpolator import OctreeDomainInterpolator
+
+        octree_params = config.get('adaptive_octree_params', {})
+        return OctreeDomainInterpolator(
+            output_mode=octree_params.get('output_mode', 'dense_blocks_cover'),
+            max_levels=octree_params.get('max_levels', 0),
+            include_dense_provenance=octree_params.get('include_dense_provenance', True),
+            verbose=config.get('verbose', False),
+        )
+
     
     elif algo_type == 'string_theory' or algo_type == 'net_connector':
         from string_theory_interpolator import StringTheoryInterpolator
@@ -2657,7 +2668,11 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'domains': original_domains_array,
             'block_indices': block_indices,
             'assigned_mask': assigned_mask,
+            'sample_block_counts': dict(sample_block_data['sample_block_counts']),
+            'sample_block_weight_sums': dict(sample_block_data['sample_block_weight_sums']),
         }
+        multiblock._sample_block_counts = dict(sample_block_data['sample_block_counts'])
+        multiblock._sample_block_weight_sums = dict(sample_block_data['sample_block_weight_sums'])
         load_pbar.update(1)
         load_pbar.set_postfix_str("initializing interpolator")
         
@@ -2725,7 +2740,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 # Initialize with only this domain's samples
                 interp1.initialize_blocks(domain_samples, tuple(block_info['dims']),
                                              all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping,
-                                             sample_domain_mapping=domain_sample_mapping)
+                                             sample_domain_mapping=domain_sample_mapping,
+                                             sample_block_counts={pos: multiblock._sample_block_counts.get(pos, 1) for pos in domain_samples},
+                                             sample_block_weight_sums={pos: multiblock._sample_block_weight_sums.get(pos, 1.0) for pos in domain_samples})
                 
                 if hasattr(interp1, 'create_ants'):
                     interp1.create_ants()
@@ -2750,7 +2767,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     # Initialize with original samples (will be augmented later)
                     interp2.initialize_blocks(domain_samples, tuple(block_info['dims']),
                                              all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_2,
-                                             sample_domain_mapping=domain_sample_mapping)
+                                             sample_domain_mapping=domain_sample_mapping,
+                                             sample_block_counts={pos: multiblock._sample_block_counts.get(pos, 1) for pos in domain_samples},
+                                             sample_block_weight_sums={pos: multiblock._sample_block_weight_sums.get(pos, 1.0) for pos in domain_samples})
                     
                     if hasattr(interp2, 'create_ants'):
                         interp2.create_ants()
@@ -2807,6 +2826,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     elif algo_type == 'gaussian_kernel':
                         interp1.allowed_grid_override = allowed_grid
                         interp1.domain_mapping = domain_mapping
+                    elif algo_type == 'adaptive_octree':
+                        interp1.allowed_grid_override = allowed_grid
+                        interp1.domain_mapping = domain_mapping
                     elif algo_type == 'string_theory':
                         interp1.allowed_grid_override = allowed_grid
                         interp1.domain_mapping = domain_mapping
@@ -2817,7 +2839,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     use_mapping_1 = False
                 
                 interp1.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
-                                         all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_1)
+                                         all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_1,
+                                         sample_block_counts=getattr(multiblock, '_sample_block_counts', {}),
+                                         sample_block_weight_sums=getattr(multiblock, '_sample_block_weight_sums', {}))
                 if hasattr(interp1, 'create_ants'):
                     interp1.create_ants()
                 domain_interpolators.append(interp1)
@@ -2837,6 +2861,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     elif algo2 == 'gaussian_kernel':
                         interp2.allowed_grid_override = allowed_grid
                         interp2.domain_mapping = domain_mapping
+                    elif algo2 == 'adaptive_octree':
+                        interp2.allowed_grid_override = allowed_grid
+                        interp2.domain_mapping = domain_mapping
                     elif algo2 == 'string_theory':
                         interp2.allowed_grid_override = allowed_grid
                         interp2.domain_mapping = domain_mapping
@@ -2847,7 +2874,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     use_mapping_2 = False
                 
                 interp2.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
-                                         all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_2)
+                                         all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_2,
+                                         sample_block_counts=getattr(multiblock, '_sample_block_counts', {}),
+                                         sample_block_weight_sums=getattr(multiblock, '_sample_block_weight_sums', {}))
                 if hasattr(interp2, 'create_ants'):
                     interp2.create_ants()
                 domain_interpolators.append(interp2)
@@ -2880,6 +2909,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     elif algo_type == 'gaussian_kernel':
                         interpolator.allowed_grid_override = allowed_grid
                         interpolator.domain_mapping = domain_mapping
+                    elif algo_type == 'adaptive_octree':
+                        interpolator.allowed_grid_override = allowed_grid
+                        interpolator.domain_mapping = domain_mapping
                     elif algo_type == 'string_theory':
                         interpolator.allowed_grid_override = allowed_grid
                         interpolator.domain_mapping = domain_mapping
@@ -2892,7 +2924,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 
                 # Use use_domain_mapping=True to respect allowed_grid_override (geometry)
                 interpolator.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
-                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping)
+                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping,
+                                             sample_block_counts=getattr(multiblock, '_sample_block_counts', {}),
+                                             sample_block_weight_sums=getattr(multiblock, '_sample_block_weight_sums', {}))
                 
                 if hasattr(interpolator, 'create_ants'):
                     interpolator.create_ants()
@@ -3042,6 +3076,11 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             idx: np.average(vals, weights=block_weights[idx]) if weights_array is not None else np.mean(vals)
             for idx, vals in block_values.items()
         }
+        sample_block_counts = {idx: len(vals) for idx, vals in block_values.items()}
+        sample_block_weight_sums = {
+            idx: float(np.sum(block_weights[idx])) if weights_array is not None else float(len(vals))
+            for idx, vals in block_values.items()
+        }
         multiblock = pv.MultiBlock(block_data)
         multiblock._block_info = block_info
         multiblock._sample_blocks = sample_blocks
@@ -3052,7 +3091,11 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'weights': original_weights_array,
             'block_indices': block_indices,
             'assigned_mask': assigned_mask,
+            'sample_block_counts': dict(sample_block_counts),
+            'sample_block_weight_sums': dict(sample_block_weight_sums),
         }
+        multiblock._sample_block_counts = dict(sample_block_counts)
+        multiblock._sample_block_weight_sums = dict(sample_block_weight_sums)
 
         if is_st_domain_interpolation or is_ant_domain_interpolation:
             # Preserve sample block domains for export.
@@ -3090,6 +3133,8 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 block_size,
                 use_domain_mapping=False,
                 sample_domain_mapping=sample_block_domain_mapping,
+                sample_block_counts=sample_block_counts,
+                sample_block_weight_sums=sample_block_weight_sums,
             )
             multiblock._ant_colony = interpolator
             return multiblock
@@ -3109,6 +3154,8 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 block_size,
                 use_domain_mapping=False,
                 sample_domain_mapping=sample_block_domain_mapping,
+                sample_block_counts=sample_block_counts,
+                sample_block_weight_sums=sample_block_weight_sums,
             )
             if hasattr(interpolator, 'create_ants'):
                 interpolator.create_ants()
@@ -3155,7 +3202,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 use_mapping = False
                 
             interp1.initialize_blocks(sample_blocks, tuple(block_info['dims']),
-                                       min_bounds, block_size, use_domain_mapping=use_mapping)
+                                       min_bounds, block_size, use_domain_mapping=use_mapping,
+                                       sample_block_counts=sample_block_counts,
+                                       sample_block_weight_sums=sample_block_weight_sums)
             if hasattr(interp1, 'create_ants'):
                 interp1.create_ants()
             domain_interpolators.append(interp1)
@@ -3172,7 +3221,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 use_mapping = False
                 
             interp2.initialize_blocks(sample_blocks, tuple(block_info['dims']),
-                                       min_bounds, block_size, use_domain_mapping=use_mapping)
+                                       min_bounds, block_size, use_domain_mapping=use_mapping,
+                                       sample_block_counts=sample_block_counts,
+                                       sample_block_weight_sums=sample_block_weight_sums)
             if hasattr(interp2, 'create_ants'):
                 interp2.create_ants()
             domain_interpolators.append(interp2)
@@ -3189,7 +3240,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 use_mapping = False
                 
             interpolator.initialize_blocks(sample_blocks, tuple(block_info['dims']),
-                                           min_bounds, block_size, use_domain_mapping=use_mapping)
+                                           min_bounds, block_size, use_domain_mapping=use_mapping,
+                                           sample_block_counts=sample_block_counts,
+                                           sample_block_weight_sums=sample_block_weight_sums)
             
             if hasattr(interpolator, 'create_ants'):
                 interpolator.create_ants()
@@ -6952,7 +7005,12 @@ def _iter_expanded_export_block_chunks(block_rows, source_blocks_file, blocks_de
     export_lookup, export_columns = _build_export_block_row_lookup(block_rows)
 
     for chunk_number, chunk in enumerate(
-        iterate_csv_with_progress(source_blocks_file, progress_label, **read_kwargs),
+        iterate_csv_path_chunks_with_progress(
+            source_blocks_file,
+            progress_label,
+            header_line=header_line,
+            **read_kwargs,
+        ),
         start=1,
     ):
         chunk = strip_leading_non_data_rows(chunk)
@@ -7033,7 +7091,7 @@ def _build_export_blocks_dataframe(blocks, block_rows):
     if not block_rows or base_df.empty:
         return base_df
 
-    if not block_info.get('expand_interpolation_exports_to_subblocks', False):
+    if not block_info.get('expand_interpolation_exports_to_subblocks', False) or _blocks_use_adaptive_leaf_cover(blocks):
         return base_df
 
     source_blocks_file = str(block_info.get('source_blocks_file') or '').strip()
@@ -7087,6 +7145,7 @@ def export_blocks_to_csv(blocks, filepath):
     should_stream_expanded_export = (
         bool(data)
         and block_info.get('expand_interpolation_exports_to_subblocks', False)
+        and not _blocks_use_adaptive_leaf_cover(blocks)
         and source_blocks_file
         and os.path.isfile(source_blocks_file)
         and os.path.getsize(source_blocks_file) >= LARGE_BLOCK_FILE_THRESHOLD
@@ -7312,6 +7371,8 @@ def _normalize_export_algorithm_name(algo_name):
     name = str(algo_name or '').strip().lower()
     if 'ant colony' in name:
         return 'Anterpolator', 'ant_colony'
+    if 'adaptive octree' in name:
+        return 'Adaptive Octree', 'adaptive_octree'
     if 'string theory' in name:
         return 'String Theory', 'string_theory'
     if 'molecular clock' in name or 'phylogeographic' in name or 'biochemical clock' in name:
@@ -7331,9 +7392,15 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
     )
     
     for pos, block in tqdm(interpolator.blocks.items(), desc="Processing blocks"):
-        # Calculate block centroid - grid indices are calculated relative to centroids in min_bounds,
-        # so we don't add block_size/2 (that would shift by half a block)
-        centroid = min_bounds + np.array(pos) * np.array(block_size)
+        if hasattr(block, 'value'):
+            relative_size = np.ones(3, dtype=float)
+        else:
+            relative_size = np.asarray(block.get('relative_size', (1, 1, 1)), dtype=float)
+            if relative_size.shape != (3,):
+                relative_size = np.ones(3, dtype=float)
+        base_block_size = np.asarray(block_size, dtype=float)
+        actual_block_size = base_block_size * relative_size
+        centroid = min_bounds + (np.asarray(pos, dtype=float) + 0.5 * (relative_size - 1.0)) * base_block_size
         
         # Apply inverse rotation if needed
         if rotation_matrix is not None and rotation_center is not None:
@@ -7392,7 +7459,17 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
             'Event_ID': None,
             'Branch_ID': None,
             'Distance_To_Feeder': None,
-            'Is_Feeder': None
+            'Is_Feeder': None,
+            'Block_Size_X': float(actual_block_size[0]),
+            'Block_Size_Y': float(actual_block_size[1]),
+            'Block_Size_Z': float(actual_block_size[2]),
+            'AdaptiveLevel': None,
+            'AdaptiveLeafID': None,
+            'AdaptiveLeafSizeX': None,
+            'AdaptiveLeafSizeY': None,
+            'AdaptiveLeafSizeZ': None,
+            'AdaptiveInherited': None,
+            'AdaptiveOutputMode': None,
         }
         
         # Get block data - handle both AntColony Block dataclass and dict
@@ -7452,10 +7529,41 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
                 'Event_ID': block.get('event_id', -1),
                 'Branch_ID': block.get('branch_id', -1),
                 'Distance_To_Feeder': dist_to_feeder,
-                'Is_Feeder': is_feeder
+                'Is_Feeder': is_feeder,
+                'AdaptiveLevel': block.get('adaptive_level', block.get('level')),
+                'AdaptiveLeafID': block.get('adaptive_leaf_id', block.get('leaf_id')),
+                'AdaptiveLeafSizeX': float(np.asarray(block.get('adaptive_relative_size', block.get('relative_size', (1, 1, 1))), dtype=float)[0] * base_block_size[0]),
+                'AdaptiveLeafSizeY': float(np.asarray(block.get('adaptive_relative_size', block.get('relative_size', (1, 1, 1))), dtype=float)[1] * base_block_size[1]),
+                'AdaptiveLeafSizeZ': float(np.asarray(block.get('adaptive_relative_size', block.get('relative_size', (1, 1, 1))), dtype=float)[2] * base_block_size[2]),
+                'AdaptiveInherited': block.get('is_inherited'),
+                'AdaptiveOutputMode': interpolator.get_metadata().get('output_mode') if hasattr(interpolator, 'get_metadata') else None,
             })
             
         data.append(row)
+
+
+def _iter_final_interpolators(blocks):
+    if hasattr(blocks, '_interpolators') and blocks._interpolators:
+        for interpolator_list in blocks._interpolators.values():
+            if isinstance(interpolator_list, list) and interpolator_list:
+                yield interpolator_list[-1]
+            elif interpolator_list is not None:
+                yield interpolator_list
+        return
+    interpolator = getattr(blocks, '_ant_colony', None)
+    if interpolator is not None:
+        yield interpolator
+
+
+def _blocks_use_adaptive_leaf_cover(blocks):
+    for interpolator in _iter_final_interpolators(blocks):
+        try:
+            metadata = interpolator.get_metadata()
+        except Exception:
+            metadata = {}
+        if str(metadata.get('output_mode', '')).strip().lower() == 'adaptive_leaf_cover':
+            return True
+    return False
 
 def _get_interpolator_run_profile(interpolator, dims, iterations):
     algo_name = interpolator.get_algorithm_name()
@@ -8650,12 +8758,12 @@ if __name__ == "__main__":
                 self.table.setItem(i, 0, domain_item)
 
                 algo1_combo = QtWidgets.QComboBox()
-                algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory', 'skip'])
+                algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory', 'skip'])
                 algo1_combo.setCurrentText('(use default)')
                 self.table.setCellWidget(i, 1, algo1_combo)
 
                 algo2_combo = QtWidgets.QComboBox()
-                algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
+                algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory'])
                 algo2_combo.setCurrentText('skip')
                 self.table.setCellWidget(i, 2, algo2_combo)
 
@@ -8700,7 +8808,7 @@ if __name__ == "__main__":
 
         def apply_to_all(self):
             """Apply same first pass algorithm to all domains"""
-            algorithms = ['(use default)', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory', 'skip']
+            algorithms = ['(use default)', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory', 'skip']
             algo, ok = QtWidgets.QInputDialog.getItem(
                 self, 'Apply to All', 'Select first pass algorithm for all domains:', 
                 algorithms, 0, False
@@ -8713,7 +8821,7 @@ if __name__ == "__main__":
 
         def apply_second_pass_to_all(self):
             """Apply same second pass algorithm to all eligible domains"""
-            algorithms = ['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory']
+            algorithms = ['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory']
             algo, ok = QtWidgets.QInputDialog.getItem(
                 self, 'Apply to All', 'Select second pass algorithm for all domains:',
                 algorithms, 0, False
@@ -9114,6 +9222,11 @@ if __name__ == "__main__":
             gk_form = QtWidgets.QFormLayout()
             gk_tab.setLayout(gk_form)
             tabs.addTab(gk_tab, "Gaussian Kernel")
+
+            octree_tab = QtWidgets.QWidget()
+            octree_form = QtWidgets.QFormLayout()
+            octree_tab.setLayout(octree_form)
+            tabs.addTab(octree_tab, "Adaptive Octree")
 
             st_tab = QtWidgets.QWidget()
             st_form = QtWidgets.QFormLayout()
@@ -10301,6 +10414,32 @@ if __name__ == "__main__":
             gk_form.addRow('Fill Background', self.gk_fill_background)
             gk_form.addRow('Background Value', self.gk_background_value)
 
+            # === ADAPTIVE OCTREE TAB ===
+            self.octree_output_mode = QtWidgets.QComboBox()
+            self.octree_output_mode.addItems(['Dense Blocks Cover', 'Adaptive Leaf Cover'])
+            self.octree_output_mode.setCurrentText('Dense Blocks Cover')
+            self.octree_output_mode.setToolTip('Dense Blocks Cover populates every final block using the adaptive field. Adaptive Leaf Cover exports only the non-overlapping adaptive leaves.')
+
+            self.octree_max_levels = QtWidgets.QSpinBox()
+            self.octree_max_levels.setRange(0, 64)
+            self.octree_max_levels.setValue(0)
+            self.octree_max_levels.setToolTip('Maximum number of aggregation levels. Set to 0 to aggregate all the way to the domain root implied by the current block grid.')
+
+            self.octree_include_dense_provenance = QtWidgets.QCheckBox()
+            self.octree_include_dense_provenance.setChecked(True)
+            self.octree_include_dense_provenance.setToolTip('When Dense Blocks Cover is selected, include adaptive leaf lineage columns on each dense output block for filtering and debugging.')
+
+            def update_octree_ui():
+                is_dense_output = self.octree_output_mode.currentText().strip().lower() == 'dense blocks cover'
+                self.octree_include_dense_provenance.setEnabled(is_dense_output)
+
+            self.octree_output_mode.currentTextChanged.connect(update_octree_ui)
+            update_octree_ui()
+
+            octree_form.addRow('Output Mode', self.octree_output_mode)
+            octree_form.addRow('Max Levels (0 = auto)', self.octree_max_levels)
+            octree_form.addRow('Dense Provenance Columns', self.octree_include_dense_provenance)
+
             # === STRING THEORY TAB ===
             self.st_distance_threshold = dbl_spin(10.0, 0.1, 1000.0, 1.0)
             self.st_distance_threshold.setToolTip('Maximum distance to search for a connection (in blocks).')
@@ -10404,10 +10543,10 @@ if __name__ == "__main__":
             self.blank_sample_domain_behavior.setToolTip('How to handle blank sample domains during domain-based interpolation or metrics.\nSkip: exclude blank-domain rows.\nInfer From Blocks: infer missing sample domains from the blocks model when possible.')
 
             self.algorithm_combo = QtWidgets.QComboBox()
-            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
+            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory'])
 
             self.second_pass_combo = QtWidgets.QComboBox()
-            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'string_theory'])
+            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory'])
             self.second_pass_combo.setCurrentText('skip')
 
             def validate_algorithms():
@@ -10704,6 +10843,11 @@ if __name__ == "__main__":
                     'fill_background': self.gk_fill_background.isChecked(),
                     'background_value': self.gk_background_value.value(),
                 },
+                'adaptive_octree_params': {
+                    'output_mode': 'dense_blocks_cover' if self.octree_output_mode.currentText().strip().lower() == 'dense blocks cover' else 'adaptive_leaf_cover',
+                    'max_levels': self.octree_max_levels.value(),
+                    'include_dense_provenance': self.octree_include_dense_provenance.isChecked(),
+                },
                 'string_theory_params': {
                     'interpolate_target': self.st_interpolate_target.currentText().strip().lower(),
                     'distance_threshold': self.st_distance_threshold.value(),
@@ -10938,6 +11082,13 @@ if __name__ == "__main__":
                         self.gk_fill_background.setChecked(bool(gk['fill_background']))
                         self.gk_background_value.setEnabled(bool(gk['fill_background']))
                     if 'background_value' in gk: self.gk_background_value.setValue(gk['background_value'])
+                if 'adaptive_octree_params' in config:
+                    octree = config['adaptive_octree_params']
+                    if 'output_mode' in octree:
+                        mode = str(octree['output_mode']).strip().lower()
+                        self.octree_output_mode.setCurrentText('Adaptive Leaf Cover' if mode == 'adaptive_leaf_cover' else 'Dense Blocks Cover')
+                    if 'max_levels' in octree: self.octree_max_levels.setValue(int(octree['max_levels']))
+                    if 'include_dense_provenance' in octree: self.octree_include_dense_provenance.setChecked(bool(octree['include_dense_provenance']))
                 if 'string_theory_params' in config:
                     st = config['string_theory_params']
                     if 'interpolate_target' in st:
@@ -12958,7 +13109,7 @@ if __name__ == "__main__":
                 if block_evaluated_samples_file:
                     print(f"Block-evaluated samples saved to:\n  {block_evaluated_samples_file}")
                 print("=" * 60)
-                self._prefer_interpolation_file_for_viewer = True
+                self._prefer_interpolation_file_for_viewer = not _blocks_use_adaptive_leaf_cover(blocks)
                 
                 success_lines = [f"Interpolation complete!\nResults saved to:\n{interpolation_file}"]
                 if block_evaluated_samples_file:

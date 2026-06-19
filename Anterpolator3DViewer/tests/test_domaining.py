@@ -1420,11 +1420,16 @@ def test_export_blocks_to_csv_streams_large_subblock_expansion(monkeypatch):
 
         progress_labels = []
 
-        def _fake_iterate_csv_with_progress(path, progress_label, progress_callback=None, **read_csv_kwargs):
+        def _fake_iterate_csv_path_chunks_with_progress(path, progress_label, progress_callback=None,
+                                                        header_line=1, **read_csv_kwargs):
             progress_labels.append(progress_label)
             yield from pd.read_csv(path, **read_csv_kwargs)
 
-        monkeypatch.setattr(viewer_module, "iterate_csv_with_progress", _fake_iterate_csv_with_progress)
+        monkeypatch.setattr(
+            viewer_module,
+            "iterate_csv_path_chunks_with_progress",
+            _fake_iterate_csv_path_chunks_with_progress,
+        )
         monkeypatch.setattr(viewer_module, "LARGE_BLOCK_FILE_THRESHOLD", 1)
 
         class FakeBlocks:
@@ -1499,10 +1504,15 @@ def test_export_blocks_to_csv_streaming_leaves_unmatched_rows_blank(monkeypatch)
             ]
         ).to_csv(blocks_path, index=False)
 
-        def _fake_iterate_csv_with_progress(path, progress_label, progress_callback=None, **read_csv_kwargs):
+        def _fake_iterate_csv_path_chunks_with_progress(path, progress_label, progress_callback=None,
+                                                        header_line=1, **read_csv_kwargs):
             yield from pd.read_csv(path, **read_csv_kwargs)
 
-        monkeypatch.setattr(viewer_module, "iterate_csv_with_progress", _fake_iterate_csv_with_progress)
+        monkeypatch.setattr(
+            viewer_module,
+            "iterate_csv_path_chunks_with_progress",
+            _fake_iterate_csv_path_chunks_with_progress,
+        )
         monkeypatch.setattr(viewer_module, "LARGE_BLOCK_FILE_THRESHOLD", 1)
 
         class FakeBlocks:
