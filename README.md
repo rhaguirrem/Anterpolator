@@ -29,13 +29,19 @@ A connectivity-driven interpolator that builds "strings" between compatible samp
 - Can interpolate either numeric values or categorical domains.
 - Includes optional azimuth and dip frequency filtering to keep dominant structural trends.
 
-### 5. Two-Pass and Domain-Specific Workflows
+### 5. Adaptive Octree Interpolator
+A bottom-up domain-aware hierarchical interpolator that aggregates support over the configured finest block grid.
+- Supports **Dense Blocks Cover** for regular final grids and **Adaptive Leaf Cover** for non-overlapping mixed-size output blocks.
+- Preserves domain boundaries while propagating values upward only within each domain.
+- Includes configurable **Support Density Alpha** weighting, using $s / (V^\alpha)$ to penalize large sparsely supported regions when desired.
+
+### 6. Two-Pass and Domain-Specific Workflows
 Interpolation is not limited to a single algorithm run.
 - Configure a first-pass and second-pass algorithm in one workflow.
 - Use the output of pass 1 as the input of pass 2.
 - Override algorithms per domain so different geological domains can use different interpolation strategies.
 
-### 6. Operations Panel for Samples, Blocks, and Exports
+### 7. Operations Panel for Samples, Blocks, and Exports
 Beyond interpolation, Anterpolator includes a dedicated operations workflow for common geological data tasks:
 - **Sample Blocks:** aggregate samples into their containing blocks.
 - **Domain Samples:** assign block-model domains back onto sample rows.
@@ -46,7 +52,7 @@ Beyond interpolation, Anterpolator includes a dedicated operations workflow for 
 - **CSV Grid To BMF:** export regular CSV grids to the experimental TBMS2.0 BMF backend.
 - **Equation Finder By Domain:** run symbolic regression per domain to search for candidate equations.
 
-### 7. Viewer and Export Utilities
+### 8. Viewer and Export Utilities
 - Interactive 3D viewer for blocks, samples, and interpolation output.
 - CSV export of interpolation results.
 - Optional sub-block-aware export expansion.
@@ -93,6 +99,7 @@ The application uses `config.json` files to manage interpolation, workflow, and 
 - **Molecular Clock:** Spatial vs. attribute weights, event detection sensitivity, ancestor depth bias, and interpolation method.
 - **Gaussian Kernel:** Bandwidth, cutoff sigma, nearest fallback, and background handling.
 - **String Theory:** Distance threshold, grade difference, connection limits, collision policy, processing order, interpolation target, and structural frequency filtering.
+- **Adaptive Octree:** Output mode, maximum aggregation levels, support-density alpha weighting, and dense-output provenance columns.
 - **Workflow:** Default algorithm, second-pass algorithm, and domain-specific algorithm overrides.
 - **Operations:** Filters, selected columns, metrics, export paths, and BMF export settings.
 
