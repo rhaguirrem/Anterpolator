@@ -14,26 +14,26 @@ Inspired by the foraging behavior of ants, this algorithm is excellent for traci
 
 Ants release "pheromones" based on sample grades, establishing connected paths through the model space that respect the natural continuity of the deposit.
 
-### 2. Molecular Clock Interpolator (Phylogeographic Approach)
-A groundbreaking approach that treats spatial dispersion as evolutionary divergence.
-- **Common Ancestor Inference:** Finds "feeder" zones or sources in depth.
-- **Multi-Event Detection:** Automatically separates distinct geological events (pulses) using DBSCAN clustering.
-- **Tree-Based Connectivity:** Builds minimum spanning trees to connect samples, ideal for magmatic intrusions, dikes, and hydrothermal systems.
-
-### 3. Gaussian Kernel Interpolator
-A non-iterative interpolation mode that fills blocks from nearby sample influence using configurable kernel bandwidth, cutoff distance, and nearest-sample fallback behavior.
-
-### 4. String Theory Interpolator
+### 2. String Theory Interpolator
 A connectivity-driven interpolator that builds "strings" between compatible samples.
 - Supports configurable distance threshold, grade-difference control, collision policy, and processing order.
 - Can interpolate either numeric values or categorical domains.
 - Includes optional azimuth and dip frequency filtering to keep dominant structural trends.
 
-### 5. Adaptive Octree Interpolator
+### 3. Molecular Clock Interpolator (Phylogeographic Approach)
+A groundbreaking approach that treats spatial dispersion as evolutionary divergence.
+- **Common Ancestor Inference:** Finds "feeder" zones or sources in depth.
+- **Multi-Event Detection:** Automatically separates distinct geological events (pulses) using DBSCAN clustering.
+- **Tree-Based Connectivity:** Builds minimum spanning trees to connect samples, ideal for magmatic intrusions, dikes, and hydrothermal systems.
+
+### 4. Adaptive Octree Interpolator
 A bottom-up domain-aware hierarchical interpolator that aggregates support over the configured finest block grid.
 - Supports **Dense Blocks Cover** for regular final grids and **Adaptive Leaf Cover** for non-overlapping mixed-size output blocks.
 - Preserves domain boundaries while propagating values upward only within each domain.
 - Includes configurable **Support Density Alpha** weighting, using $s / (V^\alpha)$ to penalize large sparsely supported regions when desired.
+
+### 5. Gaussian Kernel Interpolator
+A non-iterative interpolation mode that fills blocks from nearby sample influence using configurable kernel bandwidth, cutoff distance, and nearest-sample fallback behavior.
 
 ### 6. Two-Pass and Domain-Specific Workflows
 Interpolation is not limited to a single algorithm run.
