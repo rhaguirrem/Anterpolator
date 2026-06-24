@@ -799,28 +799,28 @@ def test_export_block_domain_sample_metrics_can_emit_nearest_sample_value_residu
         assert nearest_sample_group_std_residual_column == "block_grade_Nearest_Sample_Group_StdResidual"
 
         assert output_df.loc[0, nearest_sample_value_column] == pytest.approx(4.0)
-        assert output_df.loc[0, nearest_sample_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[0, nearest_sample_residual_column] == pytest.approx(-1.0)
         assert output_df.loc[0, nearest_sample_abs_residual_column] == pytest.approx(1.0)
         assert output_df.loc[0, nearest_sample_group_block_count_column] == pytest.approx(1.0)
-        assert output_df.loc[0, nearest_sample_group_mean_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[0, nearest_sample_group_mean_residual_column] == pytest.approx(-1.0)
         assert output_df.loc[0, nearest_sample_group_rms_residual_column] == pytest.approx(1.0)
-        assert output_df.loc[0, nearest_sample_group_std_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[0, nearest_sample_group_std_residual_column] == pytest.approx(-1.0)
 
         assert output_df.loc[1, nearest_sample_value_column] == pytest.approx(10.0)
-        assert output_df.loc[1, nearest_sample_residual_column] == pytest.approx(-1.0)
+        assert output_df.loc[1, nearest_sample_residual_column] == pytest.approx(1.0)
         assert output_df.loc[1, nearest_sample_abs_residual_column] == pytest.approx(1.0)
         assert output_df.loc[1, nearest_sample_group_block_count_column] == pytest.approx(2.0)
         assert output_df.loc[1, nearest_sample_group_mean_residual_column] == pytest.approx(0.0)
         assert output_df.loc[1, nearest_sample_group_rms_residual_column] == pytest.approx(1.0)
-        assert output_df.loc[1, nearest_sample_group_std_residual_column] == pytest.approx(-1.0)
+        assert output_df.loc[1, nearest_sample_group_std_residual_column] == pytest.approx(1.0)
 
         assert output_df.loc[2, nearest_sample_value_column] == pytest.approx(10.0)
-        assert output_df.loc[2, nearest_sample_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[2, nearest_sample_residual_column] == pytest.approx(-1.0)
         assert output_df.loc[2, nearest_sample_abs_residual_column] == pytest.approx(1.0)
         assert output_df.loc[2, nearest_sample_group_block_count_column] == pytest.approx(2.0)
         assert output_df.loc[2, nearest_sample_group_mean_residual_column] == pytest.approx(0.0)
         assert output_df.loc[2, nearest_sample_group_rms_residual_column] == pytest.approx(1.0)
-        assert output_df.loc[2, nearest_sample_group_std_residual_column] == pytest.approx(1.0)
+        assert output_df.loc[2, nearest_sample_group_std_residual_column] == pytest.approx(-1.0)
 
 
 def test_export_block_domain_sample_metrics_skips_closer_samples_without_values_for_value_metrics():
@@ -869,7 +869,7 @@ def test_export_block_domain_sample_metrics_skips_closer_samples_without_values_
         assert output_df.loc[0, nearest_distance_column] == pytest.approx(4.0)
         assert output_df.loc[0, "block_grade_dom_Closest_Sample_ID"] == "DDH-VALID"
         assert output_df.loc[0, nearest_sample_value_column] == pytest.approx(9.0)
-        assert output_df.loc[0, nearest_sample_residual_column] == pytest.approx(-4.0)
+        assert output_df.loc[0, nearest_sample_residual_column] == pytest.approx(4.0)
         assert nearest_sample_value_column == "block_grade_Nearest_Sample_Value"
 
 

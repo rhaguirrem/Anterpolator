@@ -5043,7 +5043,7 @@ BLOCK_DOMAIN_METRIC_DEFINITIONS = (
     {
         'id': 'nearest_sample_residual',
         'label': 'Nearest-sample residual',
-        'description': 'Block value minus nearest same-domain sample value.',
+        'description': 'Nearest same-domain sample value minus block value.',
         'cost_label': 'Low',
         'cost_note': 'Reuses the nearest-neighbor query; requires sample and block value columns.',
         'default_checked': False,
@@ -5685,7 +5685,7 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
 
             if wants_block_value_metrics:
                 block_values = pd.to_numeric(output_df.loc[domain_block_indices, block_value_column_name], errors='coerce').to_numpy(copy=False)
-                residual_values = block_values - nearest_sample_values
+                residual_values = nearest_sample_values - block_values
                 abs_residual_values = np.abs(residual_values)
 
                 group_count_values = np.full(len(domain_block_indices), np.nan, dtype=float)
