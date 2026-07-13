@@ -3665,6 +3665,17 @@ def resolve_block_value_transfer_export_path(configured_path=None, samples_file=
 
     return os.path.join(output_dir, f"{base_name}+{suffix}.csv")
 
+def resolve_block_model_transfer_export_path(configured_path=None, target_blocks_file=None):
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    reference_path = str(target_blocks_file or '').strip() or 'target_blocks.csv'
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'target_blocks'
+    return os.path.join(output_dir, f'{base_name}+SourceBlocks.csv')
+
+
 
 def resolve_block_domain_metrics_export_path(configured_path=None, blocks_file=None, domain_col=None):
     configured_path = str(configured_path or '').strip()
@@ -6844,6 +6855,856 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
     }
 
 
+def _normalize_optional_size_columns(size_columns):
+    values = [str(value or '').strip() for value in (size_columns or ())]
+    if len(values) != 3 or any(value in {'', '(None)', '(Infer)'} for value in values):
+        return None
+    return tuple(values)
+
+
+def _infer_block_row_bounds(coords, base_block_size, progress_callback=None, progress_label='Resolving block geometry'):
+    coords = np.asarray(coords, dtype=float)
+    base_dims = np.asarray(base_block_size, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError('Block coordinates must be an Nx3 array.')
+    if base_dims.shape != (3,) or np.any(~np.isfinite(base_dims)) or np.any(base_dims <= 0):
+        raise ValueError('Base block size must contain three positive values.')
+    if len(coords) == 0:
+        empty = np.empty((0, 3), dtype=float)
+        return empty, empty.copy(), empty.copy()
+
+    grid_origin = np.floor(coords.min(axis=0) / base_dims) * base_dims
+    parent_indices = np.floor((coords - grid_origin) / base_dims + 1e-6).astype(np.int64)
+    parent_origins = grid_origin + parent_indices * base_dims
+    local_coords = np.clip(coords - parent_origins, 0.0, base_dims)
+    lower_bounds = np.empty_like(coords, dtype=float)
+    upper_bounds = np.empty_like(coords, dtype=float)
+    _, inverse = np.unique(parent_indices, axis=0, return_inverse=True)
+    order = np.argsort(inverse, kind='stable')
+    sorted_inverse = inverse[order]
+    starts = np.flatnonzero(np.r_[True, sorted_inverse[1:] != sorted_inverse[:-1]])
+    ends = np.r_[starts[1:], len(order)]
+    total_groups = len(starts)
+
+    for group_number, (start, end) in enumerate(zip(starts, ends), start=1):
+        rows = order[start:end]
+        group_local = local_coords[rows]
+        group_origin = parent_origins[rows[0]]
+        for axis in range(3):
+            tolerance = max(base_dims[axis] * 1e-7, 1e-9)
+            centers = _cluster_axis_centers(group_local[:, axis], tolerance)
+            boundaries = np.empty(len(centers) + 1, dtype=float)
+            boundaries[0], boundaries[-1] = 0.0, base_dims[axis]
+            if len(centers) > 1:
+                boundaries[1:-1] = (centers[:-1] + centers[1:]) / 2.0
+            center_indices = np.abs(group_local[:, axis, None] - centers[None, :]).argmin(axis=1)
+            lower_bounds[rows, axis] = group_origin[axis] + boundaries[center_indices]
+            upper_bounds[rows, axis] = group_origin[axis] + boundaries[center_indices + 1]
+        if progress_callback and (group_number == total_groups or group_number % 500 == 0):
+            progress_callback(group_number, total_groups, progress_label)
+    return lower_bounds, upper_bounds, upper_bounds - lower_bounds
+
+
+def _resolve_block_row_geometry(df, coordinate_columns, base_block_size, size_columns=None,
+                                progress_callback=None, progress_label='Resolving block geometry'):
+    if len(coordinate_columns) != 3 or any(column not in df.columns for column in coordinate_columns):
+        raise ValueError('Three valid block coordinate columns are required.')
+    coord_frame = df[list(coordinate_columns)].apply(pd.to_numeric, errors='coerce')
+    valid_mask = coord_frame.notna().all(axis=1).to_numpy()
+    coords = coord_frame.loc[valid_mask].to_numpy(dtype=float, copy=False)
+    explicit_size_columns = _normalize_optional_size_columns(size_columns)
+    if explicit_size_columns:
+        missing = [column for column in explicit_size_columns if column not in df.columns]
+        if missing:
+            raise ValueError(f"Block size column(s) not found: {', '.join(missing)}")
+        sizes = df.loc[valid_mask, list(explicit_size_columns)].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+        valid_sizes = np.isfinite(sizes).all(axis=1) & (sizes > 0).all(axis=1)
+        valid_positions = np.flatnonzero(valid_mask)
+        valid_mask[valid_positions[~valid_sizes]] = False
+        coords, sizes = coords[valid_sizes], sizes[valid_sizes]
+        lower_bounds, upper_bounds = coords - sizes / 2.0, coords + sizes / 2.0
+        mode = 'explicit-size-columns'
+        if progress_callback:
+            progress_callback(1, 1, progress_label)
+    else:
+        lower_bounds, upper_bounds, sizes = _infer_block_row_bounds(
+            coords,
+            base_block_size,
+            progress_callback=progress_callback,
+            progress_label=progress_label,
+        )
+        mode = 'inferred-from-base-grid'
+    return {
+        'row_indices': np.flatnonzero(valid_mask), 'centers': coords,
+        'lower_bounds': lower_bounds, 'upper_bounds': upper_bounds,
+        'sizes': sizes, 'mode': mode,
+    }
+
+
+def _prepare_exact_block_transfer_keys(df, coordinate_columns, size_columns=None):
+    if len(coordinate_columns) != 3 or any(column not in df.columns for column in coordinate_columns):
+        raise ValueError('Three valid block coordinate columns are required.')
+    coord_frame = df[list(coordinate_columns)].apply(pd.to_numeric, errors='coerce')
+    valid_mask = coord_frame.notna().all(axis=1).to_numpy()
+    key_columns = ['__x__', '__y__', '__z__']
+    key_frame = coord_frame.loc[valid_mask].copy()
+    key_frame.columns = key_columns
+
+    explicit_size_columns = _normalize_optional_size_columns(size_columns)
+    if explicit_size_columns:
+        missing = [column for column in explicit_size_columns if column not in df.columns]
+        if missing:
+            raise ValueError(f"Block size column(s) not found: {', '.join(missing)}")
+        size_frame = df.loc[valid_mask, list(explicit_size_columns)].apply(pd.to_numeric, errors='coerce')
+        valid_sizes = size_frame.notna().all(axis=1).to_numpy() & (size_frame.to_numpy(dtype=float, copy=False) > 0).all(axis=1)
+        valid_positions = np.flatnonzero(valid_mask)
+        valid_mask[valid_positions[~valid_sizes]] = False
+        key_frame = key_frame.loc[valid_sizes].copy()
+        size_frame = size_frame.loc[valid_sizes].copy()
+        size_frame.columns = ['__dx__', '__dy__', '__dz__']
+        key_frame = pd.concat([key_frame, size_frame], axis=1)
+        key_columns.extend(['__dx__', '__dy__', '__dz__'])
+
+    if len(key_frame):
+        key_frame = key_frame.round(9)
+    key_frame['__row_index__'] = np.flatnonzero(valid_mask)
+    return {
+        'row_indices': np.flatnonzero(valid_mask),
+        'key_columns': key_columns,
+        'key_frame': key_frame,
+        'uses_explicit_sizes': bool(explicit_size_columns),
+    }
+
+
+def _try_exact_block_model_transfer(source_df, target_df, selected_columns,
+                                    source_coordinate_columns, target_coordinate_columns,
+                                    source_block_size, target_block_size,
+                                    source_size_cols=None, target_size_cols=None,
+                                    progress_callback=None):
+    source_key_data = _prepare_exact_block_transfer_keys(source_df, source_coordinate_columns, source_size_cols)
+    target_key_data = _prepare_exact_block_transfer_keys(target_df, target_coordinate_columns, target_size_cols)
+
+    if source_key_data['uses_explicit_sizes'] != target_key_data['uses_explicit_sizes']:
+        return None
+    if not source_key_data['uses_explicit_sizes'] and not np.allclose(
+        np.asarray(source_block_size, dtype=float),
+        np.asarray(target_block_size, dtype=float),
+        rtol=1e-9,
+        atol=1e-9,
+    ):
+        return None
+
+    source_keys = source_key_data['key_frame']
+    target_keys = target_key_data['key_frame']
+    key_columns = list(source_key_data['key_columns'])
+
+    source_duplicates = source_keys.duplicated(subset=key_columns, keep=False)
+    target_duplicates = target_keys.duplicated(subset=key_columns, keep=False)
+
+    if progress_callback:
+        _emit_progress(progress_callback, 46, 100, 'Matching exact blocks on common grid...')
+
+    source_lookup = source_keys.loc[~source_duplicates, key_columns + ['__row_index__']].merge(
+        source_df[selected_columns],
+        left_on='__row_index__',
+        right_index=True,
+        how='left',
+        sort=False,
+    )
+    source_lookup.rename(columns={'__row_index__': '__source_row_index__'}, inplace=True)
+    merged = target_keys.loc[~target_duplicates, key_columns + ['__row_index__']].merge(
+        source_lookup,
+        on=key_columns,
+        how='left',
+        sort=False,
+    )
+    if progress_callback:
+        _emit_progress(progress_callback, 56, 100, 'Matching exact blocks on common grid...')
+
+    matched_mask = merged['__source_row_index__'].notna()
+    source_values_df = source_df.iloc[source_key_data['row_indices']]
+    column_modes = _detect_dataframe_transfer_column_modes(source_values_df, selected_columns)
+    matched_target_row_indices = merged.loc[matched_mask, '__row_index__'].to_numpy(dtype=int, copy=False)
+    matched_source_row_indices = merged.loc[matched_mask, '__source_row_index__'].to_numpy(dtype=np.int64, copy=False)
+    valid_target_row_indices = target_key_data['row_indices']
+    remaining_target_row_indices = valid_target_row_indices[
+        ~np.isin(valid_target_row_indices, matched_target_row_indices, assume_unique=False)
+    ]
+    invalid_targets = len(target_df) - len(valid_target_row_indices)
+    return {
+        'column_modes': column_modes,
+        'matched_target_row_indices': matched_target_row_indices,
+        'matched_source_row_indices': matched_source_row_indices,
+        'remaining_target_row_indices': remaining_target_row_indices,
+        'total_target_blocks': int(len(target_df)),
+        'overlap_matched_blocks': int(len(matched_target_row_indices)),
+        'nearest_matched_blocks': 0,
+        'unmatched_blocks': int(len(target_df) - len(matched_target_row_indices)),
+        'invalid_target_blocks': int(invalid_targets),
+        'source_geometry_mode': 'exact-grid',
+        'target_geometry_mode': 'exact-grid',
+        'all_valid_targets_matched': len(remaining_target_row_indices) == 0,
+    }
+
+
+def _detect_dataframe_transfer_column_modes(df, columns):
+    modes = {}
+    for column_name in columns:
+        values = df[column_name]
+        nonblank = values.loc[
+            values.notna() & values.astype(str).str.strip().ne('') & values.astype(str).str.lower().ne('nan')
+        ]
+        modes[column_name] = (
+            'numeric' if len(nonblank) and pd.to_numeric(nonblank, errors='coerce').notna().all() else 'categorical'
+        )
+    return modes
+
+
+def _restore_list_widget_selection(list_widget, values):
+    if list_widget is None:
+        return
+    desired = {str(value or '').strip() for value in (values or []) if str(value or '').strip()}
+    blocker = QtCore.QSignalBlocker(list_widget)
+    try:
+        for index in range(list_widget.count()):
+            item = list_widget.item(index)
+            item.setSelected(item.text() in desired)
+    finally:
+        del blocker
+
+
+BLOCK_MODEL_TRANSFER_TARGET_CHUNK_SIZE = 100_000
+
+
+def _prepare_source_block_transfer_dataframe(source_blocks_file, selected_columns,
+                                             source_delimiter=None, source_header_line=1,
+                                             source_x_col=None, source_y_col=None, source_z_col=None,
+                                             source_size_cols=None, progress_callback=None):
+    if is_bmf_file(source_blocks_file):
+        source_df, _ = load_full_blocks_dataframe(
+            source_blocks_file,
+            source_delimiter,
+            source_header_line,
+            progress_label='Reading source block model',
+            progress_callback=_make_scaled_progress_callback(progress_callback, 0, 25, 'Reading source block model...'),
+        )
+        source_x_col, source_y_col, source_z_col = resolve_block_coordinate_columns(
+            list(source_df.columns),
+            source_x_col,
+            source_y_col,
+            source_z_col,
+        )
+        return source_df, source_x_col, source_y_col, source_z_col
+
+    delimiter = source_delimiter or detect_csv_delimiter(source_blocks_file)
+    source_columns = parse_effective_header_line(source_blocks_file, delimiter, source_header_line)
+    source_x_col, source_y_col, source_z_col = resolve_block_coordinate_columns(
+        list(source_columns),
+        source_x_col,
+        source_y_col,
+        source_z_col,
+    )
+    explicit_size_columns = _normalize_optional_size_columns(source_size_cols) or ()
+    selected_source_columns = list(dict.fromkeys([
+        source_x_col,
+        source_y_col,
+        source_z_col,
+        *explicit_size_columns,
+        *selected_columns,
+    ]))
+    source_df, _ = read_selected_columns_with_header(
+        source_blocks_file,
+        delimiter,
+        source_header_line,
+        selected_source_columns,
+        progress_label='Reading source block model',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 25, 'Reading source block model...'),
+    )
+    return source_df, source_x_col, source_y_col, source_z_col
+
+
+def _prepare_exact_source_block_transfer_lookup(source_df, selected_columns,
+                                                source_coordinate_columns,
+                                                source_block_size, target_block_size,
+                                                source_size_cols=None, target_size_cols=None):
+    source_key_data = _prepare_exact_block_transfer_keys(source_df, source_coordinate_columns, source_size_cols)
+    target_uses_explicit_sizes = bool(_normalize_optional_size_columns(target_size_cols))
+    if source_key_data['uses_explicit_sizes'] != target_uses_explicit_sizes:
+        return None
+    if not source_key_data['uses_explicit_sizes'] and not np.allclose(
+        np.asarray(source_block_size, dtype=float),
+        np.asarray(target_block_size, dtype=float),
+        rtol=1e-9,
+        atol=1e-9,
+    ):
+        return None
+
+    key_columns = list(source_key_data['key_columns'])
+    source_keys = source_key_data['key_frame']
+    source_duplicates = source_keys.duplicated(subset=key_columns, keep=False)
+    source_lookup = source_keys.loc[~source_duplicates, key_columns + ['__row_index__']].merge(
+        source_df[selected_columns],
+        left_on='__row_index__',
+        right_index=True,
+        how='left',
+        sort=False,
+    )
+    source_lookup.rename(columns={'__row_index__': '__source_row_index__'}, inplace=True)
+    return {
+        'key_columns': key_columns,
+        'source_lookup': source_lookup,
+        'row_indices': source_key_data['row_indices'],
+    }
+
+
+def _match_exact_block_transfer_chunk(target_chunk_df, exact_source_lookup,
+                                      target_coordinate_columns, target_size_cols=None):
+    if exact_source_lookup is None:
+        return None
+    target_key_data = _prepare_exact_block_transfer_keys(target_chunk_df, target_coordinate_columns, target_size_cols)
+    key_columns = list(exact_source_lookup['key_columns'])
+    target_keys = target_key_data['key_frame']
+    target_duplicates = target_keys.duplicated(subset=key_columns, keep=False)
+    matched_rows = target_keys.loc[~target_duplicates, key_columns + ['__row_index__']].merge(
+        exact_source_lookup['source_lookup'],
+        on=key_columns,
+        how='left',
+        sort=False,
+    )
+    matched_mask = matched_rows['__source_row_index__'].notna()
+    matched_rows = matched_rows.loc[matched_mask].copy()
+    matched_target_row_positions = matched_rows['__row_index__'].to_numpy(dtype=int, copy=False)
+    valid_target_row_positions = target_key_data['row_indices']
+    remaining_target_row_positions = valid_target_row_positions[
+        ~np.isin(valid_target_row_positions, matched_target_row_positions, assume_unique=False)
+    ]
+    return {
+        'matched_rows': matched_rows,
+        'matched_target_row_positions': matched_target_row_positions,
+        'remaining_target_row_positions': remaining_target_row_positions,
+        'valid_target_row_positions': valid_target_row_positions,
+    }
+
+
+def _iter_block_model_transfer_target_chunks(target_blocks_file, target_delimiter=None, target_header_line=1,
+                                             progress_callback=None, chunksize=BLOCK_MODEL_TRANSFER_TARGET_CHUNK_SIZE):
+    delimiter = target_delimiter or detect_csv_delimiter(target_blocks_file)
+    effective_header_line = resolve_effective_csv_header_line(target_blocks_file, target_header_line)
+    target_columns = build_unique_column_names(parse_header_line(target_blocks_file, delimiter, effective_header_line))
+    read_kwargs = dict(
+        delimiter=delimiter,
+        header=None,
+        names=target_columns,
+        skiprows=effective_header_line,
+        comment='#',
+        chunksize=chunksize,
+    )
+    return delimiter, target_columns, iterate_csv_path_chunks_with_progress(
+        target_blocks_file,
+        'Reading target block model',
+        progress_callback=progress_callback,
+        header_line=effective_header_line,
+        **read_kwargs,
+    )
+
+
+def _export_blocks_with_source_block_values_streaming_target(source_df, target_blocks_file, output_file,
+                                                             selected_columns,
+                                                             source_x_col=None, source_y_col=None, source_z_col=None,
+                                                             target_delimiter=None, target_header_line=1,
+                                                             target_x_col=None, target_y_col=None, target_z_col=None,
+                                                             source_block_size=None, target_block_size=None,
+                                                             source_size_cols=None, target_size_cols=None,
+                                                             nearest_fallback=True, nearest_distance_limit=None,
+                                                             progress_callback=None):
+    target_delimiter, target_columns, target_chunks = _iter_block_model_transfer_target_chunks(
+        target_blocks_file,
+        target_delimiter=target_delimiter,
+        target_header_line=target_header_line,
+        progress_callback=_make_scaled_progress_callback(progress_callback, 25, 98, 'Reading target block model...'),
+    )
+    target_x_col, target_y_col, target_z_col = resolve_block_coordinate_columns(
+        list(target_columns),
+        target_x_col,
+        target_y_col,
+        target_z_col,
+    )
+    exact_source_lookup = _prepare_exact_source_block_transfer_lookup(
+        source_df,
+        selected_columns,
+        (source_x_col, source_y_col, source_z_col),
+        source_block_size,
+        target_block_size,
+        source_size_cols=source_size_cols,
+        target_size_cols=target_size_cols,
+    )
+
+    if exact_source_lookup is not None:
+        source_values_df = source_df.iloc[exact_source_lookup['row_indices']]
+        column_modes = _detect_dataframe_transfer_column_modes(source_values_df, selected_columns)
+    else:
+        column_modes = None
+
+    source_geometry = None
+    values_by_column = None
+    tree = None
+    max_source_half_diagonal = None
+    wrote_header = False
+    total_target_blocks = 0
+    overlap_matches = 0
+    nearest_matches = 0
+    invalid_target_blocks = 0
+    target_geometry_mode = None
+
+    def ensure_source_matching_context(use_progress=False):
+        nonlocal source_geometry, values_by_column, tree, max_source_half_diagonal, column_modes
+        if source_geometry is not None:
+            return
+        if use_progress:
+            _emit_progress(progress_callback, 46, 100, 'Resolving source block geometry...')
+        source_geometry_kwargs = {}
+        if use_progress:
+            source_geometry_kwargs = {
+                'progress_callback': _make_scaled_progress_callback(progress_callback, 46, 56, 'Resolving source block geometry...'),
+                'progress_label': 'Resolving source block geometry',
+            }
+        source_geometry = _resolve_block_row_geometry(
+            source_df,
+            (source_x_col, source_y_col, source_z_col),
+            source_block_size,
+            source_size_cols,
+            **source_geometry_kwargs,
+        )
+        if not len(source_geometry['centers']):
+            raise ValueError('The source block model has no rows with valid coordinates and dimensions.')
+
+        from scipy.spatial import cKDTree
+
+        source_values_df_local = source_df.iloc[source_geometry['row_indices']]
+        if column_modes is None:
+            column_modes = _detect_dataframe_transfer_column_modes(source_values_df_local, selected_columns)
+        values_by_column = {
+            column: (
+                pd.to_numeric(source_values_df_local[column], errors='coerce').to_numpy(dtype=float)
+                if mode == 'numeric' else
+                source_values_df_local[column].fillna('').astype(str).str.strip().to_numpy(dtype=object)
+            )
+            for column, mode in column_modes.items()
+        }
+        tree = cKDTree(source_geometry['centers'])
+        max_source_half_diagonal = float(np.linalg.norm(source_geometry['sizes'], axis=1).max() / 2.0)
+
+    if exact_source_lookup is None:
+        ensure_source_matching_context(use_progress=True)
+
+    os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
+
+    for chunk_number, target_chunk in enumerate(target_chunks, start=1):
+        total_target_blocks += len(target_chunk)
+        exact_chunk = _match_exact_block_transfer_chunk(
+            target_chunk,
+            exact_source_lookup,
+            (target_x_col, target_y_col, target_z_col),
+            target_size_cols=target_size_cols,
+        ) if exact_source_lookup is not None else None
+
+        if exact_chunk is not None:
+            invalid_target_blocks += int(len(target_chunk) - len(exact_chunk['valid_target_row_positions']))
+            remaining_target_rows = exact_chunk['remaining_target_row_positions']
+        else:
+            remaining_target_rows = None
+
+        if column_modes is None:
+            ensure_source_matching_context(use_progress=(chunk_number == 1))
+
+        assigned = {
+            column: (
+                np.full(len(target_chunk), np.nan, dtype=float)
+                if mode == 'numeric' else
+                np.full(len(target_chunk), '', dtype=object)
+            )
+            for column, mode in column_modes.items()
+        }
+
+        if exact_chunk is not None and len(exact_chunk['matched_target_row_positions']):
+            overlap_matches += int(len(exact_chunk['matched_target_row_positions']))
+            for column, mode in column_modes.items():
+                values = exact_chunk['matched_rows'][column]
+                if mode == 'numeric':
+                    assigned[column][exact_chunk['matched_target_row_positions']] = pd.to_numeric(
+                        values,
+                        errors='coerce',
+                    ).to_numpy(dtype=float)
+                else:
+                    normalized = values.fillna('').astype(str).str.strip()
+                    normalized = normalized.mask(normalized.str.lower().eq('nan'), '')
+                    assigned[column][exact_chunk['matched_target_row_positions']] = normalized.to_numpy(dtype=object)
+
+        if remaining_target_rows is None or len(remaining_target_rows):
+            ensure_source_matching_context(use_progress=(chunk_number == 1 and exact_source_lookup is not None))
+            target_geometry_df = target_chunk if remaining_target_rows is None else target_chunk.iloc[remaining_target_rows]
+            target_geometry = _resolve_block_row_geometry(
+                target_geometry_df,
+                (target_x_col, target_y_col, target_z_col),
+                target_block_size,
+                target_size_cols,
+            )
+            if exact_chunk is None:
+                invalid_target_blocks += int(len(target_chunk) - len(target_geometry['row_indices']))
+                target_row_positions = target_geometry['row_indices']
+            else:
+                target_row_positions = np.asarray(remaining_target_rows, dtype=int)[target_geometry['row_indices']]
+
+            if len(target_geometry['centers']):
+                target_geometry_mode = (
+                    target_geometry['mode'] if exact_source_lookup is None else f'exact-prematch + {target_geometry["mode"]}'
+                )
+
+            for local_index, target_row in enumerate(target_row_positions):
+                target_center = target_geometry['centers'][local_index]
+                radius = float(np.linalg.norm(target_geometry['sizes'][local_index]) / 2.0 + max_source_half_diagonal)
+                candidates = np.asarray(tree.query_ball_point(target_center, radius), dtype=int)
+                overlaps = np.empty(0, dtype=int)
+                volumes = np.empty(0, dtype=float)
+                if len(candidates):
+                    overlap_lengths = np.maximum(
+                        0.0,
+                        np.minimum(source_geometry['upper_bounds'][candidates], target_geometry['upper_bounds'][local_index])
+                        - np.maximum(source_geometry['lower_bounds'][candidates], target_geometry['lower_bounds'][local_index]),
+                    )
+                    candidate_volumes = np.prod(overlap_lengths, axis=1)
+                    positive = candidate_volumes > max(float(np.prod(target_geometry['sizes'][local_index])) * 1e-12, 1e-12)
+                    overlaps, volumes = candidates[positive], candidate_volumes[positive]
+                if len(overlaps):
+                    overlap_matches += 1
+                    for column, mode in column_modes.items():
+                        values = values_by_column[column][overlaps]
+                        if mode == 'numeric':
+                            valid = np.isfinite(values)
+                            if valid.any():
+                                assigned[column][target_row] = float(np.average(values[valid], weights=volumes[valid]))
+                        else:
+                            totals = {}
+                            for value, volume in zip(values, volumes):
+                                value = str(value).strip()
+                                if value and value.lower() != 'nan':
+                                    totals[value] = totals.get(value, 0.0) + float(volume)
+                            if totals:
+                                assigned[column][target_row] = sorted(
+                                    totals.items(),
+                                    key=lambda item: (-item[1], item[0]),
+                                )[0][0]
+                elif nearest_fallback:
+                    nearest_distance, nearest = tree.query(target_center, k=1)
+                    if nearest_distance_limit is None or float(nearest_distance) <= nearest_distance_limit:
+                        nearest = int(nearest)
+                        nearest_matches += 1
+                        for column, mode in column_modes.items():
+                            value = values_by_column[column][nearest]
+                            if mode == 'numeric' and np.isfinite(value):
+                                assigned[column][target_row] = float(value)
+                            elif mode != 'numeric' and str(value).strip() and str(value).strip().lower() != 'nan':
+                                assigned[column][target_row] = str(value).strip()
+        elif target_geometry_mode is None:
+            target_geometry_mode = 'exact-grid'
+
+        for column, mode in column_modes.items():
+            if mode == 'numeric':
+                target_chunk[column] = pd.Series(assigned[column], index=target_chunk.index, dtype=float)
+            else:
+                target_chunk[column] = pd.Series(assigned[column], index=target_chunk.index, dtype=object)
+        target_chunk.to_csv(
+            output_file,
+            index=False,
+            sep=target_delimiter,
+            mode='w' if not wrote_header else 'a',
+            header=not wrote_header,
+        )
+        wrote_header = True
+
+    if not wrote_header:
+        empty_columns = list(dict.fromkeys(list(target_columns) + list(selected_columns)))
+        pd.DataFrame(columns=empty_columns).to_csv(output_file, index=False, sep=target_delimiter)
+
+    _emit_progress(progress_callback, 99, 100, 'Writing block-model transfer export...')
+    _emit_progress(progress_callback, 100, 100, 'Block-model transfer complete.')
+    if target_geometry_mode is None:
+        target_geometry_mode = 'exact-grid' if exact_source_lookup is not None else 'inferred-from-base-grid'
+    source_geometry_mode = 'exact-grid' if source_geometry is None else source_geometry['mode']
+    unmatched = total_target_blocks - overlap_matches - nearest_matches
+    return {
+        'output_file': output_file,
+        'total_target_blocks': int(total_target_blocks),
+        'overlap_matched_blocks': int(overlap_matches),
+        'nearest_matched_blocks': int(nearest_matches),
+        'unmatched_blocks': int(unmatched),
+        'invalid_target_blocks': int(invalid_target_blocks),
+        'transferred_columns': list(selected_columns),
+        'column_modes': column_modes or {},
+        'source_geometry_mode': source_geometry_mode,
+        'target_geometry_mode': target_geometry_mode,
+        'max_nearest_distance': nearest_distance_limit,
+    }
+
+
+def export_blocks_with_source_block_values(source_blocks_file, target_blocks_file, output_file=None,
+                                            source_delimiter=None, target_delimiter=None,
+                                            source_header_line=1, target_header_line=1,
+                                            source_x_col=None, source_y_col=None, source_z_col=None,
+                                            target_x_col=None, target_y_col=None, target_z_col=None,
+                                            source_value_cols=None,
+                                            source_block_size=None, target_block_size=None,
+                                            source_size_cols=None, target_size_cols=None,
+                                            nearest_fallback=True, max_nearest_distance=None,
+                                            progress_callback=None):
+    """Enrich existing target blocks from overlapping source blocks without creating rows."""
+    if not source_blocks_file or not os.path.isfile(source_blocks_file):
+        raise ValueError('Please select a valid source blocks file.')
+    if not target_blocks_file or not os.path.isfile(target_blocks_file):
+        raise ValueError('Please select a valid target blocks file.')
+    if source_block_size is None or target_block_size is None:
+        raise ValueError('Source and target base block sizes are required.')
+    nearest_distance_limit = None
+    if max_nearest_distance not in (None, ''):
+        nearest_distance_limit = float(max_nearest_distance)
+        if not np.isfinite(nearest_distance_limit) or nearest_distance_limit < 0:
+            raise ValueError('Maximum nearest fallback distance must be a finite value greater than or equal to zero.')
+        if nearest_distance_limit == 0:
+            nearest_distance_limit = None
+    selected_columns = _normalize_block_transfer_columns(
+        source_value_cols, block_x_col=source_x_col, block_y_col=source_y_col, block_z_col=source_z_col,
+    )
+    output_file = resolve_block_model_transfer_export_path(output_file, target_blocks_file)
+    source_df, source_x_col, source_y_col, source_z_col = _prepare_source_block_transfer_dataframe(
+        source_blocks_file,
+        selected_columns,
+        source_delimiter=source_delimiter,
+        source_header_line=source_header_line,
+        source_x_col=source_x_col,
+        source_y_col=source_y_col,
+        source_z_col=source_z_col,
+        source_size_cols=source_size_cols,
+        progress_callback=progress_callback,
+    )
+    missing = [column for column in selected_columns if column not in source_df.columns]
+    if missing:
+        raise ValueError(f"Source block column(s) not found: {', '.join(missing)}")
+    if not is_bmf_file(target_blocks_file):
+        return _export_blocks_with_source_block_values_streaming_target(
+            source_df,
+            target_blocks_file,
+            output_file,
+            selected_columns,
+            source_x_col=source_x_col,
+            source_y_col=source_y_col,
+            source_z_col=source_z_col,
+            target_delimiter=target_delimiter,
+            target_header_line=target_header_line,
+            target_x_col=target_x_col,
+            target_y_col=target_y_col,
+            target_z_col=target_z_col,
+            source_block_size=source_block_size,
+            target_block_size=target_block_size,
+            source_size_cols=source_size_cols,
+            target_size_cols=target_size_cols,
+            nearest_fallback=nearest_fallback,
+            nearest_distance_limit=nearest_distance_limit,
+            progress_callback=progress_callback,
+        )
+    target_df, output_delimiter = load_full_blocks_dataframe(
+        target_blocks_file, target_delimiter, target_header_line,
+        progress_label='Reading target block model',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 25, 45, 'Reading target block model...'),
+    )
+    target_x_col, target_y_col, target_z_col = resolve_block_coordinate_columns(
+        list(target_df.columns), target_x_col, target_y_col, target_z_col,
+    )
+    exact_transfer = _try_exact_block_model_transfer(
+        source_df,
+        target_df,
+        selected_columns,
+        (source_x_col, source_y_col, source_z_col),
+        (target_x_col, target_y_col, target_z_col),
+        source_block_size,
+        target_block_size,
+        source_size_cols=source_size_cols,
+        target_size_cols=target_size_cols,
+        progress_callback=progress_callback,
+    )
+    if exact_transfer is not None and exact_transfer['all_valid_targets_matched']:
+        output_df = target_df.copy()
+        for column, mode in exact_transfer['column_modes'].items():
+            matched_values = source_df.iloc[exact_transfer['matched_source_row_indices']][column]
+            if mode == 'numeric':
+                output_df[column] = pd.Series(np.nan, index=output_df.index, dtype=float)
+                output_df.loc[exact_transfer['matched_target_row_indices'], column] = pd.to_numeric(
+                    matched_values,
+                    errors='coerce',
+                ).to_numpy(dtype=float)
+            else:
+                output_df[column] = ''
+                values = matched_values.fillna('').astype(str).str.strip()
+                values = values.mask(values.str.lower().eq('nan'), '')
+                output_df.loc[exact_transfer['matched_target_row_indices'], column] = values.to_numpy(dtype=object)
+        os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
+        _emit_progress(progress_callback, 99, 100, 'Writing block-model transfer export...')
+        output_df.to_csv(output_file, index=False, sep=output_delimiter if output_delimiter != 'bmf' else ',')
+        _emit_progress(progress_callback, 100, 100, 'Block-model transfer complete.')
+        return {
+            'output_file': output_file,
+            'total_target_blocks': exact_transfer['total_target_blocks'],
+            'overlap_matched_blocks': exact_transfer['overlap_matched_blocks'],
+            'nearest_matched_blocks': exact_transfer['nearest_matched_blocks'],
+            'unmatched_blocks': exact_transfer['unmatched_blocks'],
+            'invalid_target_blocks': exact_transfer['invalid_target_blocks'],
+            'transferred_columns': list(selected_columns),
+            'column_modes': exact_transfer['column_modes'],
+            'source_geometry_mode': exact_transfer['source_geometry_mode'],
+            'target_geometry_mode': exact_transfer['target_geometry_mode'],
+            'max_nearest_distance': nearest_distance_limit,
+        }
+    if exact_transfer is not None:
+        column_modes = exact_transfer['column_modes']
+        assigned = {column: np.full(len(target_df), '', dtype=object) for column in selected_columns}
+        overlap_matches = int(exact_transfer['overlap_matched_blocks'])
+        exact_target_rows = exact_transfer['matched_target_row_indices']
+        exact_source_rows = exact_transfer['matched_source_row_indices']
+        for column, mode in column_modes.items():
+            matched_values = source_df.iloc[exact_source_rows][column]
+            if mode == 'numeric':
+                numeric_values = pd.to_numeric(matched_values, errors='coerce').to_numpy(dtype=float)
+                valid = np.isfinite(numeric_values)
+                assigned[column][exact_target_rows[valid]] = numeric_values[valid]
+            else:
+                values = matched_values.fillna('').astype(str).str.strip()
+                values = values.mask(values.str.lower().eq('nan'), '')
+                assigned[column][exact_target_rows] = values.to_numpy(dtype=object)
+        remaining_target_rows = exact_transfer['remaining_target_row_indices']
+    else:
+        column_modes = None
+        assigned = None
+        overlap_matches = 0
+        remaining_target_rows = None
+    _emit_progress(progress_callback, 46, 100, 'Resolving source block geometry...')
+    source_geometry = _resolve_block_row_geometry(
+        source_df,
+        (source_x_col, source_y_col, source_z_col),
+        source_block_size,
+        source_size_cols,
+        progress_callback=_make_scaled_progress_callback(progress_callback, 46, 56, 'Resolving source block geometry...'),
+        progress_label='Resolving source block geometry',
+    )
+    _emit_progress(progress_callback, 57, 100, 'Resolving target block geometry...')
+    target_geometry_df = target_df if remaining_target_rows is None else target_df.iloc[remaining_target_rows]
+    target_geometry = _resolve_block_row_geometry(
+        target_geometry_df,
+        (target_x_col, target_y_col, target_z_col),
+        target_block_size,
+        target_size_cols,
+        progress_callback=_make_scaled_progress_callback(progress_callback, 57, 70, 'Resolving target block geometry...'),
+        progress_label='Resolving target block geometry',
+    )
+    if not len(source_geometry['centers']):
+        raise ValueError('The source block model has no rows with valid coordinates and dimensions.')
+
+    from scipy.spatial import cKDTree
+    source_values_df = source_df.iloc[source_geometry['row_indices']]
+    if column_modes is None:
+        column_modes = _detect_dataframe_transfer_column_modes(source_values_df, selected_columns)
+    values_by_column = {
+        column: (pd.to_numeric(source_values_df[column], errors='coerce').to_numpy(dtype=float)
+                 if mode == 'numeric' else source_values_df[column].fillna('').astype(str).str.strip().to_numpy(dtype=object))
+        for column, mode in column_modes.items()
+    }
+    if assigned is None:
+        assigned = {column: np.full(len(target_df), '', dtype=object) for column in selected_columns}
+    tree = cKDTree(source_geometry['centers'])
+    max_source_half_diagonal = float(np.linalg.norm(source_geometry['sizes'], axis=1).max() / 2.0)
+    nearest_matches = 0
+    target_count = len(target_geometry['centers'])
+    target_row_indices = (
+        target_geometry['row_indices']
+        if remaining_target_rows is None else
+        np.asarray(remaining_target_rows, dtype=int)[target_geometry['row_indices']]
+    )
+    _emit_progress(progress_callback, 70, 100, 'Matching target blocks to source blocks...')
+
+    for local_index, target_row in enumerate(target_row_indices):
+        target_center = target_geometry['centers'][local_index]
+        radius = float(np.linalg.norm(target_geometry['sizes'][local_index]) / 2.0 + max_source_half_diagonal)
+        candidates = np.asarray(tree.query_ball_point(target_center, radius), dtype=int)
+        overlaps = np.empty(0, dtype=int)
+        volumes = np.empty(0, dtype=float)
+        if len(candidates):
+            overlap_lengths = np.maximum(
+                0.0,
+                np.minimum(source_geometry['upper_bounds'][candidates], target_geometry['upper_bounds'][local_index])
+                - np.maximum(source_geometry['lower_bounds'][candidates], target_geometry['lower_bounds'][local_index]),
+            )
+            candidate_volumes = np.prod(overlap_lengths, axis=1)
+            positive = candidate_volumes > max(float(np.prod(target_geometry['sizes'][local_index])) * 1e-12, 1e-12)
+            overlaps, volumes = candidates[positive], candidate_volumes[positive]
+        if len(overlaps):
+            overlap_matches += 1
+            for column, mode in column_modes.items():
+                values = values_by_column[column][overlaps]
+                if mode == 'numeric':
+                    valid = np.isfinite(values)
+                    if valid.any():
+                        assigned[column][target_row] = float(np.average(values[valid], weights=volumes[valid]))
+                else:
+                    totals = {}
+                    for value, volume in zip(values, volumes):
+                        value = str(value).strip()
+                        if value and value.lower() != 'nan':
+                            totals[value] = totals.get(value, 0.0) + float(volume)
+                    if totals:
+                        assigned[column][target_row] = sorted(totals.items(), key=lambda item: (-item[1], item[0]))[0][0]
+        elif nearest_fallback:
+            nearest_distance, nearest = tree.query(target_center, k=1)
+            if nearest_distance_limit is None or float(nearest_distance) <= nearest_distance_limit:
+                nearest = int(nearest)
+                nearest_matches += 1
+                for column, mode in column_modes.items():
+                    value = values_by_column[column][nearest]
+                    if mode == 'numeric' and np.isfinite(value):
+                        assigned[column][target_row] = float(value)
+                    elif mode != 'numeric' and str(value).strip() and str(value).strip().lower() != 'nan':
+                        assigned[column][target_row] = str(value).strip()
+        if progress_callback and (local_index + 1 == target_count or (local_index + 1) % 10_000 == 0):
+            _emit_progress(
+                progress_callback, 70 + int(round(((local_index + 1) / max(target_count, 1)) * 28)), 100,
+                'Matching target blocks to source blocks...',
+            )
+
+    output_df = target_df.copy()
+    for column in selected_columns:
+        output_df[column] = pd.Series(assigned[column], index=output_df.index)
+    os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
+    _emit_progress(progress_callback, 99, 100, 'Writing block-model transfer export...')
+    output_df.to_csv(output_file, index=False, sep=output_delimiter if output_delimiter != 'bmf' else ',')
+    _emit_progress(progress_callback, 100, 100, 'Block-model transfer complete.')
+    invalid_targets = (
+        len(target_df) - target_count
+        if exact_transfer is None else
+        int(exact_transfer['invalid_target_blocks'])
+    )
+    target_geometry_mode = (
+        target_geometry['mode']
+        if exact_transfer is None else
+        f"exact-prematch + {target_geometry['mode']}"
+    )
+    unmatched = len(target_df) - overlap_matches - nearest_matches
+    return {
+        'output_file': output_file, 'total_target_blocks': int(len(target_df)),
+        'overlap_matched_blocks': int(overlap_matches), 'nearest_matched_blocks': int(nearest_matches),
+        'unmatched_blocks': int(unmatched), 'invalid_target_blocks': int(invalid_targets),
+        'transferred_columns': list(selected_columns), 'column_modes': column_modes,
+        'source_geometry_mode': source_geometry['mode'], 'target_geometry_mode': target_geometry_mode,
+        'max_nearest_distance': nearest_distance_limit,
+    }
+
+
 def _collect_export_block_data(blocks):
     data = []
     min_bounds = blocks._block_info['min_bounds']
@@ -9577,6 +10438,12 @@ if __name__ == "__main__":
                     block_value_cols=self._get_selected_block_value_transfer_columns(),
                 )
 
+            def suggested_block_model_transfer_path():
+                return resolve_block_model_transfer_export_path(
+                    None,
+                    target_blocks_file=self.block_model_target_edit.text().strip(),
+                )
+
             def suggested_domain_interpolation_confidence_path():
                 return resolve_domain_interpolation_confidence_export_path(
                     None,
@@ -9634,6 +10501,41 @@ if __name__ == "__main__":
             self.block_value_transfer_select_all_btn = QtWidgets.QPushButton('Select All')
             self.block_value_transfer_clear_btn = QtWidgets.QPushButton('Clear')
             self.block_value_transfer_summary = QtWidgets.QLabel('No block columns selected for transfer.')
+            self.block_model_target_edit = QtWidgets.QLineEdit('')
+            self.block_model_target_browse = QtWidgets.QPushButton('Browse')
+            self.block_model_target_delim = QtWidgets.QComboBox()
+            self.block_model_target_delim.addItems(delim_opts)
+            self.block_model_target_header_line = QtWidgets.QSpinBox()
+            self.block_model_target_header_line.setRange(1, 1_000_000)
+            self.block_model_target_header_line.setValue(1)
+            self.block_model_target_x_col = QtWidgets.QComboBox()
+            self.block_model_target_y_col = QtWidgets.QComboBox()
+            self.block_model_target_z_col = QtWidgets.QComboBox()
+            self.block_model_source_size_cols = [QtWidgets.QComboBox() for _ in range(3)]
+            self.block_model_target_size_cols = [QtWidgets.QComboBox() for _ in range(3)]
+            self.block_model_target_size_spins = [TrimmedDisplayDoubleSpinBox() for _ in range(3)]
+            for spin, source_spin in zip(self.block_model_target_size_spins, [self.block_x, self.block_y, self.block_z]):
+                spin.setRange(0.001, 1_000_000_000.0)
+                spin.setDecimals(6)
+                spin.setValue(source_spin.value())
+            self.block_model_transfer_cols = QtWidgets.QListWidget()
+            self.block_model_transfer_cols.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+            self.block_model_transfer_cols.setMinimumHeight(120)
+            self.block_model_transfer_select_all_btn = QtWidgets.QPushButton('Select All')
+            self.block_model_transfer_clear_btn = QtWidgets.QPushButton('Clear')
+            self.block_model_transfer_summary = QtWidgets.QLabel('No source columns selected.')
+            self.block_model_transfer_summary.setWordWrap(True)
+            self.block_model_transfer_output_edit = QtWidgets.QLineEdit('')
+            self.block_model_transfer_output_browse = QtWidgets.QPushButton('Browse')
+            self.block_model_nearest_fallback = QtWidgets.QCheckBox('Use nearest source block when there is no overlap')
+            self.block_model_nearest_fallback.setChecked(True)
+            self.block_model_nearest_max_distance = TrimmedDisplayDoubleSpinBox()
+            self.block_model_nearest_max_distance.setRange(0.0, 1_000_000_000.0)
+            self.block_model_nearest_max_distance.setDecimals(3)
+            self.block_model_nearest_max_distance.setValue(0.0)
+            self.block_model_nearest_max_distance.setSpecialValueText('Unlimited')
+            self.block_model_nearest_max_distance.setSuffix(' m')
+            self.start_block_model_transfer_btn = QtWidgets.QPushButton('Transfer To Target Blocks')
             self.domain_interpolation_confidence_output_edit = QtWidgets.QLineEdit('')
             self.domain_interpolation_confidence_browse = QtWidgets.QPushButton('Browse')
             self.start_domain_interpolation_confidence_btn = QtWidgets.QPushButton('Export Confidence Metrics')
@@ -9705,6 +10607,7 @@ if __name__ == "__main__":
             self._sample_blocks_auto_path = ''
             self._domain_samples_auto_path = ''
             self._block_value_transfer_auto_path = ''
+            self._block_model_transfer_auto_path = ''
             self._block_domain_metrics_auto_path = ''
             self._domain_interpolation_confidence_auto_path = ''
             self._block_volume_weighted_auto_path = ''
@@ -9712,6 +10615,7 @@ if __name__ == "__main__":
             self._bmf_export_output_auto_path = ''
             self._equation_finder_auto_path = ''
             self._pending_block_value_transfer_cols = []
+            self._pending_block_model_transfer_cols = []
             self._pending_bmf_export_value_cols = None
             self._pending_bmf_export_column_types = None
             self._bmf_export_value_cols_initialized = False
@@ -9739,6 +10643,15 @@ if __name__ == "__main__":
                 self._block_value_transfer_auto_path = suggested
 
             self._refresh_block_value_transfer_output_path = refresh_block_value_transfer_output_path
+
+            def refresh_block_model_transfer_output_path(force=False):
+                suggested = suggested_block_model_transfer_path()
+                current = self.block_model_transfer_output_edit.text().strip()
+                if force or not current or current == self._block_model_transfer_auto_path:
+                    self.block_model_transfer_output_edit.setText(suggested)
+                self._block_model_transfer_auto_path = suggested
+
+            self._refresh_block_model_transfer_output_path = refresh_block_model_transfer_output_path
 
             def refresh_block_domain_metrics_output_path(force=False):
                 suggested = suggested_block_domain_metrics_path()
@@ -9822,6 +10735,27 @@ if __name__ == "__main__":
                 )
                 if path:
                     self.block_value_transfer_output_edit.setText(path)
+
+            def browse_block_model_target():
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self,
+                    'Target Block Model',
+                    self.block_model_target_edit.text().strip() or '.',
+                    'Block Models (*.csv *.bmf);;All Files (*.*)',
+                )
+                if path:
+                    self.block_model_target_edit.setText(path)
+
+            def browse_block_model_transfer_output():
+                initial_path = self.block_model_transfer_output_edit.text().strip() or suggested_block_model_transfer_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Block Model Transfer Output File',
+                    initial_path,
+                    'CSV Files (*.csv)',
+                )
+                if path:
+                    self.block_model_transfer_output_edit.setText(path)
 
             def browse_block_domain_metrics_output():
                 initial_path = self.block_domain_metrics_output_edit.text().strip() or suggested_block_domain_metrics_path()
@@ -9989,6 +10923,85 @@ if __name__ == "__main__":
             )
             block_value_transfer_form.addRow('', self.start_block_value_transfer_btn)
             operations_form.addRow(block_value_transfer_group)
+
+            block_model_transfer_group, block_model_transfer_form = create_collapsible_operation_section(
+                'Assign Block Columns To Block Model',
+                'Enrich the existing rows of a target block model from overlapping source blocks. Numeric fields are overlap-volume weighted; categorical fields use the category with the greatest overlap volume.',
+            )
+            self.block_model_target_edit.setToolTip('Target block model to enrich. The export preserves these rows and appends or replaces only the selected source columns.')
+            self.block_model_target_browse.setToolTip('Choose the target block model CSV or BMF file.')
+            self.block_model_target_delim.setToolTip('CSV delimiter for the target model. When a CSV is opened, the UI auto-detects the delimiter.')
+            self.block_model_target_header_line.setToolTip('Header line for the target CSV. When a CSV is opened, this control is synchronized to the effective detected header line.')
+            self.block_model_target_x_col.setToolTip('Target X coordinate column.')
+            self.block_model_target_y_col.setToolTip('Target Y coordinate column.')
+            self.block_model_target_z_col.setToolTip('Target Z coordinate column.')
+            for combo, tip in zip(
+                self.block_model_source_size_cols,
+                ['Optional source DX column. Prefer explicit size columns for source sub-block models.',
+                 'Optional source DY column. Prefer explicit size columns for source sub-block models.',
+                 'Optional source DZ column. Prefer explicit size columns for source sub-block models.'],
+            ):
+                combo.setToolTip(tip)
+            for combo, tip in zip(
+                self.block_model_target_size_cols,
+                ['Optional target DX column. Leave on Infer to use the target base size below.',
+                 'Optional target DY column. Leave on Infer to use the target base size below.',
+                 'Optional target DZ column. Leave on Infer to use the target base size below.'],
+            ):
+                combo.setToolTip(tip)
+            for spin, axis in zip(self.block_model_target_size_spins, ['X', 'Y', 'Z']):
+                spin.setToolTip(f'Fallback target base block size on {axis} used when no explicit target size column is selected.')
+            self.block_model_transfer_cols.setToolTip('Source columns to transfer onto the target block rows. Numeric columns use overlap-volume-weighted averages; text columns use the category with the greatest overlap volume.')
+            self.block_model_transfer_select_all_btn.setToolTip('Select every transferable source column.')
+            self.block_model_transfer_clear_btn.setToolTip('Clear the source-column selection.')
+            self.block_model_transfer_summary.setToolTip('Shows the current source-column selection and no-overlap fallback settings.')
+            self.block_model_nearest_fallback.setToolTip('If checked, targets with no overlapping source block can inherit values from the nearest source-block center, subject to the distance limit.')
+            self.block_model_nearest_max_distance.setToolTip('Maximum center-to-center distance allowed for the nearest fallback. Set to Unlimited to allow any distance.')
+            self.block_model_transfer_output_edit.setToolTip('CSV file to write. The output keeps the target geometry rows and adds the selected source columns.')
+            self.block_model_transfer_output_browse.setToolTip('Choose the CSV file to write for the enriched target model.')
+            target_file_layout = QtWidgets.QHBoxLayout()
+            target_file_layout.addWidget(self.block_model_target_edit)
+            target_file_layout.addWidget(self.block_model_target_browse)
+            block_model_transfer_form.addRow('Target Block Model', target_file_layout)
+            target_format_layout = QtWidgets.QHBoxLayout()
+            target_format_layout.addWidget(self.block_model_target_delim)
+            target_format_layout.addWidget(self.block_model_target_header_line)
+            block_model_transfer_form.addRow('Target Delimiter / Header', target_format_layout)
+            target_coords_layout = QtWidgets.QHBoxLayout()
+            for combo in [self.block_model_target_x_col, self.block_model_target_y_col, self.block_model_target_z_col]:
+                target_coords_layout.addWidget(combo)
+            block_model_transfer_form.addRow('Target X / Y / Z', target_coords_layout)
+            source_sizes_layout = QtWidgets.QHBoxLayout()
+            target_sizes_layout = QtWidgets.QHBoxLayout()
+            for combo in self.block_model_source_size_cols:
+                source_sizes_layout.addWidget(combo)
+            for combo in self.block_model_target_size_cols:
+                target_sizes_layout.addWidget(combo)
+            block_model_transfer_form.addRow('Source DX / DY / DZ', source_sizes_layout)
+            block_model_transfer_form.addRow('Target DX / DY / DZ', target_sizes_layout)
+            target_base_size_layout = QtWidgets.QHBoxLayout()
+            for spin in self.block_model_target_size_spins:
+                target_base_size_layout.addWidget(spin)
+            block_model_transfer_form.addRow('Target Base Size X / Y / Z', target_base_size_layout)
+            block_model_transfer_form.addRow('Source Columns', self.block_model_transfer_cols)
+            block_model_transfer_buttons = QtWidgets.QHBoxLayout()
+            block_model_transfer_buttons.addWidget(self.block_model_transfer_select_all_btn)
+            block_model_transfer_buttons.addWidget(self.block_model_transfer_clear_btn)
+            block_model_transfer_form.addRow('', block_model_transfer_buttons)
+            block_model_transfer_form.addRow('', self.block_model_transfer_summary)
+            no_overlap_layout = QtWidgets.QHBoxLayout()
+            no_overlap_layout.addWidget(self.block_model_nearest_fallback)
+            no_overlap_layout.addWidget(self.block_model_nearest_max_distance)
+            block_model_transfer_form.addRow('No-overlap Policy', no_overlap_layout)
+            block_model_transfer_output_layout = QtWidgets.QHBoxLayout()
+            block_model_transfer_output_layout.addWidget(self.block_model_transfer_output_edit)
+            block_model_transfer_output_layout.addWidget(self.block_model_transfer_output_browse)
+            block_model_transfer_form.addRow('Output File', block_model_transfer_output_layout)
+            self.start_block_model_transfer_btn.setToolTip(
+                'Preserve every target row and add the selected source columns using exact 3-D overlap. Explicit DX/DY/DZ columns are preferred for sub-block models; otherwise dimensions are inferred inside each configured base block.'
+            )
+            block_model_transfer_form.addRow('', self.start_block_model_transfer_btn)
+            operations_form.addRow(block_model_transfer_group)
 
             block_metrics_group, block_metrics_form = create_collapsible_operation_section(
                 'Block Domain Sample Metrics',
@@ -10207,6 +11220,24 @@ if __name__ == "__main__":
             self.block_value_transfer_clear_btn.clicked.connect(lambda: refresh_block_value_transfer_output_path())
             self.block_value_transfer_cols.itemSelectionChanged.connect(self._update_block_value_transfer_summary)
             self.block_value_transfer_cols.itemSelectionChanged.connect(lambda: refresh_block_value_transfer_output_path())
+            self.block_model_target_browse.clicked.connect(browse_block_model_target)
+            self.block_model_transfer_output_browse.clicked.connect(browse_block_model_transfer_output)
+            self.start_block_model_transfer_btn.clicked.connect(self.run_block_model_transfer_only)
+            self.block_model_transfer_select_all_btn.clicked.connect(self.block_model_transfer_cols.selectAll)
+            self.block_model_transfer_clear_btn.clicked.connect(self.block_model_transfer_cols.clearSelection)
+            self.block_model_transfer_cols.itemSelectionChanged.connect(self._update_block_model_transfer_summary)
+            self.block_model_nearest_fallback.toggled.connect(self._update_block_model_transfer_fallback_controls)
+            self.block_model_nearest_max_distance.valueChanged.connect(lambda _: self._update_block_model_transfer_summary())
+            self.block_model_target_edit.textChanged.connect(lambda _: self._refresh_block_model_target_columns())
+            self.block_model_target_edit.textChanged.connect(lambda _: refresh_block_model_transfer_output_path())
+            self.block_model_target_delim.currentIndexChanged.connect(self._refresh_block_model_target_columns)
+            self.block_model_target_header_line.valueChanged.connect(lambda _: self._refresh_block_model_target_columns())
+            self.blocks_edit.textChanged.connect(lambda _: self._refresh_block_model_transfer_source_columns())
+            self.blocks_delim.currentIndexChanged.connect(self._refresh_block_model_transfer_source_columns)
+            self.blocks_header_line.valueChanged.connect(lambda _: self._refresh_block_model_transfer_source_columns())
+            self.block_x_col.currentTextChanged.connect(lambda _: self._refresh_block_model_transfer_source_columns())
+            self.block_y_col.currentTextChanged.connect(lambda _: self._refresh_block_model_transfer_source_columns())
+            self.block_z_col.currentTextChanged.connect(lambda _: self._refresh_block_model_transfer_source_columns())
             self.block_domain_metrics_browse.clicked.connect(browse_block_domain_metrics_output)
             self.configure_block_domain_metrics_filters_btn.clicked.connect(self.configure_block_domain_metrics_filters)
             self.start_block_domain_metrics_btn.clicked.connect(self.run_block_domain_sample_metrics_only)
@@ -10282,6 +11313,10 @@ if __name__ == "__main__":
             refresh_domain_samples_output_path(force=True)
             self._refresh_block_value_transfer_columns()
             refresh_block_value_transfer_output_path(force=True)
+            self._refresh_block_model_transfer_source_columns()
+            self._refresh_block_model_target_columns()
+            refresh_block_model_transfer_output_path(force=True)
+            self._update_block_model_transfer_fallback_controls()
             self._update_block_domain_metrics_metric_summary()
             refresh_block_domain_metrics_output_path(force=True)
             refresh_domain_interpolation_confidence_output_path(force=True)
@@ -10767,6 +11802,19 @@ if __name__ == "__main__":
                 'domain_samples_file': self.domain_samples_output_edit.text(),
                 'block_value_transfer_file': self.block_value_transfer_output_edit.text(),
                 'block_value_transfer_cols': self._get_selected_block_value_transfer_columns(),
+                'block_model_target_file': self.block_model_target_edit.text(),
+                'block_model_target_delimiter': self.block_model_target_delim.currentText(),
+                'block_model_target_header_line': self.block_model_target_header_line.value(),
+                'block_model_target_x_col': self.block_model_target_x_col.currentText(),
+                'block_model_target_y_col': self.block_model_target_y_col.currentText(),
+                'block_model_target_z_col': self.block_model_target_z_col.currentText(),
+                'block_model_source_size_cols': [combo.currentText() for combo in self.block_model_source_size_cols],
+                'block_model_target_size_cols': [combo.currentText() for combo in self.block_model_target_size_cols],
+                'block_model_target_size': tuple(spin.value() for spin in self.block_model_target_size_spins),
+                'block_model_transfer_cols': self._get_selected_block_model_transfer_columns(),
+                'block_model_transfer_nearest_fallback': self.block_model_nearest_fallback.isChecked(),
+                'block_model_transfer_max_nearest_distance': self.block_model_nearest_max_distance.value(),
+                'block_model_transfer_file': self.block_model_transfer_output_edit.text(),
                 'block_domain_metrics_file': self.block_domain_metrics_output_edit.text(),
                 'block_domain_metrics_selected_metrics': self._get_selected_block_domain_metrics(),
                 'block_domain_metrics_avg_distance_knn_k': self.block_domain_metrics_knn_k.value(),
@@ -10925,6 +11973,10 @@ if __name__ == "__main__":
                 if 'block_domain_col' in config: self.block_domain_col.setCurrentText(config['block_domain_col'])
                 if 'domain_samples_file' in config: self.domain_samples_output_edit.setText(config['domain_samples_file'])
                 if 'block_value_transfer_file' in config: self.block_value_transfer_output_edit.setText(config['block_value_transfer_file'])
+                if 'block_model_target_file' in config: self.block_model_target_edit.setText(config['block_model_target_file'])
+                if 'block_model_target_delimiter' in config: self.block_model_target_delim.setCurrentText(config['block_model_target_delimiter'])
+                if 'block_model_target_header_line' in config: self.block_model_target_header_line.setValue(int(config['block_model_target_header_line']))
+                if 'block_model_transfer_file' in config: self.block_model_transfer_output_edit.setText(config['block_model_transfer_file'])
                 if 'block_domain_metrics_file' in config: self.block_domain_metrics_output_edit.setText(config['block_domain_metrics_file'])
                 if 'domain_interpolation_confidence_file' in config: self.domain_interpolation_confidence_output_edit.setText(config['domain_interpolation_confidence_file'])
                 if 'block_volume_weighted_file' in config: self.block_volume_weighted_output_edit.setText(config['block_volume_weighted_file'])
@@ -10987,6 +12039,26 @@ if __name__ == "__main__":
                 self._pending_block_value_transfer_cols = list(config.get('block_value_transfer_cols', []))
                 if hasattr(self, '_refresh_block_value_transfer_columns'):
                     self._refresh_block_value_transfer_columns()
+                self._pending_block_model_transfer_cols = list(config.get('block_model_transfer_cols', []))
+                if hasattr(self, '_refresh_block_model_transfer_source_columns'):
+                    self._refresh_block_model_transfer_source_columns()
+                if hasattr(self, '_refresh_block_model_target_columns'):
+                    self._refresh_block_model_target_columns()
+                for combo, column_name in zip(
+                    [self.block_model_target_x_col, self.block_model_target_y_col, self.block_model_target_z_col],
+                    [config.get('block_model_target_x_col'), config.get('block_model_target_y_col'), config.get('block_model_target_z_col')],
+                ):
+                    if column_name: combo.setCurrentText(str(column_name))
+                for combo, column_name in zip(self.block_model_source_size_cols, config.get('block_model_source_size_cols', [])):
+                    combo.setCurrentText(str(column_name))
+                for combo, column_name in zip(self.block_model_target_size_cols, config.get('block_model_target_size_cols', [])):
+                    combo.setCurrentText(str(column_name))
+                for spin, value in zip(self.block_model_target_size_spins, config.get('block_model_target_size', [])):
+                    spin.setValue(float(value))
+                if 'block_model_transfer_nearest_fallback' in config:
+                    self.block_model_nearest_fallback.setChecked(bool(config['block_model_transfer_nearest_fallback']))
+                if 'block_model_transfer_max_nearest_distance' in config:
+                    self.block_model_nearest_max_distance.setValue(float(config['block_model_transfer_max_nearest_distance']))
                 if 'sample_blocks_id_cols' in config:
                     for cb, column_name in zip(self.sample_blocks_id_cols, config['sample_blocks_id_cols']):
                         cb.setCurrentText(column_name)
@@ -11265,10 +12337,7 @@ if __name__ == "__main__":
         def _set_selected_block_value_transfer_columns(self, column_names):
             if not hasattr(self, 'block_value_transfer_cols'):
                 return
-            desired = {str(name or '').strip() for name in (column_names or []) if str(name or '').strip()}
-            for index in range(self.block_value_transfer_cols.count()):
-                item = self.block_value_transfer_cols.item(index)
-                item.setSelected(item.text() in desired)
+            _restore_list_widget_selection(self.block_value_transfer_cols, column_names)
             self._update_block_value_transfer_summary()
 
         def _update_block_value_transfer_summary(self):
@@ -11328,6 +12397,130 @@ if __name__ == "__main__":
             refresher = getattr(self, '_refresh_block_value_transfer_output_path', None)
             if callable(refresher):
                 refresher()
+
+        def _get_selected_block_model_transfer_columns(self):
+            if not hasattr(self, 'block_model_transfer_cols'):
+                return []
+            return [item.text() for item in self.block_model_transfer_cols.selectedItems()]
+
+        def _set_selected_block_model_transfer_columns(self, column_names):
+            if not hasattr(self, 'block_model_transfer_cols'):
+                return
+            _restore_list_widget_selection(self.block_model_transfer_cols, column_names)
+            self._update_block_model_transfer_summary()
+
+        def _update_block_model_transfer_summary(self):
+            if not hasattr(self, 'block_model_transfer_summary'):
+                return
+            total = self.block_model_transfer_cols.count()
+            selected = len(self._get_selected_block_model_transfer_columns())
+            if not total:
+                self.block_model_transfer_summary.setText('No transferable source columns are available.')
+                return
+            fallback_state = 'disabled'
+            if self.block_model_nearest_fallback.isChecked():
+                distance_limit = float(self.block_model_nearest_max_distance.value())
+                fallback_state = (
+                    'enabled with unlimited distance'
+                    if distance_limit <= 0 else
+                    f'enabled up to {distance_limit:g} m'
+                )
+            self.block_model_transfer_summary.setText(
+                f'{selected} of {total} source columns selected. No-overlap fallback is {fallback_state}.'
+            )
+
+        def _update_block_model_transfer_fallback_controls(self):
+            enabled = bool(self.block_model_nearest_fallback.isChecked())
+            self.block_model_nearest_max_distance.setEnabled(enabled)
+            self._update_block_model_transfer_summary()
+
+        def _populate_block_model_column_combo(self, combo, columns, first_label=None, suggestions=()):
+            previous = combo.currentText()
+            blocker = QtCore.QSignalBlocker(combo)
+            try:
+                combo.clear()
+                if first_label:
+                    combo.addItem(first_label)
+                combo.addItems([str(column) for column in columns])
+                if previous and combo.findText(previous) >= 0:
+                    combo.setCurrentText(previous)
+                else:
+                    lowered = {str(value).lower() for value in suggestions}
+                    for index in range(combo.count()):
+                        if combo.itemText(index).lower() in lowered:
+                            combo.setCurrentIndex(index)
+                            break
+            finally:
+                del blocker
+
+        def _refresh_block_model_transfer_source_columns(self):
+            if not hasattr(self, 'block_model_transfer_cols'):
+                return
+            path = self.blocks_edit.text().strip()
+            columns = []
+            if os.path.isfile(path):
+                try:
+                    columns = parse_effective_header_line(path, self.blocks_delim.currentText(), self.blocks_header_line.value())
+                except Exception:
+                    columns = []
+            for combo, suggestions in zip(
+                self.block_model_source_size_cols,
+                [('dx', 'dim_x', 'size_x', 'x_size'), ('dy', 'dim_y', 'size_y', 'y_size'), ('dz', 'dim_z', 'size_z', 'z_size')],
+            ):
+                self._populate_block_model_column_combo(combo, columns, '(Infer)', suggestions)
+
+            selected = set(self._get_selected_block_model_transfer_columns())
+            selected.update(getattr(self, '_pending_block_model_transfer_cols', []) or [])
+            excluded = {
+                self.block_x_col.currentText(), self.block_y_col.currentText(), self.block_z_col.currentText(),
+            }
+            self.block_model_transfer_cols.clear()
+            for column in columns:
+                if column in excluded:
+                    continue
+                item = QtWidgets.QListWidgetItem(column)
+                self.block_model_transfer_cols.addItem(item)
+            self._set_selected_block_model_transfer_columns(selected)
+            self._pending_block_model_transfer_cols = []
+            self._update_block_model_transfer_summary()
+
+        def _refresh_block_model_target_columns(self):
+            if not hasattr(self, 'block_model_target_edit'):
+                return
+            path = self.block_model_target_edit.text().strip()
+            columns = []
+            if os.path.isfile(path):
+                try:
+                    if not is_bmf_file(path):
+                        detected = detect_csv_delimiter(path)
+                        if self.block_model_target_delim.findText(detected) >= 0:
+                            self.block_model_target_delim.setCurrentText(detected)
+                        sync_csv_header_line_widget(
+                            self.block_model_target_header_line,
+                            path,
+                            self.block_model_target_header_line.value(),
+                        )
+                        columns = parse_effective_header_line(
+                            path, self.block_model_target_delim.currentText(), self.block_model_target_header_line.value(),
+                        )
+                    else:
+                        blocker = QtCore.QSignalBlocker(self.block_model_target_header_line)
+                        self.block_model_target_header_line.setValue(1)
+                        del blocker
+                        preview, _ = _load_bmf_dataframe(path, row_limit=1)
+                        columns = list(preview.columns)
+                except Exception:
+                    columns = []
+            for combo, suggestions in zip(
+                [self.block_model_target_x_col, self.block_model_target_y_col, self.block_model_target_z_col],
+                [('x', 'easting'), ('y', 'northing'), ('z', 'elevation', 'rl')],
+            ):
+                self._populate_block_model_column_combo(combo, columns, None, suggestions)
+            for combo, suggestions in zip(
+                self.block_model_target_size_cols,
+                [('dx', 'dim_x', 'size_x', 'x_size'), ('dy', 'dim_y', 'size_y', 'y_size'), ('dz', 'dim_z', 'size_z', 'z_size')],
+            ):
+                self._populate_block_model_column_combo(combo, columns, '(Infer)', suggestions)
 
         def _get_selected_block_domain_metrics(self):
             if not hasattr(self, 'block_domain_metrics_metric_list'):
@@ -11527,6 +12720,303 @@ if __name__ == "__main__":
             rules = {}
             for row_index in range(self.bmf_export_exception_table.rowCount()):
                 column_item = self.bmf_export_exception_table.item(row_index, 0)
+                value_item = self.bmf_export_exception_table.item(row_index, 1)
+                replacement_item = self.bmf_export_exception_table.item(row_index, 2)
+                include_item = self.bmf_export_exception_table.item(row_index, 3)
+                column_name = str(column_item.text() if column_item is not None else '').strip()
+                bad_value = str(value_item.text() if value_item is not None else '')
+                replacement = str(replacement_item.text() if replacement_item is not None else '')
+                include_in_regularization = bool(
+                    include_item is not None and include_item.checkState() == QtCore.Qt.Checked
+                )
+                if column_name and bad_value:
+                    if include_in_regularization:
+                        rules.setdefault(column_name, {})[bad_value] = {
+                            'replacement': replacement,
+                            'include_in_regularization': True,
+                        }
+                    else:
+                        rules.setdefault(column_name, {})[bad_value] = replacement
+            return rules
+
+            def _normalize_optional_size_columns(size_columns):
+                values = list(size_columns or ())
+                if len(values) != 3:
+                    return None
+                normalized = [str(value or '').strip() for value in values]
+                if any(not value or value in {'(None)', '(Infer)'} for value in normalized):
+                    return None
+                return tuple(normalized)
+
+            def _infer_block_row_bounds(coords, base_block_size):
+                coords = np.asarray(coords, dtype=float)
+                base_dims = np.asarray(base_block_size, dtype=float)
+                if coords.ndim != 2 or coords.shape[1] != 3:
+                    raise ValueError('Block coordinates must be an Nx3 array.')
+                if base_dims.shape != (3,) or np.any(~np.isfinite(base_dims)) or np.any(base_dims <= 0):
+                    raise ValueError('Base block size must contain three positive values.')
+                if len(coords) == 0:
+                    return np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=float)
+
+                grid_origin = np.floor(coords.min(axis=0) / base_dims) * base_dims
+                parent_indices = np.floor((coords - grid_origin) / base_dims + 1e-6).astype(np.int64)
+                parent_origins = grid_origin + parent_indices * base_dims
+                local_coords = np.clip(coords - parent_origins, 0.0, base_dims)
+                lower_bounds = np.empty_like(coords, dtype=float)
+                upper_bounds = np.empty_like(coords, dtype=float)
+
+                _, inverse = np.unique(parent_indices, axis=0, return_inverse=True)
+                order = np.argsort(inverse, kind='stable')
+                sorted_inverse = inverse[order]
+                starts = np.flatnonzero(np.r_[True, sorted_inverse[1:] != sorted_inverse[:-1]])
+                ends = np.r_[starts[1:], len(order)]
+                for start, end in zip(starts, ends):
+                    row_indices = order[start:end]
+                    group_local = local_coords[row_indices]
+                    group_origin = parent_origins[row_indices[0]]
+                    for axis in range(3):
+                        tolerance = max(base_dims[axis] * 1e-7, 1e-9)
+                        centers = _cluster_axis_centers(group_local[:, axis], tolerance)
+                        boundaries = np.empty(len(centers) + 1, dtype=float)
+                        boundaries[0] = 0.0
+                        boundaries[-1] = base_dims[axis]
+                        if len(centers) > 1:
+                            boundaries[1:-1] = (centers[:-1] + centers[1:]) / 2.0
+                        center_indices = np.abs(group_local[:, axis, None] - centers[None, :]).argmin(axis=1)
+                        lower_bounds[row_indices, axis] = group_origin[axis] + boundaries[center_indices]
+                        upper_bounds[row_indices, axis] = group_origin[axis] + boundaries[center_indices + 1]
+
+                return lower_bounds, upper_bounds, upper_bounds - lower_bounds
+
+            def _resolve_block_row_geometry(df, coordinate_columns, base_block_size, size_columns=None):
+                coordinate_columns = tuple(coordinate_columns or ())
+                if len(coordinate_columns) != 3 or any(column not in df.columns for column in coordinate_columns):
+                    raise ValueError('Three valid block coordinate columns are required.')
+                coord_frame = df[list(coordinate_columns)].apply(pd.to_numeric, errors='coerce')
+                valid_mask = coord_frame.notna().all(axis=1).to_numpy()
+                coords = coord_frame.loc[valid_mask].to_numpy(dtype=float, copy=False)
+
+                explicit_size_columns = _normalize_optional_size_columns(size_columns)
+                if explicit_size_columns is not None:
+                    missing = [column for column in explicit_size_columns if column not in df.columns]
+                    if missing:
+                        raise ValueError(f"Block size column(s) not found: {', '.join(missing)}")
+                    size_frame = df.loc[valid_mask, list(explicit_size_columns)].apply(pd.to_numeric, errors='coerce')
+                    sizes = size_frame.to_numpy(dtype=float, copy=False)
+                    valid_sizes = np.isfinite(sizes).all(axis=1) & (sizes > 0).all(axis=1)
+                    valid_positions = np.flatnonzero(valid_mask)
+                    valid_mask[valid_positions[~valid_sizes]] = False
+                    coords = coords[valid_sizes]
+                    sizes = sizes[valid_sizes]
+                    lower_bounds = coords - sizes / 2.0
+                    upper_bounds = coords + sizes / 2.0
+                    geometry_mode = 'explicit-size-columns'
+                else:
+                    lower_bounds, upper_bounds, sizes = _infer_block_row_bounds(coords, base_block_size)
+                    geometry_mode = 'inferred-from-base-grid'
+
+                return {
+                    'valid_mask': valid_mask,
+                    'row_indices': np.flatnonzero(valid_mask),
+                    'centers': coords,
+                    'lower_bounds': lower_bounds,
+                    'upper_bounds': upper_bounds,
+                    'sizes': sizes,
+                    'mode': geometry_mode,
+                }
+
+            def _detect_dataframe_transfer_column_modes(df, columns):
+                modes = {}
+                for column_name in columns:
+                    values = df[column_name]
+                    nonblank_mask = values.notna() & values.astype(str).str.strip().ne('') & values.astype(str).str.lower().ne('nan')
+                    nonblank = values.loc[nonblank_mask]
+                    modes[column_name] = (
+                        'numeric'
+                        if len(nonblank) > 0 and pd.to_numeric(nonblank, errors='coerce').notna().all()
+                        else 'categorical'
+                    )
+                return modes
+
+            def export_blocks_with_source_block_values(source_blocks_file, target_blocks_file, output_file=None,
+                                                        source_delimiter=None, target_delimiter=None,
+                                                        source_header_line=1, target_header_line=1,
+                                                        source_x_col=None, source_y_col=None, source_z_col=None,
+                                                        target_x_col=None, target_y_col=None, target_z_col=None,
+                                                        source_value_cols=None,
+                                                        source_block_size=None, target_block_size=None,
+                                                        source_size_cols=None, target_size_cols=None,
+                                                        nearest_fallback=True, progress_callback=None):
+                """Transfer source block attributes to existing target rows using 3-D overlap volume.
+
+                Numeric fields use an overlap-volume-weighted mean. Categorical fields use the
+                category with the greatest total overlap volume. Targets without overlap can use
+                the nearest source block center as a deterministic fallback.
+                """
+                if not source_blocks_file or not os.path.isfile(source_blocks_file):
+                    raise ValueError('Please select a valid source blocks file.')
+                if not target_blocks_file or not os.path.isfile(target_blocks_file):
+                    raise ValueError('Please select a valid target blocks file.')
+                if source_block_size is None or target_block_size is None:
+                    raise ValueError('Source and target base block sizes are required.')
+
+                selected_columns = _normalize_block_transfer_columns(
+                    source_value_cols,
+                    block_x_col=source_x_col,
+                    block_y_col=source_y_col,
+                    block_z_col=source_z_col,
+                )
+                output_file = resolve_block_model_transfer_export_path(output_file, target_blocks_file)
+                _emit_progress(progress_callback, 0, 100, 'Reading source block model...')
+                source_df, _ = load_full_blocks_dataframe(
+                    source_blocks_file,
+                    blocks_delimiter=source_delimiter,
+                    blocks_header_line=source_header_line,
+                    progress_label='Reading source block model',
+                    progress_callback=_make_scaled_progress_callback(progress_callback, 0, 25, 'Reading source block model...'),
+                )
+                source_x_col, source_y_col, source_z_col = resolve_block_coordinate_columns(
+                    list(source_df.columns), source_x_col, source_y_col, source_z_col,
+                )
+                missing_columns = [column for column in selected_columns if column not in source_df.columns]
+                if missing_columns:
+                    raise ValueError(f"Source block column(s) not found: {', '.join(missing_columns)}")
+
+                _emit_progress(progress_callback, 25, 100, 'Reading target block model...')
+                target_df, target_output_delimiter = load_full_blocks_dataframe(
+                    target_blocks_file,
+                    blocks_delimiter=target_delimiter,
+                    blocks_header_line=target_header_line,
+                    progress_label='Reading target block model',
+                    progress_callback=_make_scaled_progress_callback(progress_callback, 25, 45, 'Reading target block model...'),
+                )
+                target_x_col, target_y_col, target_z_col = resolve_block_coordinate_columns(
+                    list(target_df.columns), target_x_col, target_y_col, target_z_col,
+                )
+
+                _emit_progress(progress_callback, 45, 100, 'Resolving source and target block geometry...')
+                source_geometry = _resolve_block_row_geometry(
+                    source_df,
+                    (source_x_col, source_y_col, source_z_col),
+                    source_block_size,
+                    source_size_cols,
+                )
+                target_geometry = _resolve_block_row_geometry(
+                    target_df,
+                    (target_x_col, target_y_col, target_z_col),
+                    target_block_size,
+                    target_size_cols,
+                )
+                if len(source_geometry['centers']) == 0:
+                    raise ValueError('The source block model has no rows with valid coordinates and dimensions.')
+
+                from scipy.spatial import cKDTree
+
+                source_valid_df = source_df.iloc[source_geometry['row_indices']]
+                column_modes = _detect_dataframe_transfer_column_modes(source_valid_df, selected_columns)
+                source_column_values = {
+                    column: (
+                        pd.to_numeric(source_valid_df[column], errors='coerce').to_numpy(dtype=float, copy=False)
+                        if mode == 'numeric'
+                        else source_valid_df[column].fillna('').astype(str).str.strip().to_numpy(dtype=object, copy=False)
+                    )
+                    for column, mode in column_modes.items()
+                }
+                assigned_values = {column: [''] * len(target_df) for column in selected_columns}
+                tree = cKDTree(source_geometry['centers'])
+                source_half_diagonal_max = float(np.linalg.norm(source_geometry['sizes'], axis=1).max() / 2.0)
+                overlap_matches = 0
+                nearest_matches = 0
+                total_valid_targets = len(target_geometry['centers'])
+                _emit_progress(progress_callback, 50, 100, 'Matching target blocks to source blocks...')
+
+                for local_index, target_row_index in enumerate(target_geometry['row_indices']):
+                    target_center = target_geometry['centers'][local_index]
+                    target_lower = target_geometry['lower_bounds'][local_index]
+                    target_upper = target_geometry['upper_bounds'][local_index]
+                    query_radius = float(np.linalg.norm(target_geometry['sizes'][local_index]) / 2.0 + source_half_diagonal_max)
+                    candidate_indices = tree.query_ball_point(target_center, query_radius)
+                    overlap_indices = np.empty(0, dtype=int)
+                    overlap_volumes = np.empty(0, dtype=float)
+                    if candidate_indices:
+                        candidate_indices = np.asarray(candidate_indices, dtype=int)
+                        overlap_lengths = np.maximum(
+                            0.0,
+                            np.minimum(source_geometry['upper_bounds'][candidate_indices], target_upper)
+                            - np.maximum(source_geometry['lower_bounds'][candidate_indices], target_lower),
+                        )
+                        volumes = np.prod(overlap_lengths, axis=1)
+                        positive_mask = volumes > max(float(np.prod(target_geometry['sizes'][local_index])) * 1e-12, 1e-12)
+                        overlap_indices = candidate_indices[positive_mask]
+                        overlap_volumes = volumes[positive_mask]
+
+                    if len(overlap_indices) > 0:
+                        overlap_matches += 1
+                        for column_name, mode in column_modes.items():
+                            values = source_column_values[column_name][overlap_indices]
+                            if mode == 'numeric':
+                                valid_values = np.isfinite(values)
+                                if valid_values.any():
+                                    assigned_values[column_name][target_row_index] = float(
+                                        np.average(values[valid_values], weights=overlap_volumes[valid_values])
+                                    )
+                            else:
+                                category_volumes = {}
+                                for value, volume in zip(values, overlap_volumes):
+                                    normalized = str(value).strip()
+                                    if not normalized or normalized.lower() == 'nan':
+                                        continue
+                                    category_volumes[normalized] = category_volumes.get(normalized, 0.0) + float(volume)
+                                if category_volumes:
+                                    assigned_values[column_name][target_row_index] = sorted(
+                                        category_volumes.items(), key=lambda item: (-item[1], item[0])
+                                    )[0][0]
+                    elif nearest_fallback:
+                        _, nearest_index = tree.query(target_center, k=1)
+                        nearest_index = int(nearest_index)
+                        nearest_matches += 1
+                        for column_name, mode in column_modes.items():
+                            value = source_column_values[column_name][nearest_index]
+                            if mode == 'numeric':
+                                if np.isfinite(value):
+                                    assigned_values[column_name][target_row_index] = float(value)
+                            else:
+                                normalized = str(value).strip()
+                                if normalized and normalized.lower() != 'nan':
+                                    assigned_values[column_name][target_row_index] = normalized
+
+                    if progress_callback and (local_index + 1 == total_valid_targets or (local_index + 1) % 10_000 == 0):
+                        percent = 50 + int(round(((local_index + 1) / max(total_valid_targets, 1)) * 47))
+                        _emit_progress(progress_callback, percent, 100, 'Matching target blocks to source blocks...')
+
+                output_df = target_df.copy()
+                for column_name in selected_columns:
+                    output_df[column_name] = pd.Series(assigned_values[column_name], index=output_df.index)
+                output_dir = os.path.dirname(output_file) or '.'
+                os.makedirs(output_dir, exist_ok=True)
+                output_separator = target_output_delimiter if target_output_delimiter and target_output_delimiter != 'bmf' else ','
+                _emit_progress(progress_callback, 98, 100, 'Writing block-model transfer export...')
+                output_df.to_csv(output_file, index=False, sep=output_separator)
+                _emit_progress(progress_callback, 100, 100, 'Block-model transfer complete.')
+
+                invalid_target_count = int(len(target_df) - total_valid_targets)
+                unmatched_count = int(total_valid_targets - overlap_matches - nearest_matches + invalid_target_count)
+                print(
+                    f"Block-model transfer complete: targets={len(target_df):,}; overlap matches={overlap_matches:,}; "
+                    f"nearest fallback matches={nearest_matches:,}; unmatched={unmatched_count:,}."
+                )
+                return {
+                    'output_file': output_file,
+                    'total_target_blocks': int(len(target_df)),
+                    'overlap_matched_blocks': int(overlap_matches),
+                    'nearest_matched_blocks': int(nearest_matches),
+                    'unmatched_blocks': unmatched_count,
+                    'invalid_target_blocks': invalid_target_count,
+                    'transferred_columns': list(selected_columns),
+                    'column_modes': dict(column_modes),
+                    'source_geometry_mode': source_geometry['mode'],
+                    'target_geometry_mode': target_geometry['mode'],
+                }
                 value_item = self.bmf_export_exception_table.item(row_index, 1)
                 replacement_item = self.bmf_export_exception_table.item(row_index, 2)
                 include_item = self.bmf_export_exception_table.item(row_index, 3)
@@ -12330,6 +13820,66 @@ if __name__ == "__main__":
                 print(f"Error during block value transfer: {e}")
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block value transfer:\n{str(e)}')
+
+        def run_block_model_transfer_only(self):
+            """Transfer selected source block fields onto the existing target block rows."""
+            try:
+                cfg = self.to_dict()
+                selected_columns = cfg.get('block_model_transfer_cols') or []
+                output_file = resolve_block_model_transfer_export_path(
+                    cfg.get('block_model_transfer_file'),
+                    cfg.get('block_model_target_file'),
+                )
+                self.block_model_transfer_output_edit.setText(output_file)
+
+                def handle_success(result):
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"Block-model transfer complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Transferred columns: {', '.join(result['transferred_columns'])}\n"
+                            f"Target blocks preserved: {result['total_target_blocks']:,}\n"
+                            f"Overlap matches: {result['overlap_matched_blocks']:,}\n"
+                            f"Nearest fallback matches: {result['nearest_matched_blocks']:,}\n"
+                            f"Unmatched blocks: {result['unmatched_blocks']:,}\n"
+                            f"Nearest max distance: {'Unlimited' if result.get('max_nearest_distance') in (None, '') else f'{result['max_nearest_distance']:g} m'}"
+                        ),
+                    )
+
+                self._run_operation_with_progress(
+                    'Block Model Transfer',
+                    'Preparing block-model transfer...',
+                    export_blocks_with_source_block_values,
+                    {
+                        'source_blocks_file': cfg.get('blocks_file'),
+                        'target_blocks_file': cfg.get('block_model_target_file'),
+                        'output_file': output_file,
+                        'source_delimiter': cfg.get('blocks_delimiter'),
+                        'target_delimiter': cfg.get('block_model_target_delimiter'),
+                        'source_header_line': cfg.get('blocks_header_line', 1),
+                        'target_header_line': cfg.get('block_model_target_header_line', 1),
+                        'source_x_col': cfg.get('block_x_col'),
+                        'source_y_col': cfg.get('block_y_col'),
+                        'source_z_col': cfg.get('block_z_col'),
+                        'target_x_col': cfg.get('block_model_target_x_col'),
+                        'target_y_col': cfg.get('block_model_target_y_col'),
+                        'target_z_col': cfg.get('block_model_target_z_col'),
+                        'source_value_cols': selected_columns,
+                        'source_block_size': cfg.get('block_size'),
+                        'target_block_size': cfg.get('block_model_target_size'),
+                        'source_size_cols': cfg.get('block_model_source_size_cols'),
+                        'target_size_cols': cfg.get('block_model_target_size_cols'),
+                        'nearest_fallback': cfg.get('block_model_transfer_nearest_fallback', True),
+                        'max_nearest_distance': cfg.get('block_model_transfer_max_nearest_distance'),
+                    },
+                    handle_success,
+                    'An error occurred during block-model transfer',
+                )
+            except Exception as e:
+                print(f"Error during block-model transfer: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block-model transfer:\n{str(e)}')
 
         def run_block_domain_sample_metrics_only(self):
             """Export block rows with distance statistics to filtered samples inside the same domain."""

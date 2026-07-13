@@ -7,6 +7,7 @@ import json
 import ast
 import re
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,442 @@ def _normalize_bmf_field_type(field_type: object) -> str:
 
 def _infer_bmf_field_types_from_preview(frame: pd.DataFrame, candidate_columns: list[str], delimiter: str | None = None) -> dict[str, str]:
     return bmf_tools.infer_bmf_export_field_types_from_preview(frame, candidate_columns, delimiter=delimiter)
+
+
+def _normalize_preview_filter_token(value: object) -> str:
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    lower_text = text.lower()
+    if "." not in text and "e" not in lower_text:
+        return text
+
+    try:
+        numeric_value = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return text
+
+    if not numeric_value.is_finite():
+        return text
+
+    normalized = format(numeric_value.normalize(), "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    if normalized == "-0":
+        normalized = "0"
+    return normalized or "0"
+
+
+def _coerce_numeric_preview_series(series: pd.Series) -> pd.Series:
+    numeric_series = pd.to_numeric(series, errors="coerce")
+    missing_mask = numeric_series.isna()
+    if not missing_mask.any():
+        return numeric_series
+
+    text_series = series.astype(str)
+    normalized = text_series.str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False)
+    alternate_numeric = pd.to_numeric(normalized, errors="coerce")
+    return numeric_series.where(~missing_mask, alternate_numeric)
+
+
+class FilterDataSource:
+    def __init__(self, source: pd.DataFrame):
+        if not isinstance(source, pd.DataFrame):
+            raise TypeError("FilterDataSource source must be a pandas DataFrame.")
+        self._dataframe = source
+        self._series_cache: dict[str, pd.Series] = {}
+        self._categorical_value_cache: dict[tuple[str, int], tuple[list[str], int, bool]] = {}
+        self._numeric_range_cache: dict[str, tuple[float, float] | None] = {}
+        self._columns = [str(column) for column in source.columns]
+
+    @property
+    def columns(self) -> list[str]:
+        return list(self._columns)
+
+    def has_field(self, field: object) -> bool:
+        return str(field or "").strip() in self._dataframe.columns
+
+    def get_series(self, field: object) -> pd.Series:
+        field_name = str(field or "").strip()
+        if not field_name:
+            raise ValueError("Filter field name cannot be empty.")
+        if field_name not in self._dataframe.columns:
+            raise ValueError(f"Filter field not found: {field_name}")
+        if field_name not in self._series_cache:
+            self._series_cache[field_name] = self._dataframe[field_name]
+        return self._series_cache[field_name]
+
+    def get_categorical_values(self, field: object, max_values: int = 1000) -> tuple[list[str], int, bool]:
+        field_name = str(field or "").strip()
+        cache_key = (field_name, int(max_values))
+        if cache_key not in self._categorical_value_cache:
+            series = self.get_series(field_name)
+            unique_values = sorted({str(value).strip() for value in series.dropna() if str(value).strip()})
+            total_unique_values = len(unique_values)
+            truncated = total_unique_values > max_values
+            if truncated:
+                unique_values = unique_values[:max_values]
+            self._categorical_value_cache[cache_key] = (unique_values, total_unique_values, truncated)
+        return self._categorical_value_cache[cache_key]
+
+    def get_numeric_range(self, field: object) -> tuple[float, float] | None:
+        field_name = str(field or "").strip()
+        if field_name not in self._numeric_range_cache:
+            numeric_values = _coerce_numeric_preview_series(self.get_series(field_name)).dropna()
+            if len(numeric_values) == 0:
+                self._numeric_range_cache[field_name] = None
+            else:
+                self._numeric_range_cache[field_name] = (float(numeric_values.min()), float(numeric_values.max()))
+        return self._numeric_range_cache[field_name]
+
+
+def summarize_preview_filter_spec(filter_spec: dict[str, object]) -> str:
+    field = str(filter_spec.get("field", "")).strip()
+    filter_type = str(filter_spec.get("type", "")).strip().lower()
+    if filter_type == "categorical":
+        values = [str(value) for value in filter_spec.get("values", [])]
+        preview = ", ".join(values[:5])
+        if len(values) > 5:
+            preview += ", ..."
+        return f"{field} in [{preview}]"
+    if filter_type == "numeric":
+        min_value = filter_spec.get("min", None)
+        max_value = filter_spec.get("max", None)
+        if min_value is None and max_value is None:
+            return f"{field}: all numeric values"
+        if min_value is None:
+            return f"{field} <= {max_value}"
+        if max_value is None:
+            return f"{field} >= {min_value}"
+        return f"{field} in [{min_value}, {max_value}]"
+    return field or "Invalid filter"
+
+
+def apply_preview_dataframe_filters(
+    df_source: pd.DataFrame,
+    filters: list[dict[str, object]] | None = None,
+    filter_subject: str = "row",
+    source_label: str = "preview",
+) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+    if not filters:
+        return df_source.copy(), []
+
+    filtered_df = df_source.copy()
+    applied_filters: list[dict[str, str]] = []
+
+    for raw_filter in filters:
+        filter_spec = dict(raw_filter or {})
+        field = str(filter_spec.get("field", "")).strip()
+        filter_type = str(filter_spec.get("type", "")).strip().lower()
+
+        if not field:
+            raise ValueError(f"Each {filter_subject} filter must define a field name.")
+        if field not in filtered_df.columns:
+            raise ValueError(f"{filter_subject.capitalize()} filter field not found in {source_label}: {field}")
+
+        series = filtered_df[field]
+        if filter_type == "categorical":
+            raw_values = filter_spec.get("values", [])
+            allowed_values = [str(value).strip() for value in raw_values]
+            if not allowed_values:
+                raise ValueError(f"Categorical filter for {field} must include at least one value.")
+            series_text = series.fillna("").astype(str).str.strip()
+            mask = series_text.isin(allowed_values)
+
+            normalized_allowed_values = {_normalize_preview_filter_token(value) for value in raw_values}
+            normalized_allowed_values.discard("")
+            if normalized_allowed_values:
+                normalized_series = series.map(_normalize_preview_filter_token)
+                mask |= normalized_series.isin(normalized_allowed_values)
+        elif filter_type == "numeric":
+            numeric_series = _coerce_numeric_preview_series(series)
+            min_value = filter_spec.get("min", None)
+            max_value = filter_spec.get("max", None)
+            if min_value in ("", None):
+                min_value = None
+            else:
+                min_value = float(min_value)
+            if max_value in ("", None):
+                max_value = None
+            else:
+                max_value = float(max_value)
+            if min_value is not None and max_value is not None and min_value > max_value:
+                raise ValueError(f"Numeric filter for {field} has min greater than max.")
+
+            mask = numeric_series.notna()
+            if min_value is not None:
+                mask &= numeric_series >= min_value
+            if max_value is not None:
+                mask &= numeric_series <= max_value
+            filter_spec["min"] = min_value
+            filter_spec["max"] = max_value
+        else:
+            raise ValueError(f"Unsupported {filter_subject} filter type for {field}: {filter_type}")
+
+        filtered_df = filtered_df.loc[mask].copy()
+        applied_filters.append(
+            {
+                "field": field,
+                "type": filter_type,
+                "summary": summarize_preview_filter_spec(filter_spec),
+            }
+        )
+
+    return filtered_df, applied_filters
+
+
+class PreviewRowFilterEditDialog(QtWidgets.QDialog):
+    def __init__(self, filter_source: FilterDataSource, filter_spec: dict[str, object] | None = None, parent=None):
+        super().__init__(parent)
+        self.filter_source = filter_source if isinstance(filter_source, FilterDataSource) else FilterDataSource(filter_source)
+        self.setWindowTitle("Row Filter")
+        self.resize(520, 420)
+
+        layout = QtWidgets.QVBoxLayout()
+        self.setLayout(layout)
+
+        form = QtWidgets.QFormLayout()
+        layout.addLayout(form)
+
+        self.field_combo = QtWidgets.QComboBox()
+        self.field_combo.addItem("(Select Field)")
+        self.field_combo.addItems(self.filter_source.columns)
+        form.addRow("Field", self.field_combo)
+
+        self.type_combo = QtWidgets.QComboBox()
+        self.type_combo.addItems(["(Select Type)", "categorical", "numeric"])
+        form.addRow("Type", self.type_combo)
+
+        self.criteria_stack = QtWidgets.QStackedWidget()
+
+        categorical_page = QtWidgets.QWidget()
+        categorical_layout = QtWidgets.QVBoxLayout()
+        categorical_page.setLayout(categorical_layout)
+        categorical_layout.addWidget(QtWidgets.QLabel("Select one or more values:"))
+        self.value_list = QtWidgets.QListWidget()
+        self.value_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        categorical_layout.addWidget(self.value_list)
+        self.value_hint = QtWidgets.QLabel("")
+        self.value_hint.setWordWrap(True)
+        categorical_layout.addWidget(self.value_hint)
+        self.criteria_stack.addWidget(categorical_page)
+
+        numeric_page = QtWidgets.QWidget()
+        numeric_form = QtWidgets.QFormLayout()
+        numeric_page.setLayout(numeric_form)
+        self.min_value_edit = QtWidgets.QLineEdit("")
+        self.max_value_edit = QtWidgets.QLineEdit("")
+        self.numeric_hint = QtWidgets.QLabel("")
+        self.numeric_hint.setWordWrap(True)
+        numeric_form.addRow("Minimum", self.min_value_edit)
+        numeric_form.addRow("Maximum", self.max_value_edit)
+        numeric_form.addRow("", self.numeric_hint)
+        self.criteria_stack.addWidget(numeric_page)
+
+        form.addRow("Criteria", self.criteria_stack)
+        self.criteria_stack.setEnabled(False)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        ok_btn = QtWidgets.QPushButton("OK")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        button_row.addWidget(ok_btn)
+        button_row.addWidget(cancel_btn)
+        layout.addLayout(button_row)
+
+        self.field_combo.currentTextChanged.connect(self._refresh_criteria_ui)
+        self.type_combo.currentTextChanged.connect(self._refresh_criteria_ui)
+
+        if filter_spec:
+            field = str(filter_spec.get("field", "")).strip()
+            if field:
+                self.field_combo.setCurrentText(field)
+            filter_type = str(filter_spec.get("type", "categorical")).strip().lower() or "categorical"
+            self.type_combo.setCurrentText(filter_type)
+        else:
+            self.value_hint.setText("Select a field and choose categorical to load available values.")
+            self.numeric_hint.setText("Select a field and choose numeric to inspect the available range.")
+
+        self._refresh_criteria_ui()
+
+        if filter_spec:
+            if self.type_combo.currentText() == "categorical":
+                selected_values = {str(value) for value in filter_spec.get("values", [])}
+                for idx in range(self.value_list.count()):
+                    item = self.value_list.item(idx)
+                    item.setSelected(item.text() in selected_values)
+            else:
+                min_value = filter_spec.get("min", "")
+                max_value = filter_spec.get("max", "")
+                self.min_value_edit.setText("" if min_value is None else str(min_value))
+                self.max_value_edit.setText("" if max_value is None else str(max_value))
+
+    def _refresh_criteria_ui(self) -> None:
+        field = self.field_combo.currentText()
+        filter_type = self.type_combo.currentText()
+        has_field = bool(field and field != "(Select Field)" and self.filter_source.has_field(field))
+        has_type = filter_type in ("categorical", "numeric")
+
+        if not has_field or not has_type:
+            self.criteria_stack.setEnabled(False)
+            self.value_list.clear()
+            self.value_hint.setText("Select a field and choose categorical to load available values.")
+            self.numeric_hint.setText("Select a field and choose numeric to inspect the available range.")
+            self.criteria_stack.setCurrentIndex(0)
+            return
+
+        self.criteria_stack.setEnabled(True)
+
+        if filter_type == "categorical":
+            self.criteria_stack.setCurrentIndex(0)
+            unique_values, total_unique_values, truncated = self.filter_source.get_categorical_values(field)
+            self.value_list.clear()
+            self.value_list.addItems(unique_values)
+            self.value_hint.setText(
+                f"Loaded {total_unique_values:,} distinct values." + (" Showing the first 1,000 values." if truncated else "")
+            )
+        else:
+            self.criteria_stack.setCurrentIndex(1)
+            cached_range = self.filter_source.get_numeric_range(field)
+            if cached_range is None:
+                self.numeric_hint.setText("No numeric values detected in this field.")
+            else:
+                min_value, max_value = cached_range
+                self.numeric_hint.setText(f"Available numeric range: {min_value:g} to {max_value:g}")
+
+    def get_filter_spec(self) -> dict[str, object]:
+        field = self.field_combo.currentText().strip()
+        filter_type = self.type_combo.currentText().strip().lower()
+        if not field or field == "(Select Field)":
+            raise ValueError("Please select a field.")
+        if filter_type == "(select type)" or filter_type == "":
+            raise ValueError("Please select a filter type.")
+
+        if filter_type == "categorical":
+            selected_values = [item.text() for item in self.value_list.selectedItems()]
+            if not selected_values:
+                raise ValueError("Select at least one value for a categorical filter.")
+            return {
+                "field": field,
+                "type": "categorical",
+                "values": selected_values,
+            }
+
+        min_text = self.min_value_edit.text().strip()
+        max_text = self.max_value_edit.text().strip()
+        min_value = None if min_text == "" else float(min_text)
+        max_value = None if max_text == "" else float(max_text)
+        if min_value is not None and max_value is not None and min_value > max_value:
+            raise ValueError("Minimum value cannot be greater than maximum value.")
+        if min_value is None and max_value is None:
+            raise ValueError("Enter at least one numeric bound.")
+        return {
+            "field": field,
+            "type": "numeric",
+            "min": min_value,
+            "max": max_value,
+        }
+
+    def accept(self) -> None:
+        try:
+            self.get_filter_spec()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Invalid Filter", str(exc))
+            return
+        super().accept()
+
+
+class PreviewRowFiltersDialog(QtWidgets.QDialog):
+    def __init__(self, filter_source: FilterDataSource, filters: list[dict[str, object]] | None = None, parent=None):
+        super().__init__(parent)
+        self.filter_source = filter_source if isinstance(filter_source, FilterDataSource) else FilterDataSource(filter_source)
+        self.filters = [dict(entry) for entry in (filters or [])]
+        self.setWindowTitle("Row Filters")
+        self.resize(760, 420)
+
+        layout = QtWidgets.QVBoxLayout()
+        self.setLayout(layout)
+
+        info = QtWidgets.QLabel(
+            "Add one or more row filters. All filters are combined with AND. "
+            "Categorical filters keep selected values. Numeric filters keep values inside the requested range."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Field", "Type", "Criteria"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        layout.addWidget(self.table)
+
+        button_row = QtWidgets.QHBoxLayout()
+        self.add_btn = QtWidgets.QPushButton("Add Filter")
+        self.edit_btn = QtWidgets.QPushButton("Edit Filter")
+        self.remove_btn = QtWidgets.QPushButton("Remove Filter")
+        self.add_btn.clicked.connect(self.add_filter)
+        self.edit_btn.clicked.connect(self.edit_selected_filter)
+        self.remove_btn.clicked.connect(self.remove_selected_filter)
+        button_row.addWidget(self.add_btn)
+        button_row.addWidget(self.edit_btn)
+        button_row.addWidget(self.remove_btn)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        dialog_buttons = QtWidgets.QHBoxLayout()
+        dialog_buttons.addStretch(1)
+        ok_btn = QtWidgets.QPushButton("OK")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        dialog_buttons.addWidget(ok_btn)
+        dialog_buttons.addWidget(cancel_btn)
+        layout.addLayout(dialog_buttons)
+
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        self.table.setRowCount(len(self.filters))
+        for row, filter_spec in enumerate(self.filters):
+            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(filter_spec.get("field", ""))))
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(str(filter_spec.get("type", ""))))
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(summarize_preview_filter_spec(filter_spec)))
+        self.table.resizeRowsToContents()
+
+    def add_filter(self) -> None:
+        dialog = PreviewRowFilterEditDialog(self.filter_source, parent=self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            self.filters.append(dialog.get_filter_spec())
+            self._refresh_table()
+
+    def edit_selected_filter(self) -> None:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.filters):
+            QtWidgets.QMessageBox.information(self, "Edit Filter", "Select a filter to edit.")
+            return
+        dialog = PreviewRowFilterEditDialog(self.filter_source, filter_spec=self.filters[row], parent=self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            self.filters[row] = dialog.get_filter_spec()
+            self._refresh_table()
+
+    def remove_selected_filter(self) -> None:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.filters):
+            QtWidgets.QMessageBox.information(self, "Remove Filter", "Select a filter to remove.")
+            return
+        del self.filters[row]
+        self._refresh_table()
+
+    def get_filters(self) -> list[dict[str, object]]:
+        return [dict(entry) for entry in self.filters]
 
 
 class TrimmedDisplayDoubleSpinBox(QtWidgets.QDoubleSpinBox):
@@ -179,6 +616,7 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         self._export_value_cols_initialized = False
         self._export_columns_source_path = ""
         self._metadata_cell_size_values: list[float] | None = None
+        self._active_rows_filters: list[dict[str, object]] = []
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -443,11 +881,41 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         self.metadata_view = self._make_table_view(self.metadata_model)
         self.fields_view = self._make_table_view(self.fields_model)
         self.rows_view = self._make_table_view(self.rows_model)
+        self.rows_column_type_filter_combo = QtWidgets.QComboBox()
+        self.rows_column_type_filter_combo.addItem("All columns", "all")
+        self.rows_column_type_filter_combo.addItem("Numeric columns", "numeric")
+        self.rows_column_type_filter_combo.addItem("Text columns", "text")
+        self.rows_column_type_filter_combo.currentIndexChanged.connect(self._refresh_rows_preview)
+        self.rows_column_value_filter_edit = QtWidgets.QLineEdit()
+        self.rows_column_value_filter_edit.setPlaceholderText("Optional numeric or text value")
+        self.rows_column_value_filter_edit.textChanged.connect(self._refresh_rows_preview)
+        self.rows_filter_summary_label = QtWidgets.QLabel("Showing all columns.")
+        self.rows_configure_filters_button = QtWidgets.QPushButton("Configure Row Filters...")
+        self.rows_configure_filters_button.clicked.connect(self._configure_rows_filters)
+        self.rows_clear_filters_button = QtWidgets.QPushButton("Clear Row Filters")
+        self.rows_clear_filters_button.clicked.connect(self._clear_rows_filters)
+        self.rows_filter_status_label = QtWidgets.QLabel("No row filters configured.")
+        self.rows_filter_status_label.setWordWrap(True)
+        rows_tab = QtWidgets.QWidget()
+        rows_layout = QtWidgets.QVBoxLayout(rows_tab)
+        rows_controls = QtWidgets.QHBoxLayout()
+        rows_controls.addWidget(QtWidgets.QLabel("Column filter"))
+        rows_controls.addWidget(self.rows_column_type_filter_combo)
+        rows_controls.addWidget(QtWidgets.QLabel("Containing value"))
+        rows_controls.addWidget(self.rows_column_value_filter_edit, stretch=1)
+        rows_controls.addWidget(self.rows_filter_summary_label)
+        rows_filter_controls = QtWidgets.QHBoxLayout()
+        rows_filter_controls.addWidget(self.rows_configure_filters_button)
+        rows_filter_controls.addWidget(self.rows_clear_filters_button)
+        rows_filter_controls.addWidget(self.rows_filter_status_label, stretch=1)
+        rows_layout.addLayout(rows_controls)
+        rows_layout.addLayout(rows_filter_controls)
+        rows_layout.addWidget(self.rows_view, stretch=1)
         self.inspect_text = QtWidgets.QPlainTextEdit()
         self.inspect_text.setReadOnly(True)
         self.browser_tabs.addTab(self.metadata_view, "Metadata")
         self.browser_tabs.addTab(self.fields_view, "Fields")
-        self.browser_tabs.addTab(self.rows_view, "Rows")
+        self.browser_tabs.addTab(rows_tab, "Rows")
         self.browser_tabs.addTab(self.inspect_text, "Inspect")
         layout.addWidget(self.browser_tabs, stretch=1)
 
@@ -538,6 +1006,7 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
                 "output_csv": self.browse_output_edit.text().strip(),
                 "read_all_rows": self.read_all_rows_check.isChecked(),
                 "row_limit": int(self.row_limit_spin.value()),
+                "row_filters": [dict(entry) for entry in self._active_rows_filters],
             },
         }
 
@@ -655,11 +1124,13 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         self.browse_input_edit.setText(str(reader_config.get("input_bmf", "") or ""))
         self.browse_output_edit.setText(str(reader_config.get("output_csv", "") or ""))
         self.read_all_rows_check.setChecked(bool(reader_config.get("read_all_rows", True)))
+        self._active_rows_filters = [dict(entry) for entry in (reader_config.get("row_filters", []) or []) if isinstance(entry, dict)]
         try:
             self.row_limit_spin.setValue(int(reader_config.get("row_limit", 1000) or 1000))
         except Exception:
             self.row_limit_spin.setValue(1000)
         self._toggle_row_limit_enabled(self.read_all_rows_check.isChecked())
+        self._refresh_rows_preview()
 
     def _save_config(self) -> None:
         default_path = ""
@@ -1132,6 +1603,134 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
 
     def _toggle_row_limit_enabled(self, checked: bool) -> None:
         self.row_limit_spin.setEnabled(not checked)
+
+    def _configure_rows_filters(self) -> None:
+        frame = self._loaded_bmf_dataframe
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            QtWidgets.QMessageBox.information(self, "Row Filters", "Load a BMF preview before configuring row filters.")
+            return
+        dialog = PreviewRowFiltersDialog(FilterDataSource(frame), filters=self._active_rows_filters, parent=self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            self._active_rows_filters = dialog.get_filters()
+            self._refresh_rows_preview()
+
+    def _clear_rows_filters(self) -> None:
+        if not self._active_rows_filters:
+            self._refresh_rows_preview()
+            return
+        self._active_rows_filters = []
+        self._refresh_rows_preview()
+
+    def _set_rows_filter_status(self, message: str, is_error: bool = False) -> None:
+        self.rows_filter_status_label.setText(message)
+        self.rows_filter_status_label.setStyleSheet("color: #a40000;" if is_error else "")
+
+    def _refresh_rows_preview(self) -> None:
+        frame = self._loaded_bmf_dataframe
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            self.rows_model.set_frame(frame if isinstance(frame, pd.DataFrame) else pd.DataFrame())
+            if isinstance(frame, pd.DataFrame):
+                self.rows_filter_summary_label.setText(f"Showing 0 / {len(frame):,} rows, 0 / {len(frame.columns)} columns")
+                if self._active_rows_filters:
+                    self._set_rows_filter_status(f"{len(self._active_rows_filters)} row filter(s) configured. Load data to apply them.")
+                else:
+                    self._set_rows_filter_status("No row preview loaded.")
+            else:
+                self.rows_filter_summary_label.setText("No row preview loaded.")
+                self._set_rows_filter_status("Load a BMF preview to apply row filters.")
+            return
+
+        row_filtered_frame = frame
+        if self._active_rows_filters:
+            try:
+                row_filtered_frame, applied_filters = apply_preview_dataframe_filters(
+                    frame,
+                    filters=self._active_rows_filters,
+                    filter_subject="row",
+                    source_label="BMF preview",
+                )
+                filter_summaries = [entry["summary"] for entry in applied_filters]
+                preview_text = "; ".join(filter_summaries[:3])
+                if len(filter_summaries) > 3:
+                    preview_text += f"; +{len(filter_summaries) - 3} more"
+                self._set_rows_filter_status(f"Active row filters: {preview_text}")
+            except Exception as exc:
+                row_filtered_frame = frame
+                self._set_rows_filter_status(f"Row filter inactive: {exc}", is_error=True)
+        else:
+            self._set_rows_filter_status("No row filters configured.")
+
+        filtered_frame = self._filter_rows_preview_columns(row_filtered_frame)
+        self.rows_model.set_frame(filtered_frame)
+        self.rows_filter_summary_label.setText(
+            f"Showing {len(filtered_frame):,} / {len(frame):,} rows, {len(filtered_frame.columns)} / {len(frame.columns)} columns"
+        )
+
+    def _filter_rows_preview_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        filter_mode = str(self.rows_column_type_filter_combo.currentData() or "all")
+        raw_value_filter = self.rows_column_value_filter_edit.text().strip()
+        selected_columns = []
+        for column_name in frame.columns:
+            series = frame[column_name]
+            if not self._column_matches_preview_type_filter(series, filter_mode):
+                continue
+            if raw_value_filter and not self._column_matches_preview_value_filter(series, raw_value_filter):
+                continue
+            selected_columns.append(column_name)
+        if not selected_columns:
+            return pd.DataFrame()
+        return frame.loc[:, selected_columns].copy()
+
+    def _column_matches_preview_type_filter(self, series: pd.Series, filter_mode: str) -> bool:
+        if filter_mode == "all":
+            return True
+        is_numeric = self._series_is_numeric_like(series)
+        if filter_mode == "numeric":
+            return is_numeric
+        if filter_mode == "text":
+            return not is_numeric
+        return True
+
+    def _column_matches_preview_value_filter(self, series: pd.Series, raw_value_filter: str) -> bool:
+        values = series.dropna()
+        if values.empty:
+            return False
+
+        normalized_filter_token = _normalize_preview_filter_token(raw_value_filter)
+        try:
+            target_value = float(raw_value_filter)
+        except ValueError:
+            target_value = None
+
+        if target_value is not None:
+            coerced = _coerce_numeric_preview_series(values)
+            if coerced.notna().any():
+                tolerance = max(abs(target_value) * 1e-9, 1e-9)
+                deltas = (coerced - target_value).abs()
+                if deltas.le(tolerance).fillna(False).any():
+                    return True
+
+        normalized_values = values.map(_normalize_preview_filter_token)
+        if normalized_filter_token and normalized_values.eq(normalized_filter_token).any():
+            return True
+
+        needle = raw_value_filter.casefold()
+        return any(needle in _display_value(value).casefold() for value in values)
+
+    def _series_is_numeric_like(self, series: pd.Series) -> bool:
+        if pd.api.types.is_bool_dtype(series):
+            return False
+        if pd.api.types.is_numeric_dtype(series):
+            return True
+        values = series.dropna()
+        if values.empty:
+            return False
+        normalized = values.map(lambda value: str(value).strip())
+        normalized = normalized[normalized != ""]
+        if normalized.empty:
+            return False
+        coerced = _coerce_numeric_preview_series(normalized)
+        return float(coerced.notna().mean()) >= 0.8
 
     def _parse_triplet(self, text: str) -> list[float] | None:
         stripped = text.strip()
@@ -1668,7 +2267,7 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         if not isinstance(rows_frame, pd.DataFrame):
             rows_frame = pd.DataFrame()
         self._loaded_bmf_dataframe = rows_frame.copy()
-        self.rows_model.set_frame(rows_frame)
+        self._refresh_rows_preview()
         self.inspect_text.setPlainText(json.dumps(result.get("report") or {}, indent=2, default=str))
         self.reader_mode_label.setText(
             f"Reader mode: {result.get('reader_mode', 'unknown')} | loaded {result.get('rows_loaded', 0)} / {result.get('row_count', 0)} rows"

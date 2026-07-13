@@ -15,6 +15,7 @@ import anterpolator3DViewer as viewer_module
 
 from anterpolator3DViewer import (
     _build_export_blocks_dataframe,
+    _restore_list_widget_selection,
     FilterDataSource,
     apply_blank_sample_domain_behavior,
     compute_domain_sensitive_assignment_mask,
@@ -24,6 +25,7 @@ from anterpolator3DViewer import (
     export_blocks_to_csv,
     export_block_volume_weighted_average,
     export_block_domain_sample_metrics,
+    export_blocks_with_source_block_values,
     export_domain_interpolation_confidence_metrics,
     export_domained_samples_from_blocks,
     export_samples_with_block_values_from_blocks,
@@ -507,6 +509,268 @@ def test_export_samples_with_block_values_from_blocks_transfers_multiple_columns
         assert output_df.loc[0, "lith"] == "ore"
         assert output_df.loc[1, "grade"] == pytest.approx(6.0)
         assert output_df.loc[1, "lith"] == "waste"
+
+
+def test_export_blocks_with_source_values_preserves_target_rows_and_exact_matches():
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        output_path = os.path.join(td, "target_enriched.csv")
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "grade": 1.5, "lith": "ore"},
+            {"x": 15.0, "y": 5.0, "z": 5.0, "grade": 3.5, "lith": "waste"},
+        ]).to_csv(source_path, index=False)
+        pd.DataFrame([
+            {"tx": 5.0, "ty": 5.0, "tz": 5.0, "target_id": "A"},
+            {"tx": 15.0, "ty": 5.0, "tz": 5.0, "target_id": "B"},
+        ]).to_csv(target_path, index=False)
+
+        result = export_blocks_with_source_block_values(
+            source_path,
+            target_path,
+            output_file=output_path,
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="tx", target_y_col="ty", target_z_col="tz",
+            source_value_cols=["grade", "lith"],
+            source_block_size=(10, 10, 10),
+            target_block_size=(10, 10, 10),
+        )
+        output_df = pd.read_csv(output_path)
+
+        assert len(output_df) == 2
+        assert output_df["target_id"].tolist() == ["A", "B"]
+        assert output_df["grade"].tolist() == pytest.approx([1.5, 3.5])
+        assert output_df["lith"].tolist() == ["ore", "waste"]
+        assert result["overlap_matched_blocks"] == 2
+        assert result["nearest_matched_blocks"] == 0
+
+
+def test_export_blocks_with_source_values_uses_exact_grid_fast_path(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        output_path = os.path.join(td, "target_enriched.csv")
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "grade": 1.5},
+            {"x": 15.0, "y": 5.0, "z": 5.0, "grade": 3.5},
+        ]).to_csv(source_path, index=False)
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "target_id": "A"},
+            {"x": 15.0, "y": 5.0, "z": 5.0, "target_id": "B"},
+        ]).to_csv(target_path, index=False)
+
+        def fail_geometry(*args, **kwargs):
+            raise AssertionError("geometry path should not run for exact grid matches")
+
+        monkeypatch.setattr(viewer_module, "_resolve_block_row_geometry", fail_geometry)
+
+        result = viewer_module.export_blocks_with_source_block_values(
+            source_path,
+            target_path,
+            output_file=output_path,
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="x", target_y_col="y", target_z_col="z",
+            source_value_cols=["grade"],
+            source_block_size=(10, 10, 10),
+            target_block_size=(10, 10, 10),
+        )
+        output_df = pd.read_csv(output_path)
+
+        assert output_df["grade"].tolist() == pytest.approx([1.5, 3.5])
+        assert result["source_geometry_mode"] == "exact-grid"
+        assert result["target_geometry_mode"] == "exact-grid"
+
+
+def test_export_blocks_with_source_values_exact_prematch_skips_matched_targets(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        output_path = os.path.join(td, "target_enriched.csv")
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "grade": 1.5},
+            {"x": 15.0, "y": 5.0, "z": 5.0, "grade": 3.5},
+        ]).to_csv(source_path, index=False)
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "target_id": "A"},
+            {"x": 15.0, "y": 5.0, "z": 5.0, "target_id": "B"},
+            {"x": 105.0, "y": 5.0, "z": 5.0, "target_id": "C"},
+        ]).to_csv(target_path, index=False)
+
+        original_resolve = viewer_module._resolve_block_row_geometry
+        target_geometry_sizes = []
+
+        def wrapped_resolve(df, coordinate_columns, base_block_size, size_columns=None,
+                            progress_callback=None, progress_label='Resolving block geometry'):
+            if 'target_id' in df.columns:
+                target_geometry_sizes.append(len(df))
+                assert len(df) == 1
+            return original_resolve(df, coordinate_columns, base_block_size, size_columns, progress_callback, progress_label)
+
+        monkeypatch.setattr(viewer_module, "_resolve_block_row_geometry", wrapped_resolve)
+
+        result = viewer_module.export_blocks_with_source_block_values(
+            source_path,
+            target_path,
+            output_file=output_path,
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="x", target_y_col="y", target_z_col="z",
+            source_value_cols=["grade"],
+            source_block_size=(10, 10, 10),
+            target_block_size=(10, 10, 10),
+        )
+        output_df = pd.read_csv(output_path)
+
+        assert target_geometry_sizes == [1]
+        assert output_df["grade"].tolist() == pytest.approx([1.5, 3.5, 3.5])
+        assert result["overlap_matched_blocks"] == 2
+        assert result["nearest_matched_blocks"] == 1
+        assert result["target_geometry_mode"].startswith("exact-prematch + ")
+
+
+def test_export_blocks_with_source_values_streams_csv_target(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        output_path = os.path.join(td, "target_enriched.csv")
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "grade": 1.5},
+            {"x": 15.0, "y": 5.0, "z": 5.0, "grade": 3.5},
+        ]).to_csv(source_path, index=False)
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "target_id": "A"},
+            {"x": 15.0, "y": 5.0, "z": 5.0, "target_id": "B"},
+        ]).to_csv(target_path, index=False)
+
+        original_loader = viewer_module.load_full_blocks_dataframe
+
+        def wrapped_loader(path, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(target_path):
+                raise AssertionError("CSV target should be streamed, not loaded wholesale")
+            return original_loader(path, *args, **kwargs)
+
+        monkeypatch.setattr(viewer_module, "load_full_blocks_dataframe", wrapped_loader)
+
+        result = viewer_module.export_blocks_with_source_block_values(
+            source_path,
+            target_path,
+            output_file=output_path,
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="x", target_y_col="y", target_z_col="z",
+            source_value_cols=["grade"],
+            source_block_size=(10, 10, 10),
+            target_block_size=(10, 10, 10),
+        )
+        output_df = pd.read_csv(output_path)
+
+        assert output_df["grade"].tolist() == pytest.approx([1.5, 3.5])
+        assert result["target_geometry_mode"] == "exact-grid"
+
+
+def test_restore_list_widget_selection_restores_multi_select_items():
+    _get_qt_app()
+    widget = viewer_module.QtWidgets.QListWidget()
+    widget.setSelectionMode(viewer_module.QtWidgets.QAbstractItemView.MultiSelection)
+    for column in ["grade", "lith", "density"]:
+        widget.addItem(viewer_module.QtWidgets.QListWidgetItem(column))
+
+    _restore_list_widget_selection(widget, ["grade", "lith"])
+
+    assert [item.text() for item in widget.selectedItems()] == ["grade", "lith"]
+
+
+def test_export_blocks_with_source_values_uses_overlap_volume_for_subblocks():
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source_subblocks.csv")
+        target_path = os.path.join(td, "target.csv")
+        output_path = os.path.join(td, "target_enriched.csv")
+        pd.DataFrame([
+            {"x": 2.0, "y": 5.0, "z": 5.0, "dx": 4.0, "dy": 10.0, "dz": 10.0, "grade": 2.0, "lith": "A"},
+            {"x": 7.0, "y": 5.0, "z": 5.0, "dx": 6.0, "dy": 10.0, "dz": 10.0, "grade": 6.0, "lith": "B"},
+        ]).to_csv(source_path, index=False)
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "target_id": 1},
+        ]).to_csv(target_path, index=False)
+
+        result = export_blocks_with_source_block_values(
+            source_path,
+            target_path,
+            output_file=output_path,
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="x", target_y_col="y", target_z_col="z",
+            source_value_cols=["grade", "lith"],
+            source_block_size=(10, 10, 10),
+            target_block_size=(10, 10, 10),
+            source_size_cols=("dx", "dy", "dz"),
+        )
+        output_df = pd.read_csv(output_path)
+
+        assert output_df.loc[0, "grade"] == pytest.approx(4.4)
+        assert output_df.loc[0, "lith"] == "B"
+        assert result["source_geometry_mode"] == "explicit-size-columns"
+        assert result["overlap_matched_blocks"] == 1
+
+
+def test_export_blocks_with_source_values_uses_nearest_fallback_without_creating_rows():
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        output_path = os.path.join(td, "target_enriched.csv")
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "grade": 8.0},
+        ]).to_csv(source_path, index=False)
+        pd.DataFrame([
+            {"x": 105.0, "y": 5.0, "z": 5.0, "target_id": "far"},
+        ]).to_csv(target_path, index=False)
+
+        result = export_blocks_with_source_block_values(
+            source_path,
+            target_path,
+            output_file=output_path,
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="x", target_y_col="y", target_z_col="z",
+            source_value_cols=["grade"],
+            source_block_size=(10, 10, 10),
+            target_block_size=(10, 10, 10),
+        )
+        output_df = pd.read_csv(output_path)
+
+        assert len(output_df) == 1
+        assert output_df.loc[0, "target_id"] == "far"
+        assert output_df.loc[0, "grade"] == pytest.approx(8.0)
+        assert result["overlap_matched_blocks"] == 0
+        assert result["nearest_matched_blocks"] == 1
+
+
+def test_export_blocks_with_source_values_respects_max_nearest_distance():
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        output_path = os.path.join(td, "target_enriched.csv")
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "grade": 8.0},
+        ]).to_csv(source_path, index=False)
+        pd.DataFrame([
+            {"x": 105.0, "y": 5.0, "z": 5.0, "target_id": "far"},
+        ]).to_csv(target_path, index=False)
+
+        result = export_blocks_with_source_block_values(
+            source_path,
+            target_path,
+            output_file=output_path,
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="x", target_y_col="y", target_z_col="z",
+            source_value_cols=["grade"],
+            source_block_size=(10, 10, 10),
+            target_block_size=(10, 10, 10),
+            max_nearest_distance=25.0,
+        )
+        output_df = pd.read_csv(output_path)
+
+        assert len(output_df) == 1
+        assert pd.isna(output_df.loc[0, "grade"])
+        assert result["overlap_matched_blocks"] == 0
+        assert result["nearest_matched_blocks"] == 0
+        assert result["unmatched_blocks"] == 1
 
 
 def test_export_domained_samples_preserves_empty_columns():
