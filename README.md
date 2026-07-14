@@ -46,6 +46,7 @@ Beyond interpolation, Anterpolator includes a dedicated operations workflow for 
 - **Sample Blocks:** aggregate samples into their containing blocks.
 - **Domain Samples:** assign block-model domains back onto sample rows.
 - **Assign Block Columns To Samples:** transfer selected block attributes onto samples.
+- **Assign Block Columns To Block Model:** enrich a target block model from overlapping source blocks while preserving target rows; numeric fields use overlap-volume-weighted averages, categorical fields use the dominant overlap category, and a nearest-block fallback can be enabled for targets with no overlap.
 - **Block Domain Sample Metrics:** export nearest-distance, k-nearest, residual, and summary metrics by domain.
 - **Domain Interpolation Confidence:** summarize spacing and support metrics for each domain.
 - **Block Volume Weighted Average:** compute weighted summaries using inferred block volumes or a chosen weight field.
