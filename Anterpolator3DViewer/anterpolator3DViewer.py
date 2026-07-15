@@ -7301,6 +7301,10 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
 
     for chunk_number, target_chunk in enumerate(target_chunks, start=1):
         total_target_blocks += len(target_chunk)
+        print(
+            f"Target block chunk {chunk_number:,}: read {len(target_chunk):,} rows "
+            f"({total_target_blocks:,} cumulative) from {os.path.basename(target_blocks_file)}."
+        )
         exact_chunk = _match_exact_block_transfer_chunk(
             target_chunk,
             exact_source_lookup,
@@ -7421,6 +7425,11 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
             header=not wrote_header,
         )
         wrote_header = True
+        print(
+            f"Target block chunk {chunk_number:,}: wrote {len(target_chunk):,} rows; "
+            f"matches so far overlap/exact={overlap_matches:,}, nearest={nearest_matches:,}, "
+            f"invalid={invalid_target_blocks:,}."
+        )
 
     if not wrote_header:
         empty_columns = list(dict.fromkeys(list(target_columns) + list(selected_columns)))
