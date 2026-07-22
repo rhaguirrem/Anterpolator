@@ -25,6 +25,7 @@ from anterpolator3DViewer import (
     export_blocks_to_csv,
     export_block_volume_weighted_average,
     export_block_domain_sample_metrics,
+    export_block_model_with_table_attributes,
     export_blocks_with_source_block_values,
     export_domain_interpolation_confidence_metrics,
     export_domained_samples_from_blocks,
@@ -413,7 +414,7 @@ def test_load_block_domain_catalog_uses_path_chunk_reader_for_large_filtered_fil
         assert domains == ["A", "C"]
         assert progress_events
         assert progress_events[-1][0] == progress_events[-1][1]
-        assert progress_events[-1][2] == "Reading domain column"
+        assert progress_events[-1][2].startswith("Reading domain column")
 
 
 def test_export_domained_samples_uses_aggregated_subblock_domains():
@@ -771,6 +772,76 @@ def test_export_blocks_with_source_values_respects_max_nearest_distance():
         assert result["overlap_matched_blocks"] == 0
         assert result["nearest_matched_blocks"] == 0
         assert result["unmatched_blocks"] == 1
+
+
+def test_export_block_model_with_table_attributes_matches_multiple_keys_and_columns():
+    with tempfile.TemporaryDirectory() as td:
+        block_model_path = os.path.join(td, "block_model.csv")
+        table_path = os.path.join(td, "attributes.csv")
+        output_path = os.path.join(td, "block_model_enriched.csv")
+
+        pd.DataFrame(
+            [
+                {"UG": "A", "Fase": 1, "Density": 0.0, "Lith": ""},
+                {"UG": "A", "Fase": 2, "Density": 99.0, "Lith": "keep"},
+                {"UG": "B", "Fase": 1, "Density": 0.0, "Lith": ""},
+            ]
+        ).to_csv(block_model_path, index=False)
+        pd.DataFrame(
+            [
+                {"UG": "A", "Fase": 1, "Density": 2.45, "Lith": "ore"},
+                {"UG": "B", "Fase": 1, "Density": 2.8, "Lith": "waste"},
+            ]
+        ).to_csv(table_path, index=False)
+
+        result = export_block_model_with_table_attributes(
+            block_model_path,
+            table_path,
+            output_file=output_path,
+            key_columns=["UG", "Fase"],
+            table_value_cols=["Density", "Lith"],
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["matched_rows"] == 2
+        assert result["unmatched_rows"] == 1
+        assert result["key_columns"] == ["UG", "Fase"]
+        assert result["assigned_columns"] == ["Density", "Lith"]
+        assert output_df.loc[0, "Density"] == pytest.approx(2.45)
+        assert output_df.loc[0, "Lith"] == "ore"
+        assert output_df.loc[1, "Density"] == pytest.approx(99.0)
+        assert output_df.loc[1, "Lith"] == "keep"
+        assert output_df.loc[2, "Density"] == pytest.approx(2.8)
+        assert output_df.loc[2, "Lith"] == "waste"
+
+
+def test_export_block_model_with_table_attributes_rejects_duplicate_keys():
+    with tempfile.TemporaryDirectory() as td:
+        block_model_path = os.path.join(td, "block_model.csv")
+        table_path = os.path.join(td, "attributes.csv")
+        output_path = os.path.join(td, "block_model_enriched.csv")
+
+        pd.DataFrame(
+            [
+                {"UG": "A", "Fase": 1},
+            ]
+        ).to_csv(block_model_path, index=False)
+        pd.DataFrame(
+            [
+                {"UG": "A", "Fase": 1, "Density": 2.45},
+                {"UG": "A", "Fase": 1, "Density": 2.55},
+            ]
+        ).to_csv(table_path, index=False)
+
+        with pytest.raises(ValueError, match="duplicate key combinations"):
+            export_block_model_with_table_attributes(
+                block_model_path,
+                table_path,
+                output_file=output_path,
+                key_columns=["UG", "Fase"],
+                table_value_cols=["Density"],
+            )
 
 
 def test_export_domained_samples_preserves_empty_columns():

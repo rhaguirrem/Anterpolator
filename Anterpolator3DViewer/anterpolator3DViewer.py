@@ -471,6 +471,20 @@ def _emit_progress(progress_callback, value, maximum=100, message=''):
     progress_callback(bounded_value, max_value, str(message or ''))
 
 
+def _format_progress_message(message, value, maximum):
+    text = str(message or '').strip() or 'Working...'
+    max_value = max(int(maximum or 0), 1)
+    current_value = max(0, min(int(value or 0), max_value))
+    if '%' in text:
+        return text
+    return f'{text} ({(current_value / max_value) * 100.0:.1f}%)'
+
+
+def _format_row_progress_label(progress_label, processed_rows):
+    row_label = 'row' if int(processed_rows) == 1 else 'rows'
+    return f'{progress_label} ({int(processed_rows):,} {row_label})'
+
+
 def _make_scaled_progress_callback(progress_callback, start, end, default_message=''):
     start_value = int(start)
     end_value = int(end)
@@ -635,27 +649,61 @@ def iterate_csv_path_chunks_with_progress(path, progress_label, progress_callbac
 
     def _generator():
         processed_rows = 0
+        displayed_bytes = 0
+        pbar = tqdm(
+            total=total_bytes,
+            desc=progress_label,
+            unit='B',
+            unit_scale=True,
+            unit_divisor=1024,
+        )
         if progress_callback:
             try:
-                progress_callback(min(data_start_offset, total_bytes), total_bytes, progress_label)
+                progress_callback(
+                    min(data_start_offset, total_bytes),
+                    total_bytes,
+                    _format_row_progress_label(progress_label, processed_rows),
+                )
             except Exception:
                 pass
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', pd.errors.DtypeWarning)
-            for chunk in pd.read_csv(path, **read_csv_kwargs):
-                processed_rows += len(chunk)
-                if progress_callback and bytes_per_row is not None:
-                    estimated_bytes = min(total_bytes, int(data_start_offset + processed_rows * bytes_per_row))
-                    try:
-                        progress_callback(estimated_bytes, total_bytes, progress_label)
-                    except Exception:
-                        pass
-                yield chunk
-        if progress_callback:
-            try:
-                progress_callback(total_bytes, total_bytes, progress_label)
-            except Exception:
-                pass
+        try:
+            initial_bytes = min(data_start_offset, total_bytes)
+            if initial_bytes > 0:
+                pbar.update(initial_bytes)
+                displayed_bytes = initial_bytes
+            pbar.set_postfix_str(f'rows~{processed_rows:,}')
+
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', pd.errors.DtypeWarning)
+                for chunk in pd.read_csv(path, **read_csv_kwargs):
+                    processed_rows += len(chunk)
+                    message = _format_row_progress_label(progress_label, processed_rows)
+                    estimated_bytes = None
+                    if bytes_per_row is not None:
+                        estimated_bytes = min(total_bytes, int(data_start_offset + processed_rows * bytes_per_row))
+                        byte_delta = estimated_bytes - displayed_bytes
+                        if byte_delta > 0:
+                            pbar.update(byte_delta)
+                            displayed_bytes = estimated_bytes
+                    pbar.set_postfix_str(f'rows~{processed_rows:,}')
+                    if progress_callback and estimated_bytes is not None:
+                        try:
+                            progress_callback(estimated_bytes, total_bytes, message)
+                        except Exception:
+                            pass
+                    yield chunk
+
+            if displayed_bytes < total_bytes:
+                pbar.update(total_bytes - displayed_bytes)
+                displayed_bytes = total_bytes
+            pbar.set_postfix_str(f'rows~{processed_rows:,}')
+            if progress_callback:
+                try:
+                    progress_callback(total_bytes, total_bytes, _format_row_progress_label(progress_label, processed_rows))
+                except Exception:
+                    pass
+        finally:
+            pbar.close()
         print(f"{progress_label}: processed {processed_rows:,} rows from {os.path.basename(path)}")
 
     return _generator()
@@ -3674,6 +3722,19 @@ def resolve_block_model_transfer_export_path(configured_path=None, target_blocks
     output_dir = os.path.dirname(reference_path) or '.'
     base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'target_blocks'
     return os.path.join(output_dir, f'{base_name}+SourceBlocks.csv')
+
+
+def resolve_block_model_table_attribute_export_path(configured_path=None, block_model_file=None, table_file=None):
+    configured_path = str(configured_path or '').strip()
+    if configured_path:
+        return configured_path
+
+    reference_path = str(block_model_file or '').strip() or 'block_model.csv'
+    output_dir = os.path.dirname(reference_path) or '.'
+    base_name = os.path.splitext(os.path.basename(reference_path))[0] or 'block_model'
+    table_base_name = os.path.splitext(os.path.basename(str(table_file or '').strip()))[0] or 'table'
+    table_suffix = _sanitize_filename_fragment(table_base_name, fallback='table')
+    return os.path.join(output_dir, f'{base_name}+{table_suffix}_attributes.csv')
 
 
 
@@ -7073,6 +7134,183 @@ def _restore_list_widget_selection(list_widget, values):
         del blocker
 
 
+def _normalize_table_attribute_columns(columns, selection_label):
+    if isinstance(columns, str):
+        raw_columns = [part.strip() for part in columns.split(',')]
+    else:
+        raw_columns = [str(part).strip() for part in (columns or [])]
+
+    normalized_columns = []
+    seen = set()
+    for column_name in raw_columns:
+        if not column_name or column_name == '(None)' or column_name in seen:
+            continue
+        normalized_columns.append(column_name)
+        seen.add(column_name)
+
+    if not normalized_columns:
+        raise ValueError(f'Please select at least one {selection_label}.')
+
+    return normalized_columns
+
+
+def _normalize_table_attribute_key_series(series):
+    normalized_values = []
+    for value in series:
+        if pd.isna(value):
+            normalized_values.append(None)
+            continue
+        if isinstance(value, (np.integer, int)) and not isinstance(value, bool):
+            normalized_values.append(str(int(value)))
+            continue
+        if isinstance(value, (np.floating, float)):
+            float_value = float(value)
+            if not np.isfinite(float_value):
+                normalized_values.append(None)
+            elif float_value.is_integer():
+                normalized_values.append(str(int(float_value)))
+            else:
+                normalized_values.append(format(float_value, '.15g'))
+            continue
+
+        text = str(value).strip()
+        normalized_values.append(text if text and text.lower() != 'nan' else None)
+
+    return pd.Series(normalized_values, index=series.index, dtype=object)
+
+
+def export_block_model_with_table_attributes(block_model_file, table_file, output_file=None,
+                                             block_model_delimiter=None, block_model_header_line=1,
+                                             table_delimiter=None, table_header_line=1,
+                                             key_columns=None, table_value_cols=None,
+                                             progress_callback=None):
+    if not block_model_file or not str(block_model_file).strip():
+        raise ValueError('Block model file is required.')
+    if not table_file or not str(table_file).strip():
+        raise ValueError('Attribute table file is required.')
+
+    block_model_file = str(block_model_file).strip()
+    table_file = str(table_file).strip()
+    if not os.path.isfile(block_model_file):
+        raise ValueError(f'Block model file not found: {block_model_file}')
+    if not os.path.isfile(table_file):
+        raise ValueError(f'Attribute table file not found: {table_file}')
+    if is_bmf_file(table_file):
+        raise ValueError('Attribute table must be provided in CSV format.')
+
+    key_columns = _normalize_table_attribute_columns(key_columns, 'match key column')
+    table_value_cols = _normalize_table_attribute_columns(table_value_cols, 'attribute column to assign')
+    key_column_set = set(key_columns)
+    overlapping_columns = [column_name for column_name in table_value_cols if column_name in key_column_set]
+    if overlapping_columns:
+        raise ValueError(
+            'Attribute columns cannot also be selected as match keys: '
+            + ', '.join(overlapping_columns)
+        )
+
+    output_file = resolve_block_model_table_attribute_export_path(
+        output_file,
+        block_model_file=block_model_file,
+        table_file=table_file,
+    )
+
+    _emit_progress(progress_callback, 0, 100, 'Preparing table attribute assignment...')
+    block_df, resolved_block_delimiter = load_full_blocks_dataframe(
+        block_model_file,
+        blocks_delimiter=block_model_delimiter,
+        blocks_header_line=block_model_header_line,
+        progress_label='Reading block model',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 45, 'Reading block model...'),
+    )
+    missing_block_keys = [column_name for column_name in key_columns if column_name not in block_df.columns]
+    if missing_block_keys:
+        raise ValueError(
+            'Selected key columns were not found in the block model: '
+            + ', '.join(missing_block_keys)
+        )
+
+    table_delimiter = table_delimiter or detect_csv_delimiter(table_file)
+    selected_table_columns = list(dict.fromkeys(key_columns + table_value_cols))
+    table_df, _ = read_selected_columns_with_header(
+        table_file,
+        table_delimiter,
+        table_header_line,
+        selected_table_columns,
+        progress_label='Reading attribute table',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 45, 75, 'Reading attribute table...'),
+    )
+    missing_table_keys = [column_name for column_name in key_columns if column_name not in table_df.columns]
+    if missing_table_keys:
+        raise ValueError(
+            'Selected key columns were not found in the attribute table: '
+            + ', '.join(missing_table_keys)
+        )
+
+    block_work_df = block_df.copy()
+    table_work_df = table_df.copy()
+    helper_key_columns = []
+    for key_index, column_name in enumerate(key_columns):
+        helper_column = f'__table_attr_key_{key_index}'
+        block_work_df[helper_column] = _normalize_table_attribute_key_series(block_work_df[column_name])
+        table_work_df[helper_column] = _normalize_table_attribute_key_series(table_work_df[column_name])
+        helper_key_columns.append(helper_column)
+
+    duplicate_key_mask = table_work_df.duplicated(subset=helper_key_columns, keep=False)
+    if duplicate_key_mask.any():
+        duplicate_preview = table_df.loc[duplicate_key_mask, key_columns].drop_duplicates().head(5)
+        preview_parts = []
+        for _, row in duplicate_preview.iterrows():
+            preview_parts.append(', '.join(f'{column_name}={row[column_name]}' for column_name in key_columns))
+        preview_text = '; '.join(preview_parts)
+        raise ValueError(
+            'Attribute table contains duplicate key combinations for the selected keys'
+            + (f': {preview_text}' if preview_text else '.')
+        )
+
+    _emit_progress(progress_callback, 76, 100, 'Matching table attributes...')
+    helper_value_columns = {}
+    table_lookup_df = table_work_df[helper_key_columns].copy()
+    for value_index, column_name in enumerate(table_value_cols):
+        helper_column = f'__table_attr_value_{value_index}'
+        table_lookup_df[helper_column] = table_work_df[column_name]
+        helper_value_columns[column_name] = helper_column
+
+    merged_df = block_work_df.merge(
+        table_lookup_df,
+        how='left',
+        on=helper_key_columns,
+        sort=False,
+        indicator='__table_attr_match',
+    )
+    matched_mask = merged_df['__table_attr_match'].eq('both')
+    output_df = merged_df.drop(columns=helper_key_columns + ['__table_attr_match'])
+
+    for column_name, helper_column in helper_value_columns.items():
+        if column_name in block_df.columns:
+            output_df.loc[matched_mask, column_name] = output_df.loc[matched_mask, helper_column]
+            output_df = output_df.drop(columns=[helper_column])
+        else:
+            output_df[column_name] = output_df[helper_column]
+            output_df = output_df.drop(columns=[helper_column])
+
+    _emit_progress(progress_callback, 95, 100, 'Writing table attribute assignment...')
+    output_df.to_csv(output_file, index=False)
+    _emit_progress(progress_callback, 100, 100, 'Table attribute assignment complete.')
+
+    return {
+        'output_file': output_file,
+        'block_model_file': block_model_file,
+        'table_file': table_file,
+        'block_model_delimiter': resolved_block_delimiter,
+        'table_delimiter': table_delimiter,
+        'key_columns': list(key_columns),
+        'assigned_columns': list(table_value_cols),
+        'matched_rows': int(matched_mask.sum()),
+        'unmatched_rows': int((~matched_mask).sum()),
+        'total_rows': int(len(output_df)),
+    }
+
+
 BLOCK_MODEL_TRANSFER_TARGET_CHUNK_SIZE = 100_000
 
 
@@ -10453,6 +10691,13 @@ if __name__ == "__main__":
                     target_blocks_file=self.block_model_target_edit.text().strip(),
                 )
 
+            def suggested_table_attribute_output_path():
+                return resolve_block_model_table_attribute_export_path(
+                    None,
+                    block_model_file=self.table_attribute_block_model_edit.text().strip(),
+                    table_file=self.table_attribute_table_edit.text().strip(),
+                )
+
             def suggested_domain_interpolation_confidence_path():
                 return resolve_domain_interpolation_confidence_export_path(
                     None,
@@ -10545,6 +10790,35 @@ if __name__ == "__main__":
             self.block_model_nearest_max_distance.setSpecialValueText('Unlimited')
             self.block_model_nearest_max_distance.setSuffix(' m')
             self.start_block_model_transfer_btn = QtWidgets.QPushButton('Transfer To Target Blocks')
+            self.table_attribute_block_model_edit = QtWidgets.QLineEdit('')
+            self.table_attribute_block_model_browse = QtWidgets.QPushButton('Browse')
+            self.table_attribute_block_model_delim = QtWidgets.QComboBox()
+            self.table_attribute_block_model_delim.addItems(delim_opts)
+            self.table_attribute_block_model_header_line = QtWidgets.QSpinBox()
+            self.table_attribute_block_model_header_line.setRange(1, 1_000_000)
+            self.table_attribute_block_model_header_line.setValue(1)
+            self.table_attribute_table_edit = QtWidgets.QLineEdit('')
+            self.table_attribute_table_browse = QtWidgets.QPushButton('Browse')
+            self.table_attribute_table_delim = QtWidgets.QComboBox()
+            self.table_attribute_table_delim.addItems(delim_opts)
+            self.table_attribute_table_header_line = QtWidgets.QSpinBox()
+            self.table_attribute_table_header_line.setRange(1, 1_000_000)
+            self.table_attribute_table_header_line.setValue(1)
+            self.table_attribute_key_cols = QtWidgets.QListWidget()
+            self.table_attribute_key_cols.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+            self.table_attribute_key_cols.setMinimumHeight(100)
+            self.table_attribute_key_select_all_btn = QtWidgets.QPushButton('Select All')
+            self.table_attribute_key_clear_btn = QtWidgets.QPushButton('Clear')
+            self.table_attribute_value_cols = QtWidgets.QListWidget()
+            self.table_attribute_value_cols.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+            self.table_attribute_value_cols.setMinimumHeight(120)
+            self.table_attribute_value_select_all_btn = QtWidgets.QPushButton('Select All')
+            self.table_attribute_value_clear_btn = QtWidgets.QPushButton('Clear')
+            self.table_attribute_summary = QtWidgets.QLabel('No shared key columns are available yet.')
+            self.table_attribute_summary.setWordWrap(True)
+            self.table_attribute_output_edit = QtWidgets.QLineEdit('')
+            self.table_attribute_output_browse = QtWidgets.QPushButton('Browse')
+            self.start_table_attribute_assign_btn = QtWidgets.QPushButton('Assign Attributes')
             self.domain_interpolation_confidence_output_edit = QtWidgets.QLineEdit('')
             self.domain_interpolation_confidence_browse = QtWidgets.QPushButton('Browse')
             self.start_domain_interpolation_confidence_btn = QtWidgets.QPushButton('Export Confidence Metrics')
@@ -10617,6 +10891,7 @@ if __name__ == "__main__":
             self._domain_samples_auto_path = ''
             self._block_value_transfer_auto_path = ''
             self._block_model_transfer_auto_path = ''
+            self._table_attribute_auto_path = ''
             self._block_domain_metrics_auto_path = ''
             self._domain_interpolation_confidence_auto_path = ''
             self._block_volume_weighted_auto_path = ''
@@ -10625,6 +10900,8 @@ if __name__ == "__main__":
             self._equation_finder_auto_path = ''
             self._pending_block_value_transfer_cols = []
             self._pending_block_model_transfer_cols = []
+            self._pending_table_attribute_key_cols = []
+            self._pending_table_attribute_value_cols = []
             self._pending_bmf_export_value_cols = None
             self._pending_bmf_export_column_types = None
             self._bmf_export_value_cols_initialized = False
@@ -10661,6 +10938,15 @@ if __name__ == "__main__":
                 self._block_model_transfer_auto_path = suggested
 
             self._refresh_block_model_transfer_output_path = refresh_block_model_transfer_output_path
+
+            def refresh_table_attribute_output_path(force=False):
+                suggested = suggested_table_attribute_output_path()
+                current = self.table_attribute_output_edit.text().strip()
+                if force or not current or current == self._table_attribute_auto_path:
+                    self.table_attribute_output_edit.setText(suggested)
+                self._table_attribute_auto_path = suggested
+
+            self._refresh_table_attribute_output_path = refresh_table_attribute_output_path
 
             def refresh_block_domain_metrics_output_path(force=False):
                 suggested = suggested_block_domain_metrics_path()
@@ -10765,6 +11051,37 @@ if __name__ == "__main__":
                 )
                 if path:
                     self.block_model_transfer_output_edit.setText(path)
+
+            def browse_table_attribute_block_model():
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self,
+                    'Block Model To Enrich',
+                    self.table_attribute_block_model_edit.text().strip() or '.',
+                    'Block Models (*.csv *.bmf);;All Files (*.*)',
+                )
+                if path:
+                    self.table_attribute_block_model_edit.setText(path)
+
+            def browse_table_attribute_table():
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    self,
+                    'Attribute Table CSV',
+                    self.table_attribute_table_edit.text().strip() or '.',
+                    'CSV Files (*.csv);;All Files (*.*)',
+                )
+                if path:
+                    self.table_attribute_table_edit.setText(path)
+
+            def browse_table_attribute_output():
+                initial_path = self.table_attribute_output_edit.text().strip() or suggested_table_attribute_output_path()
+                path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    self,
+                    'Assign Attributes Output File',
+                    initial_path,
+                    'CSV Files (*.csv)',
+                )
+                if path:
+                    self.table_attribute_output_edit.setText(path)
 
             def browse_block_domain_metrics_output():
                 initial_path = self.block_domain_metrics_output_edit.text().strip() or suggested_block_domain_metrics_path()
@@ -11012,6 +11329,57 @@ if __name__ == "__main__":
             block_model_transfer_form.addRow('', self.start_block_model_transfer_btn)
             operations_form.addRow(block_model_transfer_group)
 
+            table_attribute_group, table_attribute_form = create_collapsible_operation_section(
+                'Assign Attributes From Table',
+                'Join one or more CSV table columns onto a block model by matching one or more shared key columns.',
+            )
+            self.table_attribute_block_model_edit.setToolTip('Block model CSV or BMF whose rows will be preserved and enriched.')
+            self.table_attribute_block_model_browse.setToolTip('Choose the block model to enrich.')
+            self.table_attribute_block_model_delim.setToolTip('CSV delimiter for the block model. When a CSV is opened, the UI auto-detects the delimiter.')
+            self.table_attribute_block_model_header_line.setToolTip('Header line for the block model CSV. When a CSV is opened, this control is synchronized to the effective detected header line.')
+            self.table_attribute_table_edit.setToolTip('CSV table that provides key columns and attribute values to assign.')
+            self.table_attribute_table_browse.setToolTip('Choose the CSV table to join onto the block model.')
+            self.table_attribute_table_delim.setToolTip('CSV delimiter for the attribute table. The UI auto-detects it when the file is opened.')
+            self.table_attribute_table_header_line.setToolTip('Header line for the attribute table CSV. The UI syncs this to the effective detected header line.')
+            self.table_attribute_key_cols.setToolTip('Select one or more shared columns used to match block-model rows to table rows.')
+            self.table_attribute_value_cols.setToolTip('Select one or more table columns to copy onto the block model.')
+            self.table_attribute_summary.setToolTip('Shows how many keys and table columns are selected for assignment.')
+            self.table_attribute_output_edit.setToolTip('CSV file to write. The output preserves all block-model rows and appends or updates the selected table columns.')
+            self.table_attribute_output_browse.setToolTip('Choose the CSV file to write for the enriched block model.')
+            table_attribute_block_model_layout = QtWidgets.QHBoxLayout()
+            table_attribute_block_model_layout.addWidget(self.table_attribute_block_model_edit)
+            table_attribute_block_model_layout.addWidget(self.table_attribute_block_model_browse)
+            table_attribute_form.addRow('Block Model', table_attribute_block_model_layout)
+            table_attribute_block_model_format_layout = QtWidgets.QHBoxLayout()
+            table_attribute_block_model_format_layout.addWidget(self.table_attribute_block_model_delim)
+            table_attribute_block_model_format_layout.addWidget(self.table_attribute_block_model_header_line)
+            table_attribute_form.addRow('Block Delimiter / Header', table_attribute_block_model_format_layout)
+            table_attribute_table_layout = QtWidgets.QHBoxLayout()
+            table_attribute_table_layout.addWidget(self.table_attribute_table_edit)
+            table_attribute_table_layout.addWidget(self.table_attribute_table_browse)
+            table_attribute_form.addRow('Attribute Table', table_attribute_table_layout)
+            table_attribute_table_format_layout = QtWidgets.QHBoxLayout()
+            table_attribute_table_format_layout.addWidget(self.table_attribute_table_delim)
+            table_attribute_table_format_layout.addWidget(self.table_attribute_table_header_line)
+            table_attribute_form.addRow('Table Delimiter / Header', table_attribute_table_format_layout)
+            table_attribute_form.addRow('Match Keys', self.table_attribute_key_cols)
+            table_attribute_key_buttons = QtWidgets.QHBoxLayout()
+            table_attribute_key_buttons.addWidget(self.table_attribute_key_select_all_btn)
+            table_attribute_key_buttons.addWidget(self.table_attribute_key_clear_btn)
+            table_attribute_form.addRow('', table_attribute_key_buttons)
+            table_attribute_form.addRow('Assign Columns', self.table_attribute_value_cols)
+            table_attribute_value_buttons = QtWidgets.QHBoxLayout()
+            table_attribute_value_buttons.addWidget(self.table_attribute_value_select_all_btn)
+            table_attribute_value_buttons.addWidget(self.table_attribute_value_clear_btn)
+            table_attribute_form.addRow('', table_attribute_value_buttons)
+            table_attribute_form.addRow('', self.table_attribute_summary)
+            table_attribute_output_layout = QtWidgets.QHBoxLayout()
+            table_attribute_output_layout.addWidget(self.table_attribute_output_edit)
+            table_attribute_output_layout.addWidget(self.table_attribute_output_browse)
+            table_attribute_form.addRow('Output File', table_attribute_output_layout)
+            table_attribute_form.addRow('', self.start_table_attribute_assign_btn)
+            operations_form.addRow(table_attribute_group)
+
             block_metrics_group, block_metrics_form = create_collapsible_operation_section(
                 'Block Domain Sample Metrics',
                 'Export selectable per-block and per-domain support metrics, including exact nearest distance, scalable k-nearest averages, optional nearest-sample residuals, and an optional distance-threshold summary.',
@@ -11247,6 +11615,31 @@ if __name__ == "__main__":
             self.block_x_col.currentTextChanged.connect(lambda _: self._refresh_block_model_transfer_source_columns())
             self.block_y_col.currentTextChanged.connect(lambda _: self._refresh_block_model_transfer_source_columns())
             self.block_z_col.currentTextChanged.connect(lambda _: self._refresh_block_model_transfer_source_columns())
+            self.table_attribute_block_model_browse.clicked.connect(browse_table_attribute_block_model)
+            self.table_attribute_table_browse.clicked.connect(browse_table_attribute_table)
+            self.table_attribute_output_browse.clicked.connect(browse_table_attribute_output)
+            self.start_table_attribute_assign_btn.clicked.connect(self.run_table_attribute_assignment_only)
+            self.table_attribute_key_select_all_btn.clicked.connect(self.table_attribute_key_cols.selectAll)
+            self.table_attribute_key_select_all_btn.clicked.connect(self._update_table_attribute_summary)
+            self.table_attribute_key_select_all_btn.clicked.connect(lambda: self._refresh_table_attribute_value_columns())
+            self.table_attribute_key_clear_btn.clicked.connect(self.table_attribute_key_cols.clearSelection)
+            self.table_attribute_key_clear_btn.clicked.connect(self._update_table_attribute_summary)
+            self.table_attribute_key_clear_btn.clicked.connect(lambda: self._refresh_table_attribute_value_columns())
+            self.table_attribute_value_select_all_btn.clicked.connect(self.table_attribute_value_cols.selectAll)
+            self.table_attribute_value_select_all_btn.clicked.connect(self._update_table_attribute_summary)
+            self.table_attribute_value_clear_btn.clicked.connect(self.table_attribute_value_cols.clearSelection)
+            self.table_attribute_value_clear_btn.clicked.connect(self._update_table_attribute_summary)
+            self.table_attribute_key_cols.itemSelectionChanged.connect(self._refresh_table_attribute_value_columns)
+            self.table_attribute_key_cols.itemSelectionChanged.connect(self._update_table_attribute_summary)
+            self.table_attribute_value_cols.itemSelectionChanged.connect(self._update_table_attribute_summary)
+            self.table_attribute_block_model_edit.textChanged.connect(lambda _: self._refresh_table_attribute_shared_key_columns())
+            self.table_attribute_block_model_edit.textChanged.connect(lambda _: refresh_table_attribute_output_path())
+            self.table_attribute_block_model_delim.currentIndexChanged.connect(self._refresh_table_attribute_shared_key_columns)
+            self.table_attribute_block_model_header_line.valueChanged.connect(lambda _: self._refresh_table_attribute_shared_key_columns())
+            self.table_attribute_table_edit.textChanged.connect(lambda _: self._refresh_table_attribute_shared_key_columns())
+            self.table_attribute_table_edit.textChanged.connect(lambda _: refresh_table_attribute_output_path())
+            self.table_attribute_table_delim.currentIndexChanged.connect(self._refresh_table_attribute_shared_key_columns)
+            self.table_attribute_table_header_line.valueChanged.connect(lambda _: self._refresh_table_attribute_shared_key_columns())
             self.block_domain_metrics_browse.clicked.connect(browse_block_domain_metrics_output)
             self.configure_block_domain_metrics_filters_btn.clicked.connect(self.configure_block_domain_metrics_filters)
             self.start_block_domain_metrics_btn.clicked.connect(self.run_block_domain_sample_metrics_only)
@@ -11326,6 +11719,8 @@ if __name__ == "__main__":
             self._refresh_block_model_target_columns()
             refresh_block_model_transfer_output_path(force=True)
             self._update_block_model_transfer_fallback_controls()
+            self._refresh_table_attribute_shared_key_columns()
+            refresh_table_attribute_output_path(force=True)
             self._update_block_domain_metrics_metric_summary()
             refresh_block_domain_metrics_output_path(force=True)
             refresh_domain_interpolation_confidence_output_path(force=True)
@@ -11824,6 +12219,15 @@ if __name__ == "__main__":
                 'block_model_transfer_nearest_fallback': self.block_model_nearest_fallback.isChecked(),
                 'block_model_transfer_max_nearest_distance': self.block_model_nearest_max_distance.value(),
                 'block_model_transfer_file': self.block_model_transfer_output_edit.text(),
+                'table_attribute_block_model_file': self.table_attribute_block_model_edit.text(),
+                'table_attribute_block_model_delimiter': self.table_attribute_block_model_delim.currentText(),
+                'table_attribute_block_model_header_line': self.table_attribute_block_model_header_line.value(),
+                'table_attribute_table_file': self.table_attribute_table_edit.text(),
+                'table_attribute_table_delimiter': self.table_attribute_table_delim.currentText(),
+                'table_attribute_table_header_line': self.table_attribute_table_header_line.value(),
+                'table_attribute_key_cols': self._get_selected_table_attribute_key_columns(),
+                'table_attribute_value_cols': self._get_selected_table_attribute_value_columns(),
+                'table_attribute_output_file': self.table_attribute_output_edit.text(),
                 'block_domain_metrics_file': self.block_domain_metrics_output_edit.text(),
                 'block_domain_metrics_selected_metrics': self._get_selected_block_domain_metrics(),
                 'block_domain_metrics_avg_distance_knn_k': self.block_domain_metrics_knn_k.value(),
@@ -11986,6 +12390,13 @@ if __name__ == "__main__":
                 if 'block_model_target_delimiter' in config: self.block_model_target_delim.setCurrentText(config['block_model_target_delimiter'])
                 if 'block_model_target_header_line' in config: self.block_model_target_header_line.setValue(int(config['block_model_target_header_line']))
                 if 'block_model_transfer_file' in config: self.block_model_transfer_output_edit.setText(config['block_model_transfer_file'])
+                if 'table_attribute_block_model_file' in config: self.table_attribute_block_model_edit.setText(config['table_attribute_block_model_file'])
+                if 'table_attribute_block_model_delimiter' in config: self.table_attribute_block_model_delim.setCurrentText(config['table_attribute_block_model_delimiter'])
+                if 'table_attribute_block_model_header_line' in config: self.table_attribute_block_model_header_line.setValue(int(config['table_attribute_block_model_header_line']))
+                if 'table_attribute_table_file' in config: self.table_attribute_table_edit.setText(config['table_attribute_table_file'])
+                if 'table_attribute_table_delimiter' in config: self.table_attribute_table_delim.setCurrentText(config['table_attribute_table_delimiter'])
+                if 'table_attribute_table_header_line' in config: self.table_attribute_table_header_line.setValue(int(config['table_attribute_table_header_line']))
+                if 'table_attribute_output_file' in config: self.table_attribute_output_edit.setText(config['table_attribute_output_file'])
                 if 'block_domain_metrics_file' in config: self.block_domain_metrics_output_edit.setText(config['block_domain_metrics_file'])
                 if 'domain_interpolation_confidence_file' in config: self.domain_interpolation_confidence_output_edit.setText(config['domain_interpolation_confidence_file'])
                 if 'block_volume_weighted_file' in config: self.block_volume_weighted_output_edit.setText(config['block_volume_weighted_file'])
@@ -12053,6 +12464,10 @@ if __name__ == "__main__":
                     self._refresh_block_model_transfer_source_columns()
                 if hasattr(self, '_refresh_block_model_target_columns'):
                     self._refresh_block_model_target_columns()
+                self._pending_table_attribute_key_cols = list(config.get('table_attribute_key_cols', []))
+                self._pending_table_attribute_value_cols = list(config.get('table_attribute_value_cols', []))
+                if hasattr(self, '_refresh_table_attribute_shared_key_columns'):
+                    self._refresh_table_attribute_shared_key_columns()
                 for combo, column_name in zip(
                     [self.block_model_target_x_col, self.block_model_target_y_col, self.block_model_target_z_col],
                     [config.get('block_model_target_x_col'), config.get('block_model_target_y_col'), config.get('block_model_target_z_col')],
@@ -12530,6 +12945,106 @@ if __name__ == "__main__":
                 [('dx', 'dim_x', 'size_x', 'x_size'), ('dy', 'dim_y', 'size_y', 'y_size'), ('dz', 'dim_z', 'size_z', 'z_size')],
             ):
                 self._populate_block_model_column_combo(combo, columns, '(Infer)', suggestions)
+
+        def _get_selected_table_attribute_key_columns(self):
+            if not hasattr(self, 'table_attribute_key_cols'):
+                return []
+            return [item.text() for item in self.table_attribute_key_cols.selectedItems()]
+
+        def _set_selected_table_attribute_key_columns(self, column_names):
+            if not hasattr(self, 'table_attribute_key_cols'):
+                return
+            _restore_list_widget_selection(self.table_attribute_key_cols, column_names)
+
+        def _get_selected_table_attribute_value_columns(self):
+            if not hasattr(self, 'table_attribute_value_cols'):
+                return []
+            return [item.text() for item in self.table_attribute_value_cols.selectedItems()]
+
+        def _set_selected_table_attribute_value_columns(self, column_names):
+            if not hasattr(self, 'table_attribute_value_cols'):
+                return
+            _restore_list_widget_selection(self.table_attribute_value_cols, column_names)
+
+        def _update_table_attribute_summary(self):
+            if not hasattr(self, 'table_attribute_summary'):
+                return
+            total_keys = self.table_attribute_key_cols.count()
+            selected_keys = len(self._get_selected_table_attribute_key_columns())
+            total_values = self.table_attribute_value_cols.count()
+            selected_values = len(self._get_selected_table_attribute_value_columns())
+            if total_keys == 0:
+                self.table_attribute_summary.setText('No shared key columns are available between the block model and the table.')
+                return
+            self.table_attribute_summary.setText(
+                f'{selected_keys} of {total_keys} match keys selected. '
+                f'{selected_values} of {total_values} table columns selected for assignment.'
+            )
+
+        def _read_table_attribute_source_columns(self, path, delimiter_combo, header_line_spin):
+            columns = []
+            if not path or not os.path.isfile(path):
+                return columns
+            try:
+                if not is_bmf_file(path):
+                    detected = detect_csv_delimiter(path)
+                    if delimiter_combo.findText(detected) >= 0:
+                        delimiter_combo.setCurrentText(detected)
+                    sync_csv_header_line_widget(header_line_spin, path, header_line_spin.value())
+                    columns = parse_effective_header_line(path, delimiter_combo.currentText(), header_line_spin.value())
+                else:
+                    blocker = QtCore.QSignalBlocker(header_line_spin)
+                    header_line_spin.setValue(1)
+                    del blocker
+                    preview, _ = _load_bmf_dataframe(path, row_limit=1)
+                    columns = list(preview.columns)
+            except Exception:
+                columns = []
+            return columns
+
+        def _refresh_table_attribute_shared_key_columns(self):
+            if not hasattr(self, 'table_attribute_key_cols'):
+                return
+            block_columns = self._read_table_attribute_source_columns(
+                self.table_attribute_block_model_edit.text().strip(),
+                self.table_attribute_block_model_delim,
+                self.table_attribute_block_model_header_line,
+            )
+            table_columns = self._read_table_attribute_source_columns(
+                self.table_attribute_table_edit.text().strip(),
+                self.table_attribute_table_delim,
+                self.table_attribute_table_header_line,
+            )
+            table_column_set = set(table_columns)
+            shared_columns = [column_name for column_name in block_columns if column_name in table_column_set]
+            selected_keys = set(self._get_selected_table_attribute_key_columns())
+            selected_keys.update(getattr(self, '_pending_table_attribute_key_cols', []) or [])
+            self.table_attribute_key_cols.clear()
+            for column_name in shared_columns:
+                self.table_attribute_key_cols.addItem(QtWidgets.QListWidgetItem(column_name))
+            self._set_selected_table_attribute_key_columns(selected_keys)
+            self._pending_table_attribute_key_cols = []
+            self._refresh_table_attribute_value_columns()
+
+        def _refresh_table_attribute_value_columns(self):
+            if not hasattr(self, 'table_attribute_value_cols'):
+                return
+            table_columns = self._read_table_attribute_source_columns(
+                self.table_attribute_table_edit.text().strip(),
+                self.table_attribute_table_delim,
+                self.table_attribute_table_header_line,
+            )
+            selected_values = set(self._get_selected_table_attribute_value_columns())
+            selected_values.update(getattr(self, '_pending_table_attribute_value_cols', []) or [])
+            selected_keys = set(self._get_selected_table_attribute_key_columns())
+            self.table_attribute_value_cols.clear()
+            for column_name in table_columns:
+                if column_name in selected_keys:
+                    continue
+                self.table_attribute_value_cols.addItem(QtWidgets.QListWidgetItem(column_name))
+            self._set_selected_table_attribute_value_columns(selected_values)
+            self._pending_table_attribute_value_cols = []
+            self._update_table_attribute_summary()
 
         def _get_selected_block_domain_metrics(self):
             if not hasattr(self, 'block_domain_metrics_metric_list'):
@@ -13490,6 +14005,7 @@ if __name__ == "__main__":
         def _set_operation_buttons_enabled(self, enabled):
             self.start_domaining_btn.setEnabled(enabled)
             self.start_block_value_transfer_btn.setEnabled(enabled)
+            self.start_table_attribute_assign_btn.setEnabled(enabled)
             self.start_block_domain_metrics_btn.setEnabled(enabled)
             self.start_domain_interpolation_confidence_btn.setEnabled(enabled)
             self.start_block_volume_weighted_btn.setEnabled(enabled)
@@ -13526,7 +14042,7 @@ if __name__ == "__main__":
                 progress.setMaximum(max(int(maximum or 0), 1))
                 progress.setValue(max(0, min(int(value or 0), progress.maximum())))
                 if message:
-                    progress.setLabelText(message)
+                    progress.setLabelText(_format_progress_message(message, value, progress.maximum()))
 
             def cleanup():
                 if self._active_operation_progress is progress:
@@ -13889,6 +14405,53 @@ if __name__ == "__main__":
                 print(f"Error during block-model transfer: {e}")
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during block-model transfer:\n{str(e)}')
+
+        def run_table_attribute_assignment_only(self):
+            """Assign selected table attributes onto a block model by matching one or more key columns."""
+            try:
+                cfg = self.to_dict()
+                output_file = resolve_block_model_table_attribute_export_path(
+                    cfg.get('table_attribute_output_file'),
+                    block_model_file=cfg.get('table_attribute_block_model_file'),
+                    table_file=cfg.get('table_attribute_table_file'),
+                )
+                self.table_attribute_output_edit.setText(output_file)
+
+                def handle_success(result):
+                    QtWidgets.QMessageBox.information(
+                        self,
+                        'Success',
+                        (
+                            f"Table attribute assignment complete!\nResults saved to:\n{result['output_file']}\n\n"
+                            f"Match keys: {', '.join(result['key_columns'])}\n"
+                            f"Assigned columns: {', '.join(result['assigned_columns'])}\n"
+                            f"Matched rows: {result['matched_rows']:,}\n"
+                            f"Unmatched rows: {result['unmatched_rows']:,}"
+                        ),
+                    )
+
+                self._run_operation_with_progress(
+                    'Assign Attributes From Table',
+                    'Preparing table attribute assignment...',
+                    export_block_model_with_table_attributes,
+                    {
+                        'block_model_file': cfg.get('table_attribute_block_model_file'),
+                        'table_file': cfg.get('table_attribute_table_file'),
+                        'output_file': output_file,
+                        'block_model_delimiter': cfg.get('table_attribute_block_model_delimiter'),
+                        'block_model_header_line': cfg.get('table_attribute_block_model_header_line', 1),
+                        'table_delimiter': cfg.get('table_attribute_table_delimiter'),
+                        'table_header_line': cfg.get('table_attribute_table_header_line', 1),
+                        'key_columns': cfg.get('table_attribute_key_cols'),
+                        'table_value_cols': cfg.get('table_attribute_value_cols'),
+                    },
+                    handle_success,
+                    'An error occurred during table attribute assignment',
+                )
+            except Exception as e:
+                print(f"Error during table attribute assignment: {e}")
+                traceback.print_exc()
+                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during table attribute assignment:\n{str(e)}')
 
         def run_block_domain_sample_metrics_only(self):
             """Export block rows with distance statistics to filtered samples inside the same domain."""
