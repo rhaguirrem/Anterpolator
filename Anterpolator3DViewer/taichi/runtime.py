@@ -1254,21 +1254,35 @@ class TaichiInterpolationViewer:
             if current_blocks > previous_blocks:
                 changed = True
 
-        if self.config.get('fill_unvisited_domainwise', False):
-            try:
-                if hasattr(interp, 'fill_unvisited_blocks_domainwise'):
-                    created, assigned = interp.fill_unvisited_blocks_domainwise(dims)
-                    if created or assigned:
-                        changed = True
-            except Exception:
-                pass
-
         try:
             converged = bool(interp.is_converged())
         except Exception:
             converged = False
 
         return changed, should_continue, converged
+
+    def _get_domain_post_process_mode(self, domain):
+        if not domain or str(domain).strip().lower() == 'global':
+            return 'skip'
+        domain_overrides = self.config.get('domain_algorithm_overrides') or {}
+        domain_cfg = domain_overrides.get(domain) or {}
+        if domain_cfg.get('skip', False):
+            return 'skip'
+        mode = str(domain_cfg.get('post_process', 'skip')).strip().lower()
+        if mode in ('fill_with_average', 'fill average', 'fill_average', 'fill'):
+            return 'fill_with_average'
+        return 'skip'
+
+    def _run_domain_post_process(self, domain, interp, dims):
+        if self._get_domain_post_process_mode(domain) != 'fill_with_average':
+            return 0, 0
+        if not hasattr(interp, 'fill_unvisited_blocks_domainwise'):
+            return 0, 0
+        try:
+            created, assigned = interp.fill_unvisited_blocks_domainwise(dims)
+        except Exception:
+            return 0, 0
+        return int(created or 0), int(assigned or 0)
 
     def _prepare_next_pass(self, completed_interp, next_interp):
         dims = tuple(self.block_info.get('dims', (0, 0, 0)))
@@ -1828,6 +1842,11 @@ class TaichiInterpolationViewer:
         phase_finished = (not should_continue) or converged or (phase_iteration >= target_iterations)
         next_phase_label = None
         if phase_finished:
+            is_last_pass_in_domain = (self._interpolation_pass_index + 1) >= len(group['passes'])
+            if is_last_pass_in_domain:
+                created, assigned = self._run_domain_post_process(group['domain'], interp, dims)
+                if created or assigned:
+                    changed = True
             next_phase_label = self._advance_interpolation_phase(interp)
 
         return {

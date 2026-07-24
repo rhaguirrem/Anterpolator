@@ -3504,15 +3504,6 @@ def update_interpolation(plotter):
             if current_blocks > previous_blocks:
                 changes_made = True
 
-        if getattr(plotter, '_fill_unvisited_domainwise', False):
-            try:
-                if hasattr(interp, 'fill_unvisited_blocks_domainwise'):
-                    created, assigned = interp.fill_unvisited_blocks_domainwise(dims)
-                    if created or assigned:
-                        changes_made = True
-            except Exception as e:
-                print(f"Domain-wise fill error: {e}")
-
     if changes_made:
         colony_blocks = {}
         pos_to_interpolator = {}
@@ -8753,10 +8744,39 @@ def _run_interpolator_with_progress(interpolator, dims, iterations, desc, on_fir
     pbar.close()
     return should_continue
 
+def _normalize_domain_post_process_mode(mode):
+    normalized = str(mode or 'skip').strip().lower()
+    if normalized in ('fill_with_average', 'fill average', 'fill_average', 'fill'):
+        return 'fill_with_average'
+    return 'skip'
+
+def _get_domain_post_process_mode(config, domain):
+    if not config or not domain or str(domain).strip().lower() == 'global':
+        return 'skip'
+    domain_overrides = config.get('domain_algorithm_overrides') or {}
+    domain_cfg = domain_overrides.get(domain) or {}
+    if domain_cfg.get('skip', False):
+        return 'skip'
+    return _normalize_domain_post_process_mode(domain_cfg.get('post_process', 'skip'))
+
+def _run_domain_post_process(interpolator, dims, mode, domain_label=None):
+    if _normalize_domain_post_process_mode(mode) != 'fill_with_average':
+        return 0, 0
+    if not hasattr(interpolator, 'fill_unvisited_blocks_domainwise'):
+        return 0, 0
+    try:
+        created, assigned = interpolator.fill_unvisited_blocks_domainwise(dims)
+    except Exception as exc:
+        label = str(domain_label or getattr(interpolator, 'get_algorithm_name', lambda: 'interpolator')())
+        print(f"Post-process error for {label}: {exc}")
+        return 0, 0
+    return int(created or 0), int(assigned or 0)
+
 def silent_interpolation(plotter, iterations, interpolation_file):
     blocks = plotter._blocks_data
     dims = tuple(blocks._block_info['dims'])
     block_evaluated_samples_file = getattr(plotter, '_block_evaluated_samples_file', None)
+    post_process_config = {'domain_algorithm_overrides': getattr(plotter, '_domain_post_process_overrides', {})}
     
     # Check if we have multiple interpolators (sequential domain processing)
     if hasattr(blocks, '_interpolators'):
@@ -8787,6 +8807,8 @@ def silent_interpolation(plotter, iterations, interpolation_file):
             output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
             if hasattr(interp1, 'generate_statistics'):
                 interp1.generate_statistics(output_dir, domain_name=f"{domain}_Pass1")
+
+            last_interp = interp1
 
             # --- Pass 2 ---
             if len(interpolator_list) > 1:
@@ -8918,9 +8940,14 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                 output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
                 if hasattr(interp2, 'generate_statistics'):
                     interp2.generate_statistics(output_dir, domain_name=f"{domain}_Pass2")
+                last_interp = interp2
+
+            post_process_mode = _get_domain_post_process_mode(post_process_config, domain)
+            created, assigned = _run_domain_post_process(last_interp, dims, post_process_mode, domain_label=domain)
+            if created or assigned:
+                print(f"Applied post-process for {domain}: created={created}, assigned={assigned}")
             
             # Print domain summary (of the last pass)
-            last_interp = interpolator_list[-1]
             metadata = last_interp.get_metadata()
             print(f"\n=== Domain {domain} Summary ===")
             for key, value in metadata.items():
@@ -9630,7 +9657,7 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
         plotter._blocks_data = blocks
         plotter._verbose = verbose
         plotter._value_filter = value_filter  # Store value_filter
-        plotter._fill_unvisited_domainwise = fill_unvisited_domainwise
+        plotter._domain_post_process_overrides = dict((config or {}).get('domain_algorithm_overrides', {}))
         plotter._avoid_visited_threshold_enabled = avoid_visited_threshold_enabled
         plotter._avoid_visited_threshold = avoid_visited_threshold
         plotter._block_lookup = None
@@ -9816,7 +9843,7 @@ if __name__ == "__main__":
             self.setWindowTitle("Domain Algorithm Mapping")
             self.resize(800, 500)
             
-            self.domain_configs = {}  # domain -> {'algorithm': str, 'second_pass_algorithm': str, 'skip': bool}
+            self.domain_configs = {}  # domain -> {'algorithm': str, 'second_pass_algorithm': str, 'post_process': str, 'skip': bool}
             
             layout = QtWidgets.QVBoxLayout()
             self.setLayout(layout)
@@ -9824,18 +9851,20 @@ if __name__ == "__main__":
             # Info label
             info = QtWidgets.QLabel("Configure which algorithm to use for each domain.\n"
                                   "You can configure a second pass to run after the first one completes.\n"
-                                  "The second pass uses the output of the first pass as input.")
+                                  "The second pass uses the output of the first pass as input.\n"
+                                  "Post-process runs once after the last enabled pass for that domain.")
             info.setWordWrap(True)
             layout.addWidget(info)
             
             # Table for domain mappings
             self.table = QtWidgets.QTableWidget()
-            self.table.setColumnCount(3)
-            self.table.setHorizontalHeaderLabels(['Domain', 'First Pass Algorithm', 'Second Pass Algorithm'])
+            self.table.setColumnCount(4)
+            self.table.setHorizontalHeaderLabels(['Domain', 'First Pass Algorithm', 'Second Pass Algorithm', 'Post-process'])
             self.table.horizontalHeader().setStretchLastSection(True)
             self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
             self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
             self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
             layout.addWidget(self.table)
             
             self.populate_domains(domains)
@@ -9848,6 +9877,9 @@ if __name__ == "__main__":
             self.apply_second_pass_all_btn = QtWidgets.QPushButton('Apply Second Pass to All')
             self.apply_second_pass_all_btn.clicked.connect(self.apply_second_pass_to_all)
             btn_layout.addWidget(self.apply_second_pass_all_btn)
+            self.apply_post_process_all_btn = QtWidgets.QPushButton('Apply Post Process to All')
+            self.apply_post_process_all_btn.clicked.connect(self.apply_post_process_to_all)
+            btn_layout.addWidget(self.apply_post_process_all_btn)
             btn_layout.addStretch()
             
             self.ok_btn = QtWidgets.QPushButton('OK')
@@ -9876,6 +9908,11 @@ if __name__ == "__main__":
                 algo2_combo.setCurrentText('skip')
                 self.table.setCellWidget(i, 2, algo2_combo)
 
+                post_process_combo = QtWidgets.QComboBox()
+                post_process_combo.addItems(['skip', 'fill_with_average'])
+                post_process_combo.setCurrentText('skip')
+                self.table.setCellWidget(i, 3, post_process_combo)
+
                 algo1_combo.currentTextChanged.connect(
                     lambda text, row=i: self.on_first_pass_changed(row, text)
                 )
@@ -9886,16 +9923,18 @@ if __name__ == "__main__":
         def on_first_pass_changed(self, row, text):
             """Handle changes to first pass algorithm"""
             algo2_combo = self.table.cellWidget(row, 2)
-            if not algo2_combo:
+            post_process_combo = self.table.cellWidget(row, 3)
+            if not algo2_combo or not post_process_combo:
                 return
                 
             if text == 'skip':
-                # If first pass is skip, second pass must be skip and disabled
                 algo2_combo.setCurrentText('skip')
                 algo2_combo.setEnabled(False)
+                post_process_combo.setCurrentText('skip')
+                post_process_combo.setEnabled(False)
             else:
                 algo2_combo.setEnabled(True)
-                # Ensure second pass is not same as first (unless skip)
+                post_process_combo.setEnabled(True)
                 current_algo2 = algo2_combo.currentText()
                 if current_algo2 == text and text != 'skip':
                     algo2_combo.setCurrentText('skip')
@@ -9945,6 +9984,24 @@ if __name__ == "__main__":
                         algo2_combo.setCurrentText('skip')
                         continue
                     algo2_combo.setCurrentText(algo)
+
+        def apply_post_process_to_all(self):
+            """Apply same post-process option to all eligible domains"""
+            options = ['skip', 'fill_with_average']
+            mode, ok = QtWidgets.QInputDialog.getItem(
+                self, 'Apply to All', 'Select post-process for all domains:',
+                options, 0, False
+            )
+            if ok:
+                for i in range(self.table.rowCount()):
+                    algo1_combo = self.table.cellWidget(i, 1)
+                    post_process_combo = self.table.cellWidget(i, 3)
+                    if not algo1_combo or not post_process_combo:
+                        continue
+                    if algo1_combo.currentText() == 'skip':
+                        post_process_combo.setCurrentText('skip')
+                        continue
+                    post_process_combo.setCurrentText(mode)
         
         def get_domain_configs(self):
             """Get domain algorithm configurations"""
@@ -9953,11 +10010,13 @@ if __name__ == "__main__":
                 domain_item = self.table.item(i, 0)
                 algo1_combo = self.table.cellWidget(i, 1)
                 algo2_combo = self.table.cellWidget(i, 2)
+                post_process_combo = self.table.cellWidget(i, 3)
                 
-                if domain_item and algo1_combo and algo2_combo:
+                if domain_item and algo1_combo and algo2_combo and post_process_combo:
                     domain = domain_item.text()
                     algo1 = algo1_combo.currentText()
                     algo2 = algo2_combo.currentText()
+                    post_process = _normalize_domain_post_process_mode(post_process_combo.currentText())
                     
                     config = {}
                     
@@ -9970,6 +10029,9 @@ if __name__ == "__main__":
                     # Second Pass
                     if algo2 != 'skip':
                         config['second_pass_algorithm'] = algo2
+
+                    if algo1 != 'skip' and post_process != 'skip':
+                        config['post_process'] = post_process
                     
                     if config:
                         configs[domain] = config
@@ -9982,8 +10044,9 @@ if __name__ == "__main__":
                 domain_item = self.table.item(i, 0)
                 algo1_combo = self.table.cellWidget(i, 1)
                 algo2_combo = self.table.cellWidget(i, 2)
+                post_process_combo = self.table.cellWidget(i, 3)
                 
-                if domain_item and algo1_combo and algo2_combo:
+                if domain_item and algo1_combo and algo2_combo and post_process_combo:
                     domain = domain_item.text()
                     if domain in configs:
                         config = configs[domain]
@@ -9993,12 +10056,21 @@ if __name__ == "__main__":
                             algo1_combo.setCurrentText('skip')
                         elif 'algorithm' in config:
                             algo1_combo.setCurrentText(config['algorithm'])
+                        else:
+                            algo1_combo.setCurrentText('(use default)')
                         
                         # Set Second Pass
                         if 'second_pass_algorithm' in config:
                             algo2_combo.setCurrentText(config['second_pass_algorithm'])
                         else:
                             algo2_combo.setCurrentText('skip')
+                        post_process_combo.setCurrentText(_normalize_domain_post_process_mode(config.get('post_process', 'skip')))
+                    else:
+                        algo1_combo.setCurrentText('(use default)')
+                        algo2_combo.setCurrentText('skip')
+                        post_process_combo.setCurrentText('skip')
+
+                    self.on_first_pass_changed(i, algo1_combo.currentText())
 
         def accept(self):
             super().accept()
@@ -10283,6 +10355,7 @@ if __name__ == "__main__":
             self._viewer_process_timer.start()
             self.taichi_block_render_mode_default = 'mesh'
             self.taichi_transparent_blocks_default = False
+            self._legacy_fill_unvisited_domainwise = False
             self.setWindowTitle("Anterpolator 3D Viewer Configuration")
             self.resize(1120, 680)
             
@@ -11773,6 +11846,9 @@ if __name__ == "__main__":
             self.avoid_visited_threshold = QtWidgets.QSpinBox(); self.avoid_visited_threshold.setRange(1, 10_000_000); self.avoid_visited_threshold.setValue(100)
             self.avoid_visited_threshold.setToolTip('Maximum number of visits allowed per block before ants start avoiding it.\nRequires "Avoid Visited" to be checked.')
 
+            self.average_with_blocks = QtWidgets.QCheckBox(); self.average_with_blocks.setChecked(True)
+            self.average_with_blocks.setToolTip('Ant Colony only. When an ant revisits a non-sample block that already has a value, the new neighbor-based estimate is averaged 50/50 with the block\'s current value instead of replacing it outright. This smooths repeated updates and reduces oscillation.')
+
             ant_form.addRow('Range Size', self.range_size)
             ant_form.addRow('Max Pheromone', self.max_pheromone)
             ant_form.addRow('Ants per Sample', self.ants_per_sample)
@@ -11784,6 +11860,7 @@ if __name__ == "__main__":
             ant_form.addRow('Value Filter', self.value_filter)
             ant_form.addRow('Avoid Heavily-Visited', self.avoid_visited_enabled)
             ant_form.addRow('Visited Threshold', self.avoid_visited_threshold)
+            ant_form.addRow('Average With Blocks', self.average_with_blocks)
 
             # Ant Colony domain interpolation toggle
             self.ant_interpolate_target = QtWidgets.QComboBox(); self.ant_interpolate_target.addItems(['Value', 'Domain'])
@@ -11977,9 +12054,7 @@ if __name__ == "__main__":
             st_form.addRow('Min Dip Freq (%)', self.st_min_dip_freq)
 
             # === ADVANCED TAB ===
-            self.average_with_blocks = QtWidgets.QCheckBox(); self.average_with_blocks.setChecked(True)
             self.verbose = QtWidgets.QCheckBox(); self.verbose.setChecked(False)
-            self.fill_unvisited_domainwise = QtWidgets.QCheckBox(); self.fill_unvisited_domainwise.setChecked(False)
             self.process_domains_sequentially = QtWidgets.QCheckBox(); self.process_domains_sequentially.setChecked(True)
             self.expand_interpolation_exports_to_subblocks = QtWidgets.QCheckBox(); self.expand_interpolation_exports_to_subblocks.setChecked(True)
             self.expand_interpolation_exports_to_subblocks.setToolTip('If checked, interpolation CSV exports reuse the original blocks file rows and assign each sub-block the interpolated value of its parent base block. Interpolation still runs on the base-block grid.')
@@ -12023,8 +12098,6 @@ if __name__ == "__main__":
             self.domain_mapping_btn.clicked.connect(self.open_domain_mapping)
             advanced_form.addRow('Domain-Specific Algorithms', self.domain_mapping_btn)
 
-            advanced_form.addRow('Average With Blocks', self.average_with_blocks)
-            advanced_form.addRow('Fill Unvisited (Domain-wise)', self.fill_unvisited_domainwise)
             advanced_form.addRow('Process Domains Sequentially', self.process_domains_sequentially)
             advanced_form.addRow('Expand CSV Export to Sub-Blocks', self.expand_interpolation_exports_to_subblocks)
             advanced_form.addRow('Blank Sample Domains', self.blank_sample_domain_behavior)
@@ -12330,7 +12403,6 @@ if __name__ == "__main__":
                     'min_dip_freq': self.st_min_dip_freq.value()
                 },
                 'average_with_blocks': self.average_with_blocks.isChecked(),
-                'fill_unvisited_domainwise': self.fill_unvisited_domainwise.isChecked(),
                 'process_domains_sequentially': self.process_domains_sequentially.isChecked(),
                 'expand_interpolation_exports_to_subblocks': self.expand_interpolation_exports_to_subblocks.isChecked(),
                 'blank_sample_domain_behavior': 'infer_from_blocks' if self.blank_sample_domain_behavior.currentText() == 'Infer From Blocks' else 'skip',
@@ -12620,7 +12692,6 @@ if __name__ == "__main__":
                 # If old params exist but new ones don't, we could try to map them, but they are different concepts.
                 # We'll just ignore them for now.
                 if 'average_with_blocks' in config: self.average_with_blocks.setChecked(config['average_with_blocks'])
-                if 'fill_unvisited_domainwise' in config: self.fill_unvisited_domainwise.setChecked(config['fill_unvisited_domainwise'])
                 if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
                 self.expand_interpolation_exports_to_subblocks.setChecked(bool(config.get('expand_interpolation_exports_to_subblocks', True)))
                 if 'blank_sample_domain_behavior' in config:
@@ -12629,7 +12700,21 @@ if __name__ == "__main__":
                 if 'verbose' in config: self.verbose.setChecked(config['verbose'])
                 if 'viewer_backend' in config: self.viewer_backend = _normalize_viewer_backend(config['viewer_backend'])
                 if 'taichi_sample_diameter' in config: self.taichi_sample_diameter.setValue(config['taichi_sample_diameter'])
-                if 'domain_algorithm_overrides' in config: self.domain_overrides = config['domain_algorithm_overrides']
+                self._legacy_fill_unvisited_domainwise = bool(config.get('fill_unvisited_domainwise', False))
+                if 'domain_algorithm_overrides' in config:
+                    self.domain_overrides = {
+                        str(domain): dict(settings)
+                        for domain, settings in (config['domain_algorithm_overrides'] or {}).items()
+                    }
+                    if self._legacy_fill_unvisited_domainwise:
+                        for settings in self.domain_overrides.values():
+                            if not settings.get('skip', False):
+                                settings.setdefault('post_process', 'fill_with_average')
+                count = len(self.domain_overrides)
+                if count > 0:
+                    self.domain_mapping_btn.setText(f'Configure Domain Algorithms... ({count} configured)')
+                else:
+                    self.domain_mapping_btn.setText('Configure Domain Algorithms...')
             finally:
                 self._suspend_auto_viewer_refresh = False
         def save_config(self):
@@ -12734,10 +12819,25 @@ if __name__ == "__main__":
             
             # Load existing configuration
             if self.domain_overrides:
-                dialog.set_domain_configs(self.domain_overrides)
+                dialog_configs = {
+                    str(domain): dict(settings)
+                    for domain, settings in self.domain_overrides.items()
+                }
+                if self._legacy_fill_unvisited_domainwise:
+                    for domain in domains:
+                        settings = dialog_configs.setdefault(domain, {})
+                        if not settings.get('skip', False):
+                            settings.setdefault('post_process', 'fill_with_average')
+                dialog.set_domain_configs(dialog_configs)
+            elif self._legacy_fill_unvisited_domainwise:
+                dialog.set_domain_configs({
+                    domain: {'post_process': 'fill_with_average'}
+                    for domain in domains
+                })
             
             if dialog.exec_() == QtWidgets.QDialog.Accepted:
                 self.domain_overrides = dialog.get_domain_configs()
+                self._legacy_fill_unvisited_domainwise = False
                 count = len(self.domain_overrides)
                 if count > 0:
                     self.domain_mapping_btn.setText(f'Configure Domain Algorithms... ({count} configured)')
@@ -15156,6 +15256,8 @@ if __name__ == "__main__":
                         if hasattr(interp1, 'generate_statistics'):
                             interp1.generate_statistics(output_dir, domain_name=f"{domain}_Pass1")
 
+                        last_interp = interp1
+
                         # --- Pass 2 ---
                         if len(interpolator_list) > 1:
                             interp2 = interpolator_list[1]
@@ -15199,9 +15301,14 @@ if __name__ == "__main__":
                             output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
                             if hasattr(interp2, 'generate_statistics'):
                                 interp2.generate_statistics(output_dir, domain_name=f"{domain}_Pass2")
+                            last_interp = interp2
+
+                        post_process_mode = _get_domain_post_process_mode(cfg, domain)
+                        created, assigned = _run_domain_post_process(last_interp, dims, post_process_mode, domain_label=domain)
+                        if created or assigned:
+                            print(f"Applied post-process for {domain}: created={created}, assigned={assigned}")
             
                         # Print domain summary (of the last pass)
-                        last_interp = interpolator_list[-1]
                         metadata = last_interp.get_metadata()
                         print(f"\n=== Domain {domain} Summary ===")
                         for key, value in metadata.items():
