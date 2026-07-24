@@ -26,6 +26,15 @@ import json
 from PyQt5 import QtWidgets, QtCore
 sys.path.append("C:/Projects/Anterpolator")
 
+from provenance_utils import (
+    copy_interpolator_provenance,
+    finalize_phase_provenance,
+    get_export_provenance,
+    normalize_provenance_algorithm_name,
+    seed_original_sample_provenance,
+    snapshot_interpolator_state,
+)
+
 pv = None
 taichi_runtime_module = None
 bmf_tools_module = None
@@ -8468,18 +8477,7 @@ def export_block_evaluated_samples_to_csv(blocks, filepath):
     print(f"Exported {len(data)} evaluated samples to {filepath} ({matched_count} matched to final blocks)")
 
 def _normalize_export_algorithm_name(algo_name):
-    name = str(algo_name or '').strip().lower()
-    if 'ant colony' in name:
-        return 'Anterpolator', 'ant_colony'
-    if 'adaptive octree' in name:
-        return 'Adaptive Octree', 'adaptive_octree'
-    if 'string theory' in name:
-        return 'String Theory', 'string_theory'
-    if 'molecular clock' in name or 'phylogeographic' in name or 'biochemical clock' in name:
-        return 'Molecular Clock', 'molecular_clock'
-    if 'gaussian kernel' in name:
-        return 'Gaussian Kernel', 'gaussian_kernel'
-    return 'Unknown', 'unknown'
+    return normalize_provenance_algorithm_name(algo_name)
 
 
 def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data, rotation_matrix=None, rotation_center=None, domain_mapping=None, original_samples=None, pass_count=1, forced_domain=None, first_pass_algorithm_name=None, final_algorithm_name=None):
@@ -8507,32 +8505,36 @@ def _add_interpolator_blocks_to_data(interpolator, min_bounds, block_size, data,
             # P_orig = P_aligned @ R + Center
             centroid = centroid @ rotation_matrix + rotation_center
         
-        # Determine Source
-        source = "Unknown"
-        is_sample = False
-        if hasattr(block, 'is_sample'): is_sample = block.is_sample
-        elif isinstance(block, dict): is_sample = block.get('is_sample', False)
-        
-        if is_sample:
-            if original_samples is None or pos in original_samples:
-                source = "Original Sample"
-                algorithm_label = "Sample"
-                algo_type = "sample"
-            else:
-                # It's a sample in this pass, but not in original -> Must be from previous pass
-                source = "First Pass"
-                algorithm_label = first_pass_algorithm_label
-                algo_type = first_pass_algo_type
+        # Determine Source / Algorithm provenance.
+        export_provenance = get_export_provenance(interpolator, pos)
+        if export_provenance is not None:
+            source, algorithm_label, algo_type = export_provenance
         else:
-            # It's an interpolated block in this pass
-            if pass_count == 1:
-                source = "First Pass"
-                algorithm_label = final_algorithm_label
-                algo_type = final_algo_type
+            source = "Unknown"
+            is_sample = False
+            if hasattr(block, 'is_sample'): is_sample = block.is_sample
+            elif isinstance(block, dict): is_sample = block.get('is_sample', False)
+            
+            if is_sample:
+                if original_samples is None or pos in original_samples:
+                    source = "Original Sample"
+                    algorithm_label = "Sample"
+                    algo_type = "sample"
+                else:
+                    # It's a sample in this pass, but not in original -> Must be from previous pass
+                    source = "First Pass"
+                    algorithm_label = first_pass_algorithm_label
+                    algo_type = first_pass_algo_type
             else:
-                source = "Second Pass"
-                algorithm_label = final_algorithm_label
-                algo_type = final_algo_type
+                # It's an interpolated block in this pass
+                if pass_count == 1:
+                    source = "First Pass"
+                    algorithm_label = final_algorithm_label
+                    algo_type = final_algo_type
+                else:
+                    source = "Second Pass"
+                    algorithm_label = final_algorithm_label
+                    algo_type = final_algo_type
 
         # Initialize common fields with None/NaN for all possible columns
         row = {
@@ -8789,6 +8791,8 @@ def silent_interpolation(plotter, iterations, interpolation_file):
             interp1 = interpolator_list[0]
             algo_name1 = interp1.get_algorithm_name()
             print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 1 ({algo_name1}) ===")
+            seed_original_sample_provenance(interp1)
+            pass1_snapshot = snapshot_interpolator_state(interp1)
             
             # Force verbose for first iteration if it's an AntColony
             if hasattr(interp1, 'verbose'):
@@ -8807,6 +8811,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
             output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
             if hasattr(interp1, 'generate_statistics'):
                 interp1.generate_statistics(output_dir, domain_name=f"{domain}_Pass1")
+            finalize_phase_provenance(interp1, 'First Pass', algo_name1, pass1_snapshot)
 
             last_interp = interp1
 
@@ -8919,6 +8924,8 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                          use_domain_mapping=use_mapping,
                          sample_domain_mapping=pass1_domain_mapping,
                      )
+                     copy_interpolator_provenance(interp1, interp2)
+                     pass2_snapshot = snapshot_interpolator_state(interp2)
                      
                      if hasattr(interp2, 'create_ants'):
                          interp2.create_ants()
@@ -8935,6 +8942,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                          f"Domain {domain} - Pass 2",
                          on_first_iteration=(lambda interp=interp2, verbose=original_verbose: setattr(interp, 'verbose', verbose)) if hasattr(interp2, 'verbose') else None,
                      )
+                     finalize_phase_provenance(interp2, 'Second Pass', algo_name2, pass2_snapshot)
                 
                 # Generate stats for Pass 2 if String Theory
                 output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
@@ -8943,8 +8951,10 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                 last_interp = interp2
 
             post_process_mode = _get_domain_post_process_mode(post_process_config, domain)
+            post_process_snapshot = snapshot_interpolator_state(last_interp)
             created, assigned = _run_domain_post_process(last_interp, dims, post_process_mode, domain_label=domain)
             if created or assigned:
+                finalize_phase_provenance(last_interp, 'Post-process', 'Fill with Average', post_process_snapshot)
                 print(f"Applied post-process for {domain}: created={created}, assigned={assigned}")
             
             # Print domain summary (of the last pass)
@@ -8956,12 +8966,15 @@ def silent_interpolation(plotter, iterations, interpolation_file):
         # Single interpolator
         interpolator = blocks._ant_colony
         algo_name = interpolator.get_algorithm_name()
+        seed_original_sample_provenance(interpolator)
+        first_pass_snapshot = snapshot_interpolator_state(interpolator)
         _run_interpolator_with_progress(
             interpolator,
             dims,
             iterations,
             f"Interpolation ({algo_name})",
         )
+        finalize_phase_provenance(interpolator, 'First Pass', algo_name, first_pass_snapshot)
         
         metadata = interpolator.get_metadata()
         print(f"\n=== Summary ===")
@@ -15243,6 +15256,8 @@ if __name__ == "__main__":
                         interp1 = interpolator_list[0]
                         algo_name1 = interp1.get_algorithm_name()
                         print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 1 ({algo_name1}) ===")
+                        seed_original_sample_provenance(interp1)
+                        pass1_snapshot = snapshot_interpolator_state(interp1)
 
                         _run_interpolator_with_progress(
                             interp1,
@@ -15250,6 +15265,7 @@ if __name__ == "__main__":
                             iterations,
                             f"Domain {domain} - Pass 1",
                         )
+                        finalize_phase_provenance(interp1, 'First Pass', algo_name1, pass1_snapshot)
                         
                         # Generate stats for Pass 1 if String Theory
                         output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
@@ -15286,6 +15302,8 @@ if __name__ == "__main__":
                                 use_domain_mapping=use_mapping,
                                 sample_domain_mapping=pass1_domain_mapping,
                             )
+                            copy_interpolator_provenance(interp1, interp2)
+                            pass2_snapshot = snapshot_interpolator_state(interp2)
                             
                             if hasattr(interp2, 'create_ants'):
                                 interp2.create_ants()
@@ -15296,6 +15314,7 @@ if __name__ == "__main__":
                                 iterations,
                                 f"Domain {domain} - Pass 2",
                             )
+                            finalize_phase_provenance(interp2, 'Second Pass', algo_name2, pass2_snapshot)
                             
                             # Generate stats for Pass 2 if String Theory
                             output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
@@ -15304,8 +15323,10 @@ if __name__ == "__main__":
                             last_interp = interp2
 
                         post_process_mode = _get_domain_post_process_mode(cfg, domain)
+                        post_process_snapshot = snapshot_interpolator_state(last_interp)
                         created, assigned = _run_domain_post_process(last_interp, dims, post_process_mode, domain_label=domain)
                         if created or assigned:
+                            finalize_phase_provenance(last_interp, 'Post-process', 'Fill with Average', post_process_snapshot)
                             print(f"Applied post-process for {domain}: created={created}, assigned={assigned}")
             
                         # Print domain summary (of the last pass)
@@ -15318,6 +15339,8 @@ if __name__ == "__main__":
                     # Single interpolator case
                     interpolator = blocks._ant_colony
                     algo_name = interpolator.get_algorithm_name()
+                    seed_original_sample_provenance(interpolator)
+                    first_pass_snapshot = snapshot_interpolator_state(interpolator)
 
                     _run_interpolator_with_progress(
                         interpolator,
@@ -15325,6 +15348,7 @@ if __name__ == "__main__":
                         iterations,
                         f"Interpolation ({algo_name})",
                     )
+                    finalize_phase_provenance(interpolator, 'First Pass', algo_name, first_pass_snapshot)
                     
                     metadata = interpolator.get_metadata()
                     print(f"\n=== Summary ===")

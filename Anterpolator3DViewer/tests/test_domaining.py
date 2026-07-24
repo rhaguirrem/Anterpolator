@@ -12,6 +12,8 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import anterpolator3DViewer as viewer_module
+from ant_colony import Block
+from provenance_utils import finalize_phase_provenance, seed_original_sample_provenance, snapshot_interpolator_state
 
 from anterpolator3DViewer import (
     _build_export_blocks_dataframe,
@@ -1738,6 +1740,77 @@ def test_build_export_blocks_dataframe_keeps_empty_interpolation_export_empty():
 
         assert output_df.empty
         assert list(output_df.columns) == []
+
+
+def test_collect_export_block_data_uses_cumulative_provenance_labels():
+    class FakeInterpolator:
+        def __init__(self):
+            self.interpolation_target = 'value'
+            self.blocks = {
+                (0, 0, 0): Block(
+                    value=10.0,
+                    is_sample=True,
+                    mark_class=15.0,
+                    block_id=1,
+                    pheromone=1000,
+                    visited=True,
+                    visit_count=1,
+                    ant_count=0,
+                    distance_to_sample=0,
+                    nearest_sample_value=10.0,
+                    domain='A',
+                ),
+                (1, 0, 0): Block(
+                    value=14.0,
+                    is_sample=False,
+                    mark_class=15.0,
+                    block_id=2,
+                    pheromone=0,
+                    visited=False,
+                    visit_count=0,
+                    ant_count=0,
+                    distance_to_sample=1,
+                    nearest_sample_value=10.0,
+                    domain='A',
+                ),
+            }
+
+        def get_algorithm_name(self):
+            return 'Ant Colony Optimization'
+
+    interp = FakeInterpolator()
+    seed_original_sample_provenance(interp)
+    first_pass_snapshot = snapshot_interpolator_state(interp)
+    interp.blocks[(1, 0, 0)].value = 12.0
+    finalize_phase_provenance(interp, 'First Pass', 'String Theory', first_pass_snapshot)
+    second_pass_snapshot = snapshot_interpolator_state(interp)
+    interp.blocks[(1, 0, 0)].value = 13.0
+    finalize_phase_provenance(interp, 'Second Pass', 'Ant Colony Optimization', second_pass_snapshot)
+    post_process_snapshot = snapshot_interpolator_state(interp)
+    interp.blocks[(1, 0, 0)].value = 14.0
+    finalize_phase_provenance(interp, 'Post-process', 'Fill with Average', post_process_snapshot)
+
+    class FakeBlocks:
+        pass
+
+    fake_blocks = FakeBlocks()
+    fake_blocks._ant_colony = interp
+    fake_blocks._block_info = {
+        'min_bounds': np.array([0.0, 0.0, 0.0]),
+        'block_size': np.array([10.0, 10.0, 10.0]),
+        'rotation_matrix': None,
+        'rotation_center': None,
+        'expand_interpolation_exports_to_subblocks': False,
+        'domain_mapping': {(0, 0, 0): 'A', (1, 0, 0): 'A'},
+    }
+
+    rows = viewer_module._collect_export_block_data(fake_blocks)
+    by_pos = {row['_Grid_Index']: row for row in rows}
+
+    assert by_pos[(0, 0, 0)]['Source'] == 'Original Sample'
+    assert by_pos[(0, 0, 0)]['Algorithm'] == 'Sample'
+    assert by_pos[(1, 0, 0)]['Source'] == 'First Pass + Second Pass + Post-process'
+    assert by_pos[(1, 0, 0)]['Algorithm'] == 'String Theory + Anterpolator + Fill with Average'
 
 
 def test_export_blocks_to_csv_streams_large_subblock_expansion(monkeypatch):

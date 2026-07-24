@@ -10,6 +10,13 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
 
+from provenance_utils import (
+    copy_interpolator_provenance,
+    finalize_phase_provenance,
+    seed_original_sample_provenance,
+    snapshot_interpolator_state,
+)
+
 try:
     from pynput import mouse as pynput_mouse
 except Exception:
@@ -490,6 +497,8 @@ class TaichiInterpolationViewer:
         self._interpolation_total_phases = 0
         self._interpolation_completed_phases = 0
         self._interpolation_complete = False
+        self._phase_provenance_snapshot = None
+        self._phase_provenance_interp = None
 
         self.sample_fields = (None, None)
         self.block_fields = (None, None)
@@ -1197,6 +1206,8 @@ class TaichiInterpolationViewer:
         self._interpolation_total_phases = sum(len(group['passes']) for group in self._interpolation_groups)
         self._interpolation_completed_phases = 0
         self._interpolation_complete = self._interpolation_total_phases == 0
+        self._phase_provenance_snapshot = None
+        self._phase_provenance_interp = None
 
     def _current_interpolation_group(self):
         while self._interpolation_domain_index < len(self._interpolation_groups):
@@ -1291,6 +1302,7 @@ class TaichiInterpolationViewer:
         pass_values = completed_interp.get_interpolated_values()
         use_mapping = bool(getattr(next_interp, 'allowed_grid_override', None) is not None)
         next_interp.initialize_blocks(pass_values, dims, min_bounds, block_size, use_domain_mapping=use_mapping)
+        copy_interpolator_provenance(completed_interp, next_interp)
         if hasattr(next_interp, 'create_ants'):
             next_interp.create_ants()
 
@@ -1836,18 +1848,30 @@ class TaichiInterpolationViewer:
             interp,
         )
 
+        if self._interpolation_pass_iteration == 0 or self._phase_provenance_interp is not interp:
+            if self._interpolation_pass_index == 0:
+                seed_original_sample_provenance(interp)
+            self._phase_provenance_snapshot = snapshot_interpolator_state(interp)
+            self._phase_provenance_interp = interp
+
         changed, should_continue, converged = self._run_single_interpolator_iteration(interp, dims)
         self._interpolation_pass_iteration += 1
         phase_iteration = self._interpolation_pass_iteration
         phase_finished = (not should_continue) or converged or (phase_iteration >= target_iterations)
         next_phase_label = None
         if phase_finished:
+            phase_source = 'First Pass' if self._interpolation_pass_index == 0 else 'Second Pass'
+            finalize_phase_provenance(interp, phase_source, interp.get_algorithm_name(), self._phase_provenance_snapshot)
             is_last_pass_in_domain = (self._interpolation_pass_index + 1) >= len(group['passes'])
             if is_last_pass_in_domain:
+                post_process_snapshot = snapshot_interpolator_state(interp)
                 created, assigned = self._run_domain_post_process(group['domain'], interp, dims)
                 if created or assigned:
+                    finalize_phase_provenance(interp, 'Post-process', 'Fill with Average', post_process_snapshot)
                     changed = True
             next_phase_label = self._advance_interpolation_phase(interp)
+            self._phase_provenance_snapshot = None
+            self._phase_provenance_interp = None
 
         return {
             'changed': changed,
