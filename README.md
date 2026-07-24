@@ -63,7 +63,6 @@ Beyond interpolation, Anterpolator includes a dedicated operations workflow for 
 ## Project Structure
 
 - **Anterpolator3DViewer/**: Core Python application and viewer, including the main GUI, interpolation engines, and BMF export backend.
-- **Ant Hill/**: Legacy/Alternative implementations and data.
 - **utils/**: Utility scripts (e.g., backup management).
 - **DOCS/**: Documentation.
 
