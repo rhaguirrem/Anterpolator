@@ -14471,6 +14471,11 @@ if __name__ == "__main__":
                 self.block_model_transfer_output_edit.setText(output_file)
 
                 def handle_success(result):
+                    max_nearest_distance = result.get('max_nearest_distance')
+                    if max_nearest_distance in (None, ''):
+                        nearest_distance_display = 'Unlimited'
+                    else:
+                        nearest_distance_display = f"{max_nearest_distance:g} m"
                     QtWidgets.QMessageBox.information(
                         self,
                         'Success',
@@ -14481,7 +14486,7 @@ if __name__ == "__main__":
                             f"Overlap matches: {result['overlap_matched_blocks']:,}\n"
                             f"Nearest fallback matches: {result['nearest_matched_blocks']:,}\n"
                             f"Unmatched blocks: {result['unmatched_blocks']:,}\n"
-                            f"Nearest max distance: {'Unlimited' if result.get('max_nearest_distance') in (None, '') else f'{result['max_nearest_distance']:g} m'}"
+                            f"Nearest max distance: {nearest_distance_display}"
                         ),
                     )
 
