@@ -98,8 +98,7 @@ class AntColonyInterpolator(InterpolatorBase):
         return round(mark_class, decimals)
 
     def initialize_blocks(self, sample_blocks: Dict[Tuple[int, int, int], float], dims: Tuple[int, int, int], min_bounds, block_size, use_domain_mapping: bool = False, **kwargs):
-        print(f"Total volume: {dims[0]*dims[1]*dims[2]} blocks")
-        print(f"Initializing {len(sample_blocks)} sample blocks...")
+        block_model_volume = dims[0] * dims[1] * dims[2]
         self.dims = dims
 
         sample_domain_mapping: Dict[Tuple[int, int, int], str] = kwargs.get('sample_domain_mapping', None) or {}
@@ -111,6 +110,13 @@ class AntColonyInterpolator(InterpolatorBase):
                 self.allowed_positions = set(sample_blocks.keys())
         else:
             self.allowed_positions = {(i, j, k) for i in range(dims[0]) for j in range(dims[1]) for k in range(dims[2])}
+        interpolation_volume = len(self.allowed_positions)
+        if interpolation_volume != block_model_volume:
+            print(f"Block model volume: {block_model_volume} blocks")
+            print(f"Domain volume: {interpolation_volume} blocks")
+        else:
+            print(f"Total volume: {block_model_volume} blocks")
+        print(f"Initializing {len(sample_blocks)} sample blocks...")
         # Build domain totals for early stopping
         self.domain_totals.clear(); self.domain_created_counts.clear(); self.domain_heavy_counts.clear(); self.domains_frozen.clear()
         if use_domain_mapping and hasattr(self, 'domain_mapping'):

@@ -2779,6 +2779,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 # Filter allowed_grid to this domain only
                 domain_allowed_grid = {pos for pos in allowed_grid if domain_mapping.get(pos) == domain}
                 domain_sample_mapping = {pos: domain for pos in domain_samples}
+                print(f"  Domain '{domain}' volume: {len(domain_allowed_grid)} blocks")
                 
                 # Check if we have any non-sample blocks in this domain (sparse vs dense definition)
                 # If the allowed grid is just the samples, we shouldn't enforce it as a constraint.
