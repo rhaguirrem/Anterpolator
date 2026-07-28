@@ -8956,6 +8956,18 @@ def _get_interpolator_run_profile(interpolator, dims, iterations):
             'unit': 'pos',
         }
 
+    if algo_name == 'String Theory':
+        sample_count = len(getattr(interpolator, 'sorted_samples', []) or [])
+        if sample_count == 0:
+            sample_count = len(getattr(interpolator, 'sample_locations', set()) or set())
+        return {
+            'single_pass': True,
+            'message': f"Running {algo_name} single pass over {sample_count:,} samples...",
+            'desc_suffix': 'sample scan',
+            'total': max(int(sample_count), 1),
+            'unit': 'sample',
+        }
+
     return {
         'single_pass': False,
         'message': (

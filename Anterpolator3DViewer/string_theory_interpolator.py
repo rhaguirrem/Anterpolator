@@ -47,6 +47,8 @@ class StringTheoryInterpolator(InterpolatorBase):
         self.kdtree: cKDTree = None
         self.current_index = 0
         self.sample_locations: Set[Tuple[int, int, int]] = set()
+        self.progress_callback = None
+        self._interpolated_block_count = 0
         
         # Statistics
         self.stats = {
@@ -136,12 +138,19 @@ class StringTheoryInterpolator(InterpolatorBase):
             self.kdtree = cKDTree(coords)
         
         self.current_index = 0
+        self._interpolated_block_count = sum(1 for block in self.blocks.values() if not block.get('is_sample'))
         if self.verbose:
             print(f"Initialized StringTheory with {len(self.sorted_samples)} samples.")
             if self.interpolation_target == 'domain':
                 print(f"Distance Threshold: {self.distance_threshold} (domain mode)")
             else:
                 print(f"Distance Threshold: {self.distance_threshold}, Grade Diff: {self.grade_difference}")
+
+    def _emit_progress(self, processed_samples: int, total_samples: int):
+        callback = getattr(self, 'progress_callback', None)
+        if callback is None:
+            return
+        callback(processed_samples, total_samples, self._interpolated_block_count)
 
     def _bresenham_3d(self, p1: Tuple[int, int, int], p2: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
         """
@@ -345,10 +354,16 @@ class StringTheoryInterpolator(InterpolatorBase):
                     # Fill blocks if NOT filtering by frequency (otherwise we do it later)
                     if not self.filter_by_frequency:
                         self._fill_path_blocks(s1_p, s1_v, s2_p, s2_v, pts)
+
+            if processed_count == 1 or processed_count == total_samples or processed_count % 100 == 0:
+                self._emit_progress(processed_count, total_samples)
         
         # Apply filtering if enabled
         if self.filter_by_frequency:
             self._filter_and_fill_paths()
+
+        self._interpolated_block_count = sum(1 for block in self.blocks.values() if not block.get('is_sample'))
+        self._emit_progress(total_samples, total_samples)
         
         print(f"String Theory: Finished processing {total_samples} samples.        ")
         print("String Theory Stats:")
@@ -434,8 +449,14 @@ class StringTheoryInterpolator(InterpolatorBase):
                     if not self.filter_by_frequency:
                         self._fill_path_blocks_domain(domain, pts)
 
+            if processed_count == 1 or processed_count == total_samples or processed_count % 100 == 0:
+                self._emit_progress(processed_count, total_samples)
+
         if self.filter_by_frequency:
             self._filter_and_fill_paths_domain()
+
+        self._interpolated_block_count = sum(1 for block in self.blocks.values() if not block.get('is_sample'))
+        self._emit_progress(total_samples, total_samples)
 
         if self.verbose:
             print(f"String Theory: Finished processing {total_samples} samples (domain mode).")
@@ -449,7 +470,9 @@ class StringTheoryInterpolator(InterpolatorBase):
         return {pos: b['value'] for pos, b in self.blocks.items()}
     
     def get_metadata(self) -> Dict[str, Any]:
-        return self.stats
+        metadata = dict(self.stats)
+        metadata['interpolated_blocks'] = int(self._interpolated_block_count)
+        return metadata
 
     def _collect_sample_connection_rows(self) -> List[Tuple[Tuple[int, int, int], float, int]]:
         connection_counts = {
@@ -731,6 +754,7 @@ class StringTheoryInterpolator(InterpolatorBase):
                     self.blocks[pt]['count'] = count + 1
             else:
                 self.blocks[pt] = {'value': val, 'is_sample': False, 'count': 1}
+                self._interpolated_block_count += 1
 
     def _fill_path_blocks_domain(self, domain: str, points_to_fill: List[Tuple[int, int, int]]):
         domain = str(domain).strip()
@@ -744,6 +768,7 @@ class StringTheoryInterpolator(InterpolatorBase):
                 if getattr(self, 'domain_mapping', None) is None:
                     self.domain_mapping = {}
                 self.domain_mapping[pt] = domain
+                self._interpolated_block_count += 1
                 continue
 
             existing_domain = existing.get('domain')
