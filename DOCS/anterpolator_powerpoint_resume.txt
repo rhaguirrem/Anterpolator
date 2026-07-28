@@ -1,0 +1,279 @@
+ANTERPOLATOR POWERPOINT RESUME
+Source deck: Anterpolator.pptx
+Topic: Estimation of spatial values based on Ant Colony Optimization (ACO)
+Author: Roberto Aguirre Maturana, Geologist, Universidad de Chile
+
+PURPOSE OF THE PRESENTATION
+The presentation documents the development and testing of “Anterpolator”, a numeric spatial interpolator that estimates values in a 3D grid using an Ant Colony Optimization-inspired process. The slides compare how different movement rules, value-assignment rules, background-value handling, distance/visit decay parameters, domain constraints, and weighting methods affect the spatial continuity, conservativeness, extension, and coverage of the resulting interpolation.
+
+CORE METHOD
+1. Input data are samples with known X/Y/Z coordinates and values.
+2. The sample volume is divided into a regular 3D grid with user-defined cell size.
+3. Each grid cell can have up to 26 neighboring cells.
+4. Cells containing samples receive the average sample value of the samples inside the cell.
+5. Cells without samples initially have no assigned value unless a background-value option is activated.
+6. A user-defined number of ants is generated.
+7. Each ant starts randomly in a sampled cell.
+8. At each step, the ant predicts the value of its current cell from neighboring-cell values, usually as a weighted average.
+9. The predicted value is assigned to the current cell unless it is a sample cell.
+10. If the current cell already has a value, the new prediction may replace it or be averaged with the current value using a user-defined cell weight.
+11. If the current cell has no value, the prediction may replace it or be averaged with a user-defined background value.
+12. The ant then moves to a neighboring cell. Priority rules favor unvisited cells, cells without samples, or cells whose value is close to the current cell according to a tolerance/class-size threshold. If no priority cell is available, movement is random.
+
+MAIN PARAMETERS DISCUSSED
+- Cell size: controls the grid resolution.
+- Number of ants: controls the number of simultaneous paths exploring/interpolating the grid.
+- Iterations: controls how long ants walk through the grid.
+- Class size and tolerance: define whether two cell values are considered similar enough for priority movement.
+- Cell weight: controls how much existing cell value is retained when averaging with a new prediction.
+- Background value: usually 0 in the tests; used to make interpolation more conservative away from samples.
+- Background value for None cells / Value for None cells: controls whether empty/unvisited cells are treated as background during prediction or assignment.
+- Decay rate: controls how rapidly influence changes with distance or value difference.
+- Visit decay lambda: alternative decay based on number of visits instead of distance to samples.
+- Sample distance range: limits or prioritizes ant movement around sampled cells.
+- Domain average distance / Background distance: controls domain-limited estimation and background behavior.
+- Weight method: different ways to weight neighbor cells, including greater_sample, greater_value, nearest_sample, and weights based on difference to the closest sample.
+- Fill unvisited cells with neighbors average: optional post-processing to estimate cells never visited by ants.
+
+SLIDE-BY-SLIDE SUMMARY
+
+Slide 1 - Title
+Introduces Anterpolator as a method for estimating spatial values using Ant Colony Optimization.
+
+Slide 2 - Algorithm concept
+Explains the basic workflow: samples are loaded into a 3D grid, ants start from sampled cells, each ant predicts values from neighbor cells, predictions are assigned to cells, and ants move according to priority rules. This slide is the conceptual specification of the algorithm.
+
+Slide 3 - Baseline early result before revised priority rule
+Dataset: 27,414 samples, 10x10x10 cells, 870,348 total cells, 6,119 sampled cells, 10,000 ants, 1,000 iterations, cell weight 0.5, no background for None cells. Coverage: 848,558 cells visited, 97.50%.
+Result: High coverage, but produced an isolated drillhole section in the center. This was before adding the rule that first-priority neighbor cells should exclude sampled cells.
+
+Slide 4 - Priority rule excluding sampled cells
+Same grid and dataset, but 5,000 ants. Coverage: 809,246 cells visited, 92.98%.
+Result: After excluding sampled cells from first-priority movement, isograde continuity increased.
+
+Slide 5 - Visit decay lambda = 8
+Same as Slide 4, with visit decay lambda 8. Coverage: 808,125 cells visited, 92.85%.
+Result: Similar coverage to Slide 4. Tests visit-based decay as an additional control.
+
+Slide 6 - Higher cell weight = 0.75
+Same as Slide 4 but cell weight 0.75. Coverage: 801,554 cells visited, 92.10%.
+Result: Increasing the weight retained from the previous/current cell value slightly reduced visited-cell coverage and changed smoothing behavior.
+
+Slide 7 - Higher cell weight = 0.9
+Same as Slide 4 but cell weight 0.9. Coverage: 804,983 cells visited, 92.49%.
+Result: High cell weight preserves existing cell values more strongly. Continuity remains improved compared with the earlier pre-priority-rule result.
+
+Slide 8 - Smaller class size = 1, decay rate = 64
+Class size reduced from 5 to 1, tolerance 1, decay rate 64. Coverage: 836,803 cells visited, 96.15%.
+Result: Smaller class size restricts which neighbor cells count as similar/priority because the similarity threshold is class size multiplied by tolerance. This produces a more selective movement rule while still giving high coverage.
+
+Slide 9 - Dynamic/distance-based cell weight, decay rate = 1024
+Class size 1, cell weight None, decay rate 1024. Coverage: 828,246 cells visited, 95.16%.
+Result: The slide introduces a formula where the new cell value is a weighted average of predicted value and current value, with predicted weight depending on distance to the nearest sample:
+New value = pw * predicted + (1 - pw) * current.
+
+Slide 10 - Visit decay lambda = 4
+Cell weight 0.9, visit decay lambda 4. Coverage: 797,095 cells visited, 91.58%.
+Result: Visit decay lambda is intended to control how fast interpolated values converge to background away from samples using visit count instead of sample distance.
+
+Slide 11 - Visit decay lambda = 8
+Cell weight 0.9, visit decay lambda 8. Coverage: 818,279 cells visited, 94.02%.
+Result: Visit decay lambda did not provide enough continuity near close samples, even when high values excessively extended interpolation far from samples. This suggests visit count alone is not a good substitute for spatial/sample-distance control.
+
+Slide 12 - Distance decay rate = 0.1
+Cell weight 0.5, decay rate 0.1. Coverage: 792,945 cells visited, 91.11%.
+Result: Decay rate controls how distance to samples affects convergence toward the background value.
+
+Slide 13 - Distance decay rate = 2
+Same as Slide 12 but decay rate 2. Coverage: 800,446 cells visited, 91.97%.
+Result: A stronger decay rate changes how rapidly estimates fade toward background away from samples.
+
+Slide 14 - Duplicate of decay rate = 2 test
+Same parameters and result as Slide 13: 800,446 cells visited, 91.97%.
+Result: Appears to duplicate Slide 13.
+
+Slide 15 - Background value for None cells = True, cell weight = 0.5
+Coverage: 786,610 cells visited, 90.38%.
+Result: Assuming background value for blank first-visited cells makes interpolation very conservative.
+
+Slide 16 - Background for None cells True, cell weight = 0.3
+Coverage: 785,662 cells visited, 90.27%.
+Result: Lowering the cell weight begins reducing the conservativeness introduced by background-value averaging.
+
+Slide 17 - Background for None cells True, cell weight = 0.1
+Coverage: 795,747 cells visited, 91.43%.
+Result: Reducing cell weight makes the interpolation less conservative even when blank cells are initialized/averaged with the background value.
+
+Slide 18 - Background for None cells True, cell weight = 0.01
+Coverage: 795,975 cells visited, 91.45%.
+Result: Very low cell weight further minimizes the damping effect of the background value.
+
+Slide 19 - Background for None cells True, cell weight = 0
+Coverage: 803,787 cells visited, 92.35%.
+Result: A cell weight of 0 behaves essentially like not using the existing cell value during interpolation.
+
+Slide 20 - Neighbor prediction weighted by distance to nearest sample, cell weight = 0.5
+Class size 1, decay rate 10. Coverage: 841,662 cells visited, 96.70%.
+Result: Neighbor-cell values are weighted using distance to the nearest sample during prediction. This produced high coverage.
+
+Slide 21 - Same as Slide 20, cell weight = 0.25
+Coverage: 838,289 cells visited, 96.32%.
+Result: Slightly lower cell weight maintained high coverage and changed the balance between new predictions and existing cell values.
+
+Slide 22 - Sample distance range as only first-priority parameter
+Sample distance range 10, no decay rate, cell weight 0.5. Coverage: 458,630 cells visited, 52.70%.
+Result: When sample distance range is the only first-priority rule, ants remain closer to sampled cells and coverage drops strongly. This parameter can restrict interpolation extent around sample support.
+
+Slide 23 - Sample distance range 5, probability of including cell value = 1
+Background for None cells True. Coverage: 784,204 cells visited, 90.10%.
+Result: Tests adding cell value during prediction with a local sample-distance range and conservative background handling.
+
+Slide 24 - Sample distance range 5, 500 iterations, no current-cell inclusion
+Background for None cells False. Coverage: 804,652 cells visited, 92.45%.
+Result: Removing current-cell value from prediction and not using background for None cells produces broad coverage with fewer iterations.
+
+Slide 25 - Sample distance range 5, 1,000 iterations, background for None cells True
+Coverage: 800,534 cells visited, 91.98%.
+Result: Turning background for None cells back on slightly reduces conservativeness/coverage relative to comparable non-background cases, while still keeping broad coverage.
+
+Slide 26 - Closest-sample value registered for each visited cell
+200 iterations, background for None cells False. Coverage: 632,218 cells visited, 72.64%.
+Result: Each visited cell stores its closest sample, and this closest-sample value is used for weight calculation during prediction. Neighbor cells with values closer to the last visited cell receive greater weight in the interpolation.
+
+Slide 27 - Sample distance range controls anomaly extension and fills unvisited cells
+Class size 2, sample distance range 10, background for None cells True, fill unvisited cells with neighbor average True. Coverage: 665,928 cells visited, 76.51%.
+Result: Sample distance range is used to control anomaly extension by forcing background values beyond a distance from sampled cells. Unvisited cells are post-filled from neighbors.
+
+Slide 28 - Coarser 20x20x20 grid, pheromone and domain parameters, 20 iterations
+Dataset: 27,414 samples, 20x20x20 cells, 110,577 total cells, 2,974 sampled cells. Starting/surviving ants: 8,922. Max pheromone 150. Domain average distance 7, background distance 10, decay rate 1, weight method greater_sample. Coverage: 78,125 cells visited, 70.65%.
+Result: Introduces coarser grid, pheromone cap, domain/background distances, and greater_sample weighting.
+
+Slide 29 - Same as Slide 28 but 10 iterations
+Coverage: 63,549 cells visited, 57.47%.
+Result: Fewer iterations strongly reduce coverage.
+
+Slide 30 - Same as Slide 29 but decay rate = 0.5
+Coverage: 63,845 cells visited, 57.74%.
+Result: Lower decay rate slightly increases coverage compared with decay rate 1 under the same 10-iteration setup.
+
+Slide 31 - Fault/domain example, weight method greater_value, decay rate 2
+Fault divides the boundary into two domains. Movement priority considers direction continuity from the last move and requires the neighbor cell to share the same class mark. Weight is based on cell value, where greater value means greater weight. Dataset: 468 samples, 25x25x25 cells, 229,320 total cells, 241 sampled cells, 723 ants, class size 0.2, domain average distance 100, background distance 10, decay rate 2. Coverage: 188,276 cells visited, 82.10%.
+Result: Demonstrates domain/fault-aware interpolation with direction and class continuity.
+
+Slide 32 - Fault/domain example, greater_value, decay rate 0.5
+Same as Slide 31 but decay rate 0.5. Coverage: 187,348 cells visited, 81.70%.
+Result: Similar coverage to Slide 31; lower decay rate slightly reduces visited-cell count in this case.
+
+Slide 33 - Fault/domain example, nearest_sample weighting
+Same fault/domain setup, but weight method nearest_sample: closer to a sample means greater weight. Decay rate 2. Coverage: 188,276 cells visited, 82.10%.
+Result: Tests sample-proximity weighting under structural/domain constraints.
+
+Slide 34 - Fault/domain example, greater_sample weighting
+Weight is based on the value of the closest sample: greater closest-sample value gives greater weight. Domain average distance 7, background distance 10, decay rate 1.5. Coverage listed as 224,511 cells visited, 82.93%. Note: 224,511 / 229,320 is about 97.90%, so the percentage in the slide may contain a typo.
+Result: Greater_sample weighting gives extensive coverage in the fault/domain example and may better propagate sample-controlled anomalies.
+
+Slide 35 - Domained estimation, fine 5x5x5 grid
+Dataset: 21,908 samples, 5x5x5 cells, 3,726,450 total cells, 1,077,347 sampled cells, 3,000 ants, sample distance range 10, decay rate 0.5, background for None cells True, 500 iterations. Coverage: 1,301,637 cells visited, 34.93%.
+Result: Presents a domained estimation and gives the current neighbor-weighting formula:
+fValue = get_mark_of_class(abs(last_cell.closest_sample - cell.value), class_size)
+weight = class_size / (class_size + fValue ** decay_rate)
+This weights neighbors based on the difference between the closest-sample value of the last cell and the candidate neighbor-cell value.
+
+Slide 36 - Anterpolator vs Kriging section divider
+Introduces a comparison between the Anterpolator result and kriging.
+
+Slide 37 - Comparison of Anterpolator and Kriging
+Same fine-grid domained estimation parameters as Slide 35. Coverage: 1,301,637 cells visited, 34.93%.
+Result: Visual comparison slide between Anterpolator and kriging.
+
+Slide 38 - Second comparison of Anterpolator and Kriging
+Same parameters and coverage as Slide 37.
+Result: Additional comparison view between Anterpolator and kriging.
+
+Slides 39-50 - Additional/duplicate sensitivity tests
+These slides repeat or revisit earlier parameter combinations, probably to compare result images side by side or preserve previous experiments.
+
+Slide 39: 10,000 ants, 500 iterations, cell weight 0.5, no background for None cells. Coverage: 720,366 cells visited, 82.77%.
+Slide 40: 20,000 ants, 250 iterations, cell weight 0.5. Coverage: 613,422 cells visited, 70.48%.
+Slide 41: 10,000 ants, 1,000 iterations, cell weight 0. Coverage: 849,198 cells visited, 97.57%.
+Slide 42: 10,000 ants, 200 iterations, cell weight 0. Coverage: 461,938 cells visited, 53.08%.
+Slide 43: duplicate of Slide 3 baseline with 10,000 ants, 1,000 iterations, cell weight 0.5. Coverage: 848,558 cells visited, 97.50%.
+Slide 44: duplicate of Slide 4 with 5,000 ants, 1,000 iterations, cell weight 0.5. Coverage: 809,246 cells visited, 92.98%.
+Slide 45: duplicate of Slide 39. Coverage: 720,366 cells visited, 82.77%.
+Slide 46: 20,000 ants, 100 iterations, cell weight 0.5. Coverage: 394,875 cells visited, 45.37%.
+Slide 47: duplicate of Slide 41. Coverage: 849,198 cells visited, 97.57%.
+Slide 48: duplicate of Slide 42. Coverage: 461,938 cells visited, 53.08%.
+Slide 49: duplicate of Slide 43. Coverage: 848,558 cells visited, 97.50%.
+Slide 50: duplicate of Slide 44. Coverage: 809,246 cells visited, 92.98%.
+
+KEY RESULTS AND INTERPRETATION
+
+1. Excluding sampled cells from first-priority movement improved continuity.
+The early baseline reached very high coverage, but produced an isolated drillhole section. After changing the priority rule so first-priority neighbors do not include sampled cells, the interpolation became more continuous along isogrades.
+
+2. Cell weight controls conservativeness and memory of previous estimates.
+Higher cell weight keeps more of the previous cell value and dampens new predictions. Lower cell weight gives more importance to the ant prediction. A cell weight of 0 behaves like ignoring the existing cell value during interpolation.
+
+3. Background value for None cells makes the interpolation more conservative.
+When blank cells are treated as background on first visit, the interpolation is damped toward 0 away from samples. Reducing cell weight can counteract this conservativeness.
+
+4. Class size and tolerance define value-continuity constraints.
+A neighbor is considered similar if the absolute difference in values is below class_size * tolerance. Smaller class sizes make the movement rule more restrictive and can help preserve sharper value classes or isograde continuity.
+
+5. Visit decay lambda was not fully satisfactory.
+Visit-based decay is intended to make values converge to background according to how many times a cell has been visited, but the tests suggest it did not preserve enough continuity near close samples and could still overextend estimates away from samples.
+
+6. Distance/sample-based decay appears more geologically meaningful than pure visit decay.
+Decay rate based on distance to samples better represents the idea that interpolation should fade toward background away from sample support.
+
+7. Sample distance range is a strong control on anomaly extension.
+When sample distance range is the only priority rule, ants remain close to samples and visited-cell coverage drops substantially. This makes it useful for limiting anomaly extension, but too restrictive if used alone.
+
+8. Weighting by nearest sample, closest-sample value, or greater sample value supports domain-aware estimation.
+The later experiments move toward a more geologically constrained approach where each visited cell stores its closest sample and neighbor weights depend on sample proximity, sample value, or value compatibility.
+
+9. Domain and fault constraints are important.
+In the fault-domain example, movement priority considers direction continuity and class/domain consistency. This helps avoid propagation across structural boundaries and makes the algorithm more suitable for geological modeling.
+
+10. Iterations matter more than just increasing ants.
+Comparisons show that high ant count with low iterations may cover less of the grid than fewer ants with more iterations. The number of ant movements through time is critical for coverage.
+
+11. Fine-grid domained estimation is computationally large.
+In the 5x5x5 grid example, the model has over 3.7 million cells and more than 1 million sampled cells. Coverage is only 34.93% after 500 iterations, suggesting the need for optimization, more iterations, post-fill strategies, or more efficient traversal.
+
+12. Comparison with kriging is included but not quantitatively evaluated in the text.
+The presentation shows visual comparisons between Anterpolator and kriging. The text does not provide validation metrics such as cross-validation error, bias, RMSE, slope of regression, or conditional bias, so the comparison is mainly qualitative/visual.
+
+POSSIBLE CODE/IMPLEMENTATION NOTES FOR GPT IN VS CODE
+
+- Represent the grid as a 3D array or sparse dictionary indexed by integer cell coordinates.
+- Store for each cell: value, has_sample, sample_value/average, visited_count, closest_sample, distance_to_closest_sample, domain/class mark, and optional pheromone.
+- Ant state should include current cell, previous cell, last direction vector, current/last closest sample, and possibly alive/dead status.
+- Neighbor search should use the 26 adjacent offsets in 3D.
+- Priority rules should be modular:
+  a) unvisited cells,
+  b) non-sample cells,
+  c) cells inside sample distance range,
+  d) cells with similar value class,
+  e) cells with same domain/class mark,
+  f) direction-continuity cells,
+  g) pheromone or decay constraints.
+- Prediction should be a weighted average of eligible neighbor values.
+- Assignment should be configurable:
+  a) replace current value with prediction,
+  b) average prediction with current value,
+  c) average prediction with background for None cells,
+  d) dynamic predicted weight based on distance to nearest sample or other decay rule.
+- Post-processing can optionally fill unvisited cells using neighbor averages.
+- Validation should be added: compare Anterpolator estimates with sample values by leave-one-out or train/test split, then compare with kriging using RMSE, MAE, bias, correlation, and visual residual maps.
+
+KNOWN ISSUES OR TEXT CORRECTIONS
+
+- Several slides are duplicates or repeated sensitivity tests.
+- Slide 14 appears to duplicate Slide 13 exactly.
+- Slides 39-50 include repeated versions of earlier tests.
+- Slide 34 reports 224,511 visited cells out of 229,320 total cells but gives 82.93%; the percentage appears inconsistent because 224,511 / 229,320 is about 97.90%.
+- Some text contains typos: “prioritary” should be “priority”, “de boundary” should be “the boundary”, “wieight” should be “weight”, “lesser” should be “less than”, “biggest weight” should be “greater weight”, “form” should be “from”.
+
+ONE-PARAGRAPH SUMMARY
+Anterpolator is a prototype 3D spatial interpolator that uses ant-like agents to propagate sample values through a grid. Ants start at sampled cells, estimate current-cell values from neighboring cells, assign predictions according to configurable weighting/background rules, and move through priority-selected neighbor cells. The presentation explores how parameters such as cell weight, class-size tolerance, background handling, sample-distance range, visit decay, distance decay, weighting method, pheromone limits, and domain/fault constraints affect interpolation behavior. The strongest conclusions are that excluding sample cells from first-priority movement improves continuity, background treatment makes results conservative, sample-distance controls are useful for limiting anomaly extension, visit-decay alone is insufficient, and domain/fault constraints are necessary for geological realism. The deck ends with qualitative comparisons between Anterpolator and kriging but does not yet include quantitative validation metrics.

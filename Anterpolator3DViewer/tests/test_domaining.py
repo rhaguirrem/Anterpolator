@@ -16,6 +16,7 @@ from ant_colony import Block
 from provenance_utils import finalize_phase_provenance, seed_original_sample_provenance, snapshot_interpolator_state
 
 from anterpolator3DViewer import (
+    _run_interpolator_statistics_with_retry,
     _build_export_blocks_dataframe,
     _restore_list_widget_selection,
     FilterDataSource,
@@ -340,6 +341,286 @@ def test_create_blocks_rotates_samples_before_streaming_assignment(monkeypatch):
         assert blocks._sample_blocks == {(0, 0, 0): 7.0}
         assert blocks._sample_assignment_data["assigned_mask"].tolist() == [True]
         assert blocks._sample_assignment_data["block_indices"].tolist() == [[0, 0, 0]]
+
+
+def _prepare_sample_block_cache_create_blocks_test(monkeypatch, temp_dir):
+    samples_path = os.path.join(temp_dir, "samples.csv")
+    blocks_path = os.path.join(temp_dir, "blocks.csv")
+    with open(samples_path, "w", encoding="utf-8") as handle:
+        handle.write("x,y,z,Value,Domain\n")
+        handle.write("0,0,0,7,A\n")
+    with open(blocks_path, "w", encoding="utf-8") as handle:
+        handle.write("x,y,z,dom\n")
+        handle.write("0,0,0,A\n")
+
+    monkeypatch.setattr(viewer_module, "LARGE_BLOCK_FILE_THRESHOLD", 1)
+
+    def _fake_load_large_blocks_metadata(*args, **kwargs):
+        return {
+            "all_min_bounds": np.array([0.0, 0.0, 0.0], dtype=float),
+            "all_max_bounds": np.array([10.0, 10.0, 10.0], dtype=float),
+            "unified_dims": np.array([10.0, 10.0, 10.0], dtype=float),
+            "domain_mapping": {(0, 0, 0): "A"},
+            "subblock_counts": {(0, 0, 0): 1},
+            "mixed_domain_blocks": {},
+            "rotation_matrix": np.eye(3, dtype=float),
+            "rotation_center": np.array([0.0, 0.0, 0.0], dtype=float),
+            "is_rotated": False,
+            "grid_index_origin": np.array([0.0, 0.0, 0.0], dtype=float),
+            "source_blocks_header_line": 1,
+        }
+
+    class _FakeCell:
+        def __init__(self):
+            self.n_cells = 1
+            self.cell_data = {}
+
+    class _FakeMultiBlock(list):
+        pass
+
+    class _FakeInterpolator:
+        def initialize_blocks(self, *args, **kwargs):
+            self.initialized = True
+
+        def create_ants(self):
+            return None
+
+    monkeypatch.setattr(viewer_module, "load_large_blocks_metadata", _fake_load_large_blocks_metadata)
+    monkeypatch.setattr(
+        viewer_module,
+        "_require_pyvista",
+        lambda: type("_FakePv", (), {"Box": staticmethod(lambda **kwargs: _FakeCell()), "MultiBlock": _FakeMultiBlock})(),
+    )
+    monkeypatch.setattr(viewer_module, "create_interpolator", lambda config, **kwargs: _FakeInterpolator())
+
+    base_config = {
+        "algorithm": "ant_colony",
+        "process_domains_sequentially": False,
+        "expand_interpolation_exports_to_subblocks": True,
+        "samples_file": samples_path,
+        "blocks_file": blocks_path,
+        "samples_delimiter": ",",
+        "blocks_delimiter": ",",
+        "samples_header_line": 1,
+        "blocks_header_line": 1,
+        "sample_x_col": "x",
+        "sample_y_col": "y",
+        "sample_z_col": "z",
+        "sample_value_col": "Value",
+        "sample_domain_col": "Domain",
+        "sample_weight_col": "(None)",
+        "block_x_col": "x",
+        "block_y_col": "y",
+        "block_z_col": "z",
+        "block_domain_col": "dom",
+        "block_size": (10.0, 10.0, 10.0),
+        "block_domain_sample_filters": [],
+        "block_volume_weighted_filters": [],
+        "domain_algorithm_overrides": {},
+        "blank_sample_domain_behavior": "skip",
+    }
+    return samples_path, blocks_path, base_config
+
+
+def test_create_blocks_reuses_sample_block_cache(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        samples_path, blocks_path, base_config = _prepare_sample_block_cache_create_blocks_test(monkeypatch, td)
+
+        original_aggregate = viewer_module.aggregate_samples_into_blocks
+        aggregate_call_count = {"count": 0}
+
+        def _counting_aggregate(*args, **kwargs):
+            aggregate_call_count["count"] += 1
+            return original_aggregate(*args, **kwargs)
+
+        monkeypatch.setattr(viewer_module, "aggregate_samples_into_blocks", _counting_aggregate)
+
+        config = dict(base_config)
+        config["force_rebuild_sample_blocks"] = False
+        call_kwargs = {
+            "points": np.array([[0.0, 0.0, 0.0]], dtype=float),
+            "values": np.array([7.0], dtype=float),
+            "block_size": (10.0, 10.0, 10.0),
+            "blocks_file": blocks_path,
+            "blocks_delimiter": ",",
+            "blocks_header_line": 1,
+            "block_x_col": "x",
+            "block_y_col": "y",
+            "block_z_col": "z",
+            "block_domain_col": "dom",
+            "config": config,
+            "sample_domains": np.array(["A"], dtype=object),
+        }
+
+        create_blocks(**call_kwargs)
+        create_blocks(**call_kwargs)
+
+        assert aggregate_call_count["count"] == 1
+        cache_dir = os.path.join(td, "AnterpolatorCache")
+        assert os.path.isdir(cache_dir)
+        assert any(name.endswith(".csv") for name in os.listdir(cache_dir))
+
+
+def test_create_blocks_force_rebuild_bypasses_sample_block_cache(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        samples_path, blocks_path, base_config = _prepare_sample_block_cache_create_blocks_test(monkeypatch, td)
+
+        original_aggregate = viewer_module.aggregate_samples_into_blocks
+        aggregate_call_count = {"count": 0}
+
+        def _counting_aggregate(*args, **kwargs):
+            aggregate_call_count["count"] += 1
+            return original_aggregate(*args, **kwargs)
+
+        monkeypatch.setattr(viewer_module, "aggregate_samples_into_blocks", _counting_aggregate)
+
+        warm_config = dict(base_config)
+        warm_config["force_rebuild_sample_blocks"] = False
+        rebuild_config = dict(base_config)
+        rebuild_config["force_rebuild_sample_blocks"] = True
+
+        common_kwargs = {
+            "points": np.array([[0.0, 0.0, 0.0]], dtype=float),
+            "values": np.array([7.0], dtype=float),
+            "block_size": (10.0, 10.0, 10.0),
+            "blocks_file": blocks_path,
+            "blocks_delimiter": ",",
+            "blocks_header_line": 1,
+            "block_x_col": "x",
+            "block_y_col": "y",
+            "block_z_col": "z",
+            "block_domain_col": "dom",
+            "sample_domains": np.array(["A"], dtype=object),
+        }
+
+        create_blocks(config=warm_config, **common_kwargs)
+        create_blocks(config=rebuild_config, **common_kwargs)
+
+        assert aggregate_call_count["count"] == 2
+
+
+def test_create_blocks_can_skip_visual_geometry(monkeypatch):
+    class _FakeInterpolator:
+        def initialize_blocks(self, *args, **kwargs):
+            self.initialized = True
+
+        def create_ants(self):
+            return None
+
+    def _fail_require_pyvista():
+        raise AssertionError("PyVista should not be required when build_visual_blocks is False")
+
+    monkeypatch.setattr(viewer_module, "_require_pyvista", _fail_require_pyvista)
+    monkeypatch.setattr(viewer_module, "create_interpolator", lambda config, **kwargs: _FakeInterpolator())
+
+    blocks = create_blocks(
+        points=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        values=np.array([7.0], dtype=float),
+        block_size=(10.0, 10.0, 10.0),
+        config={"algorithm": "ant_colony"},
+        build_visual_blocks=False,
+    )
+
+    assert isinstance(blocks, viewer_module.LightweightBlocks)
+    assert blocks._sample_blocks == {(0, 0, 0): 7.0}
+
+
+def test_statistics_retry_helper_retries_after_permission_error(monkeypatch):
+    class _FakeMessageBox:
+        Warning = 1
+        Retry = 2
+        Cancel = 4
+        responses = [Retry]
+
+        def __init__(self, parent=None):
+            self.parent = parent
+
+        def setIcon(self, icon):
+            self.icon = icon
+
+        def setWindowTitle(self, title):
+            self.title = title
+
+        def setText(self, text):
+            self.text = text
+
+        def setInformativeText(self, text):
+            self.info = text
+
+        def setDetailedText(self, text):
+            self.detail = text
+
+        def setStandardButtons(self, buttons):
+            self.buttons = buttons
+
+        def setDefaultButton(self, button):
+            self.default = button
+
+        def exec_(self):
+            return _FakeMessageBox.responses.pop(0)
+
+    class _FakeInterpolator:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_statistics(self, output_dir, domain_name="Global"):
+            self.calls += 1
+            if self.calls == 1:
+                raise PermissionError(13, "Permission denied", "locked.csv")
+
+    monkeypatch.setattr(viewer_module.QtWidgets, "QMessageBox", _FakeMessageBox)
+
+    interpolator = _FakeInterpolator()
+    assert _run_interpolator_statistics_with_retry(interpolator, ".", "Demo") is True
+    assert interpolator.calls == 2
+
+
+def test_statistics_retry_helper_can_cancel_after_permission_error(monkeypatch):
+    class _FakeMessageBox:
+        Warning = 1
+        Retry = 2
+        Cancel = 4
+
+        def __init__(self, parent=None):
+            self.parent = parent
+
+        def setIcon(self, icon):
+            self.icon = icon
+
+        def setWindowTitle(self, title):
+            self.title = title
+
+        def setText(self, text):
+            self.text = text
+
+        def setInformativeText(self, text):
+            self.info = text
+
+        def setDetailedText(self, text):
+            self.detail = text
+
+        def setStandardButtons(self, buttons):
+            self.buttons = buttons
+
+        def setDefaultButton(self, button):
+            self.default = button
+
+        def exec_(self):
+            return _FakeMessageBox.Cancel
+
+    class _FakeInterpolator:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_statistics(self, output_dir, domain_name="Global"):
+            self.calls += 1
+            raise PermissionError(13, "Permission denied", "locked.csv")
+
+    monkeypatch.setattr(viewer_module.QtWidgets, "QMessageBox", _FakeMessageBox)
+
+    interpolator = _FakeInterpolator()
+    assert _run_interpolator_statistics_with_retry(interpolator, ".", "Demo") is False
+    assert interpolator.calls == 1
 
 
 def test_load_block_domain_catalog_applies_filters_on_small_files():

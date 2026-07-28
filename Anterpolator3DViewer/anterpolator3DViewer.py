@@ -15,6 +15,7 @@ import traceback
 import warnings
 import math
 import re
+import hashlib
 from decimal import Decimal, InvalidOperation
 from tqdm import tqdm
 import sys
@@ -40,8 +41,13 @@ taichi_runtime_module = None
 bmf_tools_module = None
 LARGE_BLOCK_FILE_THRESHOLD = 512 * 1024 * 1024
 INITIAL_BLOCK_RENDER_THRESHOLD = 5000
+SAMPLE_BLOCK_CACHE_VERSION = 1
 INVALID_FILENAME_CHARS = str.maketrans({ch: '_' for ch in '<>:"/\\|?*'})
 _LOGGED_LEAPFROG_METADATA_SIGNATURES = set()
+
+
+class LightweightBlocks(list):
+    pass
 
 
 def _require_pyvista():
@@ -1308,10 +1314,209 @@ def compute_domain_sensitive_assignment_mask(block_indices, allowed_grid, domain
     return allowed_mask & domain_match_mask
 
 
+def _compute_sample_block_assignment_state(points_array, grid_origin, block_dims,
+                                           allowed_grid=None, domain_mapping=None, sample_domains=None):
+    block_indices = np.floor((points_array - grid_origin) / block_dims + 1e-6).astype(int)
+    if allowed_grid is None:
+        assigned_mask = np.ones(len(points_array), dtype=bool)
+        domain_mismatch_count = 0
+    else:
+        allowed_mask = np.array([tuple(idx) in allowed_grid for idx in block_indices], dtype=bool)
+        assigned_mask = compute_domain_sensitive_assignment_mask(
+            block_indices,
+            allowed_grid,
+            domain_mapping=domain_mapping,
+            sample_domains=sample_domains,
+        )
+        domain_mismatch_count = int(np.count_nonzero(allowed_mask & ~assigned_mask))
+    return block_indices, assigned_mask, domain_mismatch_count
+
+
+def _get_sample_block_cache_file_signature(path):
+    normalized_path = os.path.abspath(path) if path else ''
+    if not normalized_path:
+        return {'path': '', 'exists': False}
+    if not os.path.isfile(normalized_path):
+        return {'path': normalized_path, 'exists': False}
+    stat_result = os.stat(normalized_path)
+    mtime_ns = getattr(stat_result, 'st_mtime_ns', int(stat_result.st_mtime * 1_000_000_000))
+    return {
+        'path': normalized_path,
+        'exists': True,
+        'size': int(stat_result.st_size),
+        'mtime_ns': int(mtime_ns),
+    }
+
+
+def _normalize_sample_block_cache_block_size(block_size):
+    if isinstance(block_size, np.ndarray):
+        return [float(v) for v in block_size.tolist()]
+    if isinstance(block_size, (list, tuple)):
+        return [float(v) for v in block_size]
+    return [float(block_size)] * 3
+
+
+def _build_sample_block_cache_identity(config, mode='blocks_file'):
+    cfg = config or {}
+    return {
+        'version': SAMPLE_BLOCK_CACHE_VERSION,
+        'mode': str(mode or 'blocks_file'),
+        'samples_file': os.path.abspath(str(cfg.get('samples_file') or '')) if cfg.get('samples_file') else '',
+        'blocks_file': os.path.abspath(str(cfg.get('blocks_file') or '')) if cfg.get('blocks_file') else '',
+        'samples_delimiter': str(cfg.get('samples_delimiter') or ''),
+        'blocks_delimiter': str(cfg.get('blocks_delimiter') or ''),
+        'samples_header_line': int(cfg.get('samples_header_line', 1) or 1),
+        'blocks_header_line': int(cfg.get('blocks_header_line', 1) or 1),
+        'sample_x_col': str(cfg.get('sample_x_col') or ''),
+        'sample_y_col': str(cfg.get('sample_y_col') or ''),
+        'sample_z_col': str(cfg.get('sample_z_col') or ''),
+        'sample_value_col': str(cfg.get('sample_value_col') or ''),
+        'sample_domain_col': str(cfg.get('sample_domain_col') or ''),
+        'sample_weight_col': str(cfg.get('sample_weight_col') or ''),
+        'block_x_col': str(cfg.get('block_x_col') or ''),
+        'block_y_col': str(cfg.get('block_y_col') or ''),
+        'block_z_col': str(cfg.get('block_z_col') or ''),
+        'block_domain_col': str(cfg.get('block_domain_col') or ''),
+        'blank_sample_domain_behavior': str(cfg.get('blank_sample_domain_behavior') or ''),
+        'block_size': _normalize_sample_block_cache_block_size(cfg.get('block_size', ())),
+        'sample_filters': [dict(entry) for entry in get_configured_sample_filters(cfg)],
+        'block_filters': [dict(entry) for entry in get_configured_block_filters(cfg)],
+        'domain_algorithm_overrides': {
+            str(domain): dict(settings)
+            for domain, settings in (cfg.get('domain_algorithm_overrides') or {}).items()
+        },
+        'subblock_domain_policy': str(cfg.get('subblock_domain_policy', 'majority') or 'majority'),
+    }
+
+
+def _build_sample_block_cache_manifest(config, points_count, sample_domains, sample_weights, mode='blocks_file'):
+    identity = _build_sample_block_cache_identity(config, mode=mode)
+    cfg = config or {}
+    manifest = {
+        'cache_version': SAMPLE_BLOCK_CACHE_VERSION,
+        'identity': identity,
+        'samples_file_signature': _get_sample_block_cache_file_signature(cfg.get('samples_file')),
+        'blocks_file_signature': _get_sample_block_cache_file_signature(cfg.get('blocks_file')),
+        'points_count': int(points_count),
+        'uses_sample_domains': bool(sample_domains is not None),
+        'uses_sample_weights': bool(sample_weights is not None),
+    }
+    return manifest
+
+
+def _resolve_sample_block_cache_paths(config, mode='blocks_file'):
+    cfg = config or {}
+    samples_file = str(cfg.get('samples_file') or '').strip()
+    if not samples_file:
+        return None
+
+    sample_dir = os.path.dirname(os.path.abspath(samples_file)) or os.getcwd()
+    cache_dir = os.path.join(sample_dir, 'AnterpolatorCache')
+    base_name = os.path.splitext(os.path.basename(samples_file))[0] or 'samples'
+    identity = _build_sample_block_cache_identity(cfg, mode=mode)
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode('utf-8')).hexdigest()[:16]
+    stem = f"{base_name}_sample_blocks_cache_{digest}"
+    return {
+        'cache_dir': cache_dir,
+        'csv_path': os.path.join(cache_dir, f'{stem}.csv'),
+        'manifest_path': os.path.join(cache_dir, f'{stem}.json'),
+    }
+
+
+def _load_sample_block_cache(config, points_count, sample_domains, sample_weights, mode='blocks_file'):
+    paths = _resolve_sample_block_cache_paths(config, mode=mode)
+    if not paths:
+        return None
+    if not os.path.isfile(paths['csv_path']) or not os.path.isfile(paths['manifest_path']):
+        return None
+
+    expected_manifest = _build_sample_block_cache_manifest(
+        config,
+        points_count,
+        sample_domains,
+        sample_weights,
+        mode=mode,
+    )
+    try:
+        with open(paths['manifest_path'], 'r', encoding='utf-8') as handle:
+            stored_manifest = json.load(handle)
+    except Exception as exc:
+        print(f"Sample-block cache manifest could not be read; regenerating sample blocks. ({exc})")
+        return None
+
+    if stored_manifest != expected_manifest:
+        return None
+
+    try:
+        cache_df = pd.read_csv(paths['csv_path'])
+    except Exception as exc:
+        print(f"Sample-block cache could not be read; regenerating sample blocks. ({exc})")
+        return None
+
+    required_columns = {'block_ix', 'block_iy', 'block_iz', 'value', 'sample_count', 'sample_weight_sum'}
+    if not required_columns.issubset(cache_df.columns):
+        print("Sample-block cache is missing required columns; regenerating sample blocks.")
+        return None
+
+    sample_block_values = {}
+    sample_block_counts = {}
+    sample_block_weight_sums = {}
+    for row in cache_df.itertuples(index=False):
+        block_idx = (int(row.block_ix), int(row.block_iy), int(row.block_iz))
+        sample_block_values[block_idx] = float(row.value)
+        sample_block_counts[block_idx] = int(row.sample_count)
+        sample_block_weight_sums[block_idx] = float(row.sample_weight_sum)
+
+    return {
+        'paths': paths,
+        'sample_block_values': sample_block_values,
+        'sample_block_counts': sample_block_counts,
+        'sample_block_weight_sums': sample_block_weight_sums,
+    }
+
+
+def _write_sample_block_cache(config, sample_block_values, sample_block_counts, sample_block_weight_sums,
+                              points_count, sample_domains, sample_weights, mode='blocks_file'):
+    paths = _resolve_sample_block_cache_paths(config, mode=mode)
+    if not paths:
+        return None
+
+    os.makedirs(paths['cache_dir'], exist_ok=True)
+    cache_rows = []
+    for block_idx in sorted(sample_block_values):
+        cache_rows.append({
+            'block_ix': int(block_idx[0]),
+            'block_iy': int(block_idx[1]),
+            'block_iz': int(block_idx[2]),
+            'value': float(sample_block_values[block_idx]),
+            'sample_count': int(sample_block_counts.get(block_idx, 0)),
+            'sample_weight_sum': float(sample_block_weight_sums.get(block_idx, 0.0)),
+        })
+
+    cache_df = pd.DataFrame(cache_rows)
+    cache_df.to_csv(paths['csv_path'], index=False)
+    _write_json_atomic(
+        paths['manifest_path'],
+        _build_sample_block_cache_manifest(
+            config,
+            points_count,
+            sample_domains,
+            sample_weights,
+            mode=mode,
+        ),
+    )
+    return paths
+
+
+def _should_force_rebuild_sample_blocks(config):
+    return bool((config or {}).get('force_rebuild_sample_blocks', False))
+
+
 def aggregate_samples_into_blocks(points, values, grid_index_origin, unified_dims,
                                   allowed_grid=None, domain_mapping=None, sample_domains=None,
                                   sample_ids=None, sample_weights=None,
-                                  progress_label='Assigning points to blocks'):
+                                  progress_label='Assigning points to blocks',
+                                  block_indices=None, assigned_mask=None, domain_mismatch_count=None):
     points_array = np.asarray(points, dtype=float)
     values_array = np.asarray(values, dtype=float)
     grid_origin = np.asarray(grid_index_origin, dtype=float)
@@ -1332,19 +1537,15 @@ def aggregate_samples_into_blocks(points, values, grid_index_origin, unified_dim
         if np.any(weights_array <= 0.0):
             raise ValueError('Sample weights must be greater than zero for sample-block aggregation.')
 
-    block_indices = np.floor((points_array - grid_origin) / block_dims + 1e-6).astype(int)
-    if allowed_grid is None:
-        assigned_mask = np.ones(len(points_array), dtype=bool)
-        domain_mismatch_count = 0
-    else:
-        allowed_mask = np.array([tuple(idx) in allowed_grid for idx in block_indices], dtype=bool)
-        assigned_mask = compute_domain_sensitive_assignment_mask(
-            block_indices,
-            allowed_grid,
+    if block_indices is None or assigned_mask is None or domain_mismatch_count is None:
+        block_indices, assigned_mask, domain_mismatch_count = _compute_sample_block_assignment_state(
+            points_array,
+            grid_origin,
+            block_dims,
+            allowed_grid=allowed_grid,
             domain_mapping=domain_mapping,
             sample_domains=sample_domains,
         )
-        domain_mismatch_count = int(np.count_nonzero(allowed_mask & ~assigned_mask))
 
     sample_block_sums = {}
     sample_block_counts = {}
@@ -2391,8 +2592,9 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                   block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
                   config=None,
                   sample_domains=None,
-                  sample_weights=None):
-    pv = _require_pyvista()
+                  sample_weights=None,
+                  build_visual_blocks=True):
+    pv = _require_pyvista() if build_visual_blocks else None
     original_points_array = np.array(points, copy=True)
     original_values_array = np.array(values, copy=True)
     original_domains_array = np.array(sample_domains, copy=True) if sample_domains is not None else None
@@ -2648,22 +2850,71 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
 
         # Group sample points using the same grid origin used to index the block model.
         print("Assigning points to blocks...")
-        sample_block_data = aggregate_samples_into_blocks(
-            points,
-            values,
-            grid_index_origin,
-            unified_dims,
+        block_indices, assigned_mask, domain_mismatch_count = _compute_sample_block_assignment_state(
+            np.asarray(points, dtype=float),
+            np.asarray(grid_index_origin, dtype=float),
+            np.asarray(unified_dims, dtype=float),
             allowed_grid=allowed_grid,
             domain_mapping=domain_mapping,
             sample_domains=sample_domains,
-            sample_weights=sample_weights,
-            progress_label='Assigning points to blocks',
         )
-        block_indices = sample_block_data['block_indices']
-        assigned_mask = sample_block_data['assigned_mask']
+        sample_block_cache = None
+        if not _should_force_rebuild_sample_blocks(config):
+            sample_block_cache = _load_sample_block_cache(
+                config,
+                len(points),
+                sample_domains,
+                sample_weights,
+                mode='blocks_file',
+            )
+        sample_block_data = None
+        if sample_block_cache is not None:
+            sample_block_data = {
+                'block_indices': block_indices,
+                'assigned_mask': assigned_mask,
+                'domain_mismatch_count': domain_mismatch_count,
+                'sample_block_values': sample_block_cache['sample_block_values'],
+                'sample_block_counts': sample_block_cache['sample_block_counts'],
+                'sample_block_weight_sums': sample_block_cache['sample_block_weight_sums'],
+                'sample_block_domain_counts': {},
+                'sample_block_ids': {},
+            }
+            print(
+                f"Using cached sample blocks from {sample_block_cache['paths']['csv_path']} "
+                f"({len(sample_block_data['sample_block_values']):,} blocks)."
+            )
+        else:
+            sample_block_data = aggregate_samples_into_blocks(
+                points,
+                values,
+                grid_index_origin,
+                unified_dims,
+                allowed_grid=allowed_grid,
+                domain_mapping=domain_mapping,
+                sample_domains=sample_domains,
+                sample_weights=sample_weights,
+                progress_label='Assigning points to blocks',
+                block_indices=block_indices,
+                assigned_mask=assigned_mask,
+                domain_mismatch_count=domain_mismatch_count,
+            )
+            cache_paths = _write_sample_block_cache(
+                config,
+                sample_block_data['sample_block_values'],
+                sample_block_data['sample_block_counts'],
+                sample_block_data['sample_block_weight_sums'],
+                len(points),
+                sample_domains,
+                sample_weights,
+                mode='blocks_file',
+            )
+            if cache_paths is not None:
+                print(
+                    f"Saved sample-block cache to {cache_paths['csv_path']} "
+                    f"({len(sample_block_data['sample_block_values']):,} blocks)."
+                )
         sample_block_values = sample_block_data['sample_block_values']
         sample_block_counts = sample_block_data['sample_block_counts']
-        domain_mismatch_count = sample_block_data['domain_mismatch_count']
         if domain_mismatch_count:
             print(f"Rejected {domain_mismatch_count:,} samples whose domain does not match their target block domain.")
         
@@ -2677,25 +2928,32 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         for domain, count in sorted(sample_domain_counts.items()):
             print(f"  {domain}: {count} sample blocks")
         print(f"  Total sample blocks: {len(sample_block_values)}")
-        load_pbar.update(1)
-        load_pbar.set_postfix_str("creating blocks")
+        if build_visual_blocks:
+            load_pbar.update(1)
+            load_pbar.set_postfix_str("creating blocks")
 
-        block_data = []
-        for idx in tqdm(sample_block_values.keys(), desc="Creating blocks"):
-            corner = all_min_bounds + np.array(idx) * unified_dims
-            cell = pv.Box(bounds=(
-                corner[0], corner[0] + unified_dims[0],
-                corner[1], corner[1] + unified_dims[1],
-                corner[2], corner[2] + unified_dims[2]
-            ))
-            avg_value = sample_block_values[idx]
-            cell.cell_data['Value'] = np.full(cell.n_cells, avg_value)
-            cell.cell_data['Raw_Value'] = np.full(cell.n_cells, avg_value)
-            cell.cell_data['Is_Sample'] = np.full(cell.n_cells, True)
-            cell.cell_data['Block_ID'] = np.full(cell.n_cells, 0)  # to be set later
-            domain = domain_mapping.get(idx, "Undomained")
-            cell.cell_data['Domain'] = np.full(cell.n_cells, domain)
-            block_data.append(cell)
+            block_data = []
+            for idx in tqdm(sample_block_values.keys(), desc="Creating blocks"):
+                corner = all_min_bounds + np.array(idx) * unified_dims
+                cell = pv.Box(bounds=(
+                    corner[0], corner[0] + unified_dims[0],
+                    corner[1], corner[1] + unified_dims[1],
+                    corner[2], corner[2] + unified_dims[2]
+                ))
+                avg_value = sample_block_values[idx]
+                cell.cell_data['Value'] = np.full(cell.n_cells, avg_value)
+                cell.cell_data['Raw_Value'] = np.full(cell.n_cells, avg_value)
+                cell.cell_data['Is_Sample'] = np.full(cell.n_cells, True)
+                cell.cell_data['Block_ID'] = np.full(cell.n_cells, 0)  # to be set later
+                domain = domain_mapping.get(idx, "Undomained")
+                cell.cell_data['Domain'] = np.full(cell.n_cells, domain)
+                block_data.append(cell)
+            multiblock = pv.MultiBlock(block_data)
+        else:
+            load_pbar.update(1)
+            load_pbar.set_postfix_str("skipping visual blocks")
+            print("Skipping sample block geometry materialization (interpolation-only mode).")
+            multiblock = LightweightBlocks()
         block_info = {
             'min_bounds': all_min_bounds,
             'dims': np.ceil((all_max_bounds - all_min_bounds) / unified_dims).astype(int),
@@ -2716,7 +2974,6 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'source_block_filters': [dict(entry) for entry in (block_filters or [])],
             'expand_interpolation_exports_to_subblocks': bool((config or {}).get('expand_interpolation_exports_to_subblocks', True)),
         }
-        multiblock = pv.MultiBlock(block_data)
         # Store metadata on multiblock with private-style names to avoid PyVista attribute restrictions
         multiblock._block_info = block_info
         multiblock._sample_blocks = dict(sample_block_values)
@@ -3051,7 +3308,6 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 block_weights[block_idx].append(weights_array[i])
             if domains_array is not None:
                 block_domains[block_idx].append(domains_array[i])
-        block_data = []
         next_block_id = 1
 
         # Detect domain interpolation mode (String Theory)
@@ -3115,22 +3371,28 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
 
                 sample_block_domain_mapping[idx] = winner
 
-        for idx in tqdm(blocks.keys(), desc="Creating blocks"):
-            corner = min_bounds + np.array(idx) * np.array(block_size)
-            cell = pv.Box(bounds=(
-                corner[0], corner[0] + block_size[0],
-                corner[1], corner[1] + block_size[1],
-                corner[2], corner[2] + block_size[2]
-            ))
-            avg_value = np.average(block_values[idx], weights=block_weights[idx]) if weights_array is not None else np.mean(block_values[idx])
-            cell.cell_data['Value'] = np.full(cell.n_cells, avg_value)
-            cell.cell_data['Is_Sample'] = np.full(cell.n_cells, True)
-            cell.cell_data['Block_ID'] = np.full(cell.n_cells, next_block_id)
-            next_block_id += 1
-            if is_st_domain_interpolation or is_ant_domain_interpolation:
-                dom = sample_block_domain_mapping.get(idx, "")
-                cell.cell_data['Domain'] = np.full(cell.n_cells, dom)
-            block_data.append(cell)
+        if build_visual_blocks:
+            block_data = []
+            for idx in tqdm(blocks.keys(), desc="Creating blocks"):
+                corner = min_bounds + np.array(idx) * np.array(block_size)
+                cell = pv.Box(bounds=(
+                    corner[0], corner[0] + block_size[0],
+                    corner[1], corner[1] + block_size[1],
+                    corner[2], corner[2] + block_size[2]
+                ))
+                avg_value = np.average(block_values[idx], weights=block_weights[idx]) if weights_array is not None else np.mean(block_values[idx])
+                cell.cell_data['Value'] = np.full(cell.n_cells, avg_value)
+                cell.cell_data['Is_Sample'] = np.full(cell.n_cells, True)
+                cell.cell_data['Block_ID'] = np.full(cell.n_cells, next_block_id)
+                next_block_id += 1
+                if is_st_domain_interpolation or is_ant_domain_interpolation:
+                    dom = sample_block_domain_mapping.get(idx, "")
+                    cell.cell_data['Domain'] = np.full(cell.n_cells, dom)
+                block_data.append(cell)
+            multiblock = pv.MultiBlock(block_data)
+        else:
+            print("Skipping sample block geometry materialization (interpolation-only mode).")
+            multiblock = LightweightBlocks()
         sample_blocks = {
             idx: np.average(vals, weights=block_weights[idx]) if weights_array is not None else np.mean(vals)
             for idx, vals in block_values.items()
@@ -3140,7 +3402,6 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             idx: float(np.sum(block_weights[idx])) if weights_array is not None else float(len(vals))
             for idx, vals in block_values.items()
         }
-        multiblock = pv.MultiBlock(block_data)
         multiblock._block_info = block_info
         multiblock._sample_blocks = sample_blocks
         multiblock._sample_assignment_data = {
@@ -8697,11 +8958,30 @@ def _get_interpolator_run_profile(interpolator, dims, iterations):
 
     return {
         'single_pass': False,
-        'message': f"Running {algo_name} for {iterations} iterations...",
+        'message': (
+            f"Running {algo_name} for {iterations} iterations"
+            f"{_format_interpolator_run_counts(interpolator)}..."
+        ),
         'desc_suffix': None,
         'total': max(int(iterations), 1),
         'unit': 'iter',
     }
+
+
+def _format_interpolator_run_counts(interpolator):
+    counts = []
+
+    if hasattr(interpolator, 'ants'):
+        sample_count = sum(1 for block in getattr(interpolator, 'blocks', {}).values() if getattr(block, 'is_sample', False))
+        ant_count = len(getattr(interpolator, 'ants', []) or [])
+        if sample_count:
+            counts.append(f"samples={sample_count:,}")
+        counts.append(f"ants={ant_count:,}")
+
+    if not counts:
+        return ""
+
+    return f" ({', '.join(counts)})"
 
 def _run_interpolator_with_progress(interpolator, dims, iterations, desc, on_first_iteration=None):
     profile = _get_interpolator_run_profile(interpolator, dims, iterations)
@@ -8746,6 +9026,37 @@ def _run_interpolator_with_progress(interpolator, dims, iterations, desc, on_fir
             break
     pbar.close()
     return should_continue
+
+
+def _run_interpolator_statistics_with_retry(interpolator, output_dir, domain_name, parent=None):
+    if not hasattr(interpolator, 'generate_statistics'):
+        return True
+
+    while True:
+        try:
+            interpolator.generate_statistics(output_dir, domain_name=domain_name)
+            return True
+        except PermissionError as exc:
+            locked_path = getattr(exc, 'filename', None) or str(exc)
+            print(f"Permission denied while saving interpolation statistics: {locked_path}")
+
+            message_box = QtWidgets.QMessageBox(parent)
+            message_box.setIcon(QtWidgets.QMessageBox.Warning)
+            message_box.setWindowTitle('Statistics Save Failed')
+            message_box.setText('Could not save the interpolation statistics file.')
+            message_box.setInformativeText(
+                f"Permission denied for:\n{locked_path}\n\n"
+                'The file may be open in Excel or locked by OneDrive sync. '
+                'Close the file and click Retry to resume saving statistics, or click Cancel to skip the statistics export and continue.'
+            )
+            message_box.setDetailedText(str(exc))
+            message_box.setStandardButtons(QtWidgets.QMessageBox.Retry | QtWidgets.QMessageBox.Cancel)
+            message_box.setDefaultButton(QtWidgets.QMessageBox.Retry)
+            if message_box.exec_() == QtWidgets.QMessageBox.Retry:
+                continue
+
+            print(f"Skipped interpolation statistics for {domain_name}.")
+            return False
 
 def _normalize_domain_post_process_mode(mode):
     normalized = str(mode or 'skip').strip().lower()
@@ -8810,8 +9121,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
             
             # Generate stats for Pass 1 if String Theory
             output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
-            if hasattr(interp1, 'generate_statistics'):
-                interp1.generate_statistics(output_dir, domain_name=f"{domain}_Pass1")
+            _run_interpolator_statistics_with_retry(interp1, output_dir, f"{domain}_Pass1")
             finalize_phase_provenance(interp1, 'First Pass', algo_name1, pass1_snapshot)
 
             last_interp = interp1
@@ -8947,8 +9257,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                 
                 # Generate stats for Pass 2 if String Theory
                 output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
-                if hasattr(interp2, 'generate_statistics'):
-                    interp2.generate_statistics(output_dir, domain_name=f"{domain}_Pass2")
+                _run_interpolator_statistics_with_retry(interp2, output_dir, f"{domain}_Pass2")
                 last_interp = interp2
 
             post_process_mode = _get_domain_post_process_mode(post_process_config, domain)
@@ -8984,8 +9293,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
             
         # Generate stats if String Theory
         output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
-        if hasattr(interpolator, 'generate_statistics'):
-            interpolator.generate_statistics(output_dir, domain_name="Global")
+        _run_interpolator_statistics_with_retry(interpolator, output_dir, "Global")
     
     # Export results (handles both single and multiple interpolators)
     interpolation_file = export_blocks_to_file(blocks, interpolation_file)
@@ -10371,6 +10679,9 @@ if __name__ == "__main__":
             self.taichi_transparent_blocks_default = False
             self._legacy_fill_unvisited_domainwise = False
             self.setWindowTitle("Anterpolator 3D Viewer Configuration")
+            self.setWindowFlags(
+                self.windowFlags() | QtCore.Qt.WindowMinimizeButtonHint | QtCore.Qt.WindowMaximizeButtonHint
+            )
             self.resize(1120, 680)
             
             # Main layout with tabs
@@ -10400,44 +10711,45 @@ if __name__ == "__main__":
             operations_form = QtWidgets.QFormLayout()
             operations_content.setLayout(operations_form)
             operations_scroll.setWidget(operations_content)
-            tabs.addTab(operations_tab, "Operations")
             
             # Tab 2: Ant Colony Parameters
             ant_tab = QtWidgets.QWidget()
             ant_form = QtWidgets.QFormLayout()
             ant_tab.setLayout(ant_form)
-            tabs.addTab(ant_tab, "Ant Colony")
             
             # Tab 3: Molecular Clock Parameters
             mc_tab = QtWidgets.QWidget()
             mc_form = QtWidgets.QFormLayout()
             mc_tab.setLayout(mc_form)
-            tabs.addTab(mc_tab, "Molecular Clock")
 
             gk_tab = QtWidgets.QWidget()
             gk_form = QtWidgets.QFormLayout()
             gk_tab.setLayout(gk_form)
-            tabs.addTab(gk_tab, "Gaussian Kernel")
 
             octree_tab = QtWidgets.QWidget()
             octree_form = QtWidgets.QFormLayout()
             octree_tab.setLayout(octree_form)
-            tabs.addTab(octree_tab, "Adaptive Octree")
 
             st_tab = QtWidgets.QWidget()
             st_form = QtWidgets.QFormLayout()
             st_tab.setLayout(st_form)
-            tabs.addTab(st_tab, "String Theory")
 
             display_tab = QtWidgets.QWidget()
             display_form = QtWidgets.QFormLayout()
             display_tab.setLayout(display_form)
-            tabs.addTab(display_tab, "Display")
 
             # Tab 6: Advanced Options
             advanced_tab = QtWidgets.QWidget()
             advanced_form = QtWidgets.QFormLayout()
             advanced_tab.setLayout(advanced_form)
+
+            tabs.addTab(operations_tab, "Operations")
+            tabs.addTab(st_tab, "String Theory")
+            tabs.addTab(ant_tab, "Ant Colony")
+            tabs.addTab(mc_tab, "Molecular Clock")
+            tabs.addTab(gk_tab, "Gaussian Kernel")
+            tabs.addTab(octree_tab, "Adaptive Octree")
+            tabs.addTab(display_tab, "Display")
             tabs.addTab(advanced_tab, "Advanced")
 
             # === FILES & DATA TAB ===
@@ -12072,6 +12384,8 @@ if __name__ == "__main__":
             self.process_domains_sequentially = QtWidgets.QCheckBox(); self.process_domains_sequentially.setChecked(True)
             self.expand_interpolation_exports_to_subblocks = QtWidgets.QCheckBox(); self.expand_interpolation_exports_to_subblocks.setChecked(True)
             self.expand_interpolation_exports_to_subblocks.setToolTip('If checked, interpolation CSV exports reuse the original blocks file rows and assign each sub-block the interpolated value of its parent base block. Interpolation still runs on the base-block grid.')
+            self.force_rebuild_sample_blocks = QtWidgets.QCheckBox(); self.force_rebuild_sample_blocks.setChecked(False)
+            self.force_rebuild_sample_blocks.setToolTip('If checked, ignore any valid sample-block cache and regenerate sample blocks from the source samples for this run.')
             self.blank_sample_domain_behavior = QtWidgets.QComboBox(); self.blank_sample_domain_behavior.addItems(['Skip', 'Infer From Blocks'])
             self.blank_sample_domain_behavior.setCurrentText('Skip')
             self.blank_sample_domain_behavior.setToolTip('How to handle blank sample domains during domain-based interpolation or metrics.\nSkip: exclude blank-domain rows.\nInfer From Blocks: infer missing sample domains from the blocks model when possible.')
@@ -12114,6 +12428,7 @@ if __name__ == "__main__":
 
             advanced_form.addRow('Process Domains Sequentially', self.process_domains_sequentially)
             advanced_form.addRow('Expand CSV Export to Sub-Blocks', self.expand_interpolation_exports_to_subblocks)
+            advanced_form.addRow('Force Rebuild Sample Blocks', self.force_rebuild_sample_blocks)
             advanced_form.addRow('Blank Sample Domains', self.blank_sample_domain_behavior)
             advanced_form.addRow('Verbose', self.verbose)
 
@@ -12419,6 +12734,7 @@ if __name__ == "__main__":
                 'average_with_blocks': self.average_with_blocks.isChecked(),
                 'process_domains_sequentially': self.process_domains_sequentially.isChecked(),
                 'expand_interpolation_exports_to_subblocks': self.expand_interpolation_exports_to_subblocks.isChecked(),
+                'force_rebuild_sample_blocks': self.force_rebuild_sample_blocks.isChecked(),
                 'blank_sample_domain_behavior': 'infer_from_blocks' if self.blank_sample_domain_behavior.currentText() == 'Infer From Blocks' else 'skip',
                 'verbose': self.verbose.isChecked(),
                 'viewer_backend': self.viewer_backend,
@@ -12708,6 +13024,7 @@ if __name__ == "__main__":
                 if 'average_with_blocks' in config: self.average_with_blocks.setChecked(config['average_with_blocks'])
                 if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
                 self.expand_interpolation_exports_to_subblocks.setChecked(bool(config.get('expand_interpolation_exports_to_subblocks', True)))
+                self.force_rebuild_sample_blocks.setChecked(bool(config.get('force_rebuild_sample_blocks', False)))
                 if 'blank_sample_domain_behavior' in config:
                     behavior = str(config['blank_sample_domain_behavior']).strip().lower()
                     self.blank_sample_domain_behavior.setCurrentText('Infer From Blocks' if behavior == 'infer_from_blocks' else 'Skip')
@@ -15245,6 +15562,7 @@ if __name__ == "__main__":
                     config=cfg,
                     sample_domains=sample_domains,
                     sample_weights=sample_weights,
+                    build_visual_blocks=False,
                 )
                 
                 # Run interpolation (handle both single and sequential domain processing)
@@ -15275,8 +15593,7 @@ if __name__ == "__main__":
                         
                         # Generate stats for Pass 1 if String Theory
                         output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
-                        if hasattr(interp1, 'generate_statistics'):
-                            interp1.generate_statistics(output_dir, domain_name=f"{domain}_Pass1")
+                        _run_interpolator_statistics_with_retry(interp1, output_dir, f"{domain}_Pass1", parent=self)
 
                         last_interp = interp1
 
@@ -15324,8 +15641,7 @@ if __name__ == "__main__":
                             
                             # Generate stats for Pass 2 if String Theory
                             output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
-                            if hasattr(interp2, 'generate_statistics'):
-                                interp2.generate_statistics(output_dir, domain_name=f"{domain}_Pass2")
+                            _run_interpolator_statistics_with_retry(interp2, output_dir, f"{domain}_Pass2", parent=self)
                             last_interp = interp2
 
                         post_process_mode = _get_domain_post_process_mode(cfg, domain)
@@ -15363,8 +15679,7 @@ if __name__ == "__main__":
                         
                     # Generate stats if String Theory
                     output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
-                    if hasattr(interpolator, 'generate_statistics'):
-                        interpolator.generate_statistics(output_dir, domain_name="Global")
+                    _run_interpolator_statistics_with_retry(interpolator, output_dir, "Global", parent=self)
                 
                 # Export results (handles both single and multiple interpolators)
                 interpolation_file = export_blocks_to_file(blocks, interpolation_file)

@@ -450,6 +450,27 @@ class StringTheoryInterpolator(InterpolatorBase):
     
     def get_metadata(self) -> Dict[str, Any]:
         return self.stats
+
+    def _collect_sample_connection_rows(self) -> List[Tuple[Tuple[int, int, int], float, int]]:
+        connection_counts = {
+            pos: 0
+            for pos, block in self.blocks.items()
+            if block.get('is_sample')
+        }
+
+        for source_pos, _, _ in self.paths:
+            if source_pos in connection_counts:
+                connection_counts[source_pos] += 1
+
+        rows = []
+        for pos, connection_count in connection_counts.items():
+            value = self.blocks.get(pos, {}).get('value')
+            if value is None:
+                continue
+            rows.append((pos, float(value), int(connection_count)))
+
+        rows.sort(key=lambda row: (row[1], row[0]))
+        return rows
     
     def generate_statistics(self, output_dir: str, domain_name: str = "Global"):
         import matplotlib.pyplot as plt
@@ -523,6 +544,7 @@ class StringTheoryInterpolator(InterpolatorBase):
         
         # Sanitize domain name for filename
         safe_domain = "".join([c for c in domain_name if c.isalnum() or c in (' ', '_', '-')]).strip()
+        sample_connection_rows = self._collect_sample_connection_rows()
         
         # 1. Path Length Histogram
         plt.figure(figsize=(10, 6))
@@ -563,6 +585,34 @@ class StringTheoryInterpolator(InterpolatorBase):
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(stats_dir, f'dip_histogram_{safe_domain}.png'))
         plt.close()
+
+        # 4. Connection-count histogram per sample block
+        if sample_connection_rows:
+            connection_counts = [row[2] for row in sample_connection_rows]
+            unique_connection_counts = np.unique(connection_counts)
+            plt.figure(figsize=(10, 6))
+            if len(unique_connection_counts) == 1:
+                connection_count = int(unique_connection_counts[0])
+                plt.bar([connection_count], [len(connection_counts)], width=0.8, color='mediumpurple', edgecolor='black')
+            else:
+                min_count = int(np.min(connection_counts))
+                max_count = int(np.max(connection_counts))
+                bins = np.arange(min_count - 0.5, max_count + 1.5, 1.0)
+                plt.hist(connection_counts, bins=bins, color='mediumpurple', edgecolor='black')
+                if max_count - min_count <= 25:
+                    plt.xticks(range(min_count, max_count + 1))
+            plt.title(f'Sample Block Connection Count Distribution - {domain_name}')
+            plt.xlabel('Number of Connections')
+            plt.ylabel('Sample Block Count')
+            plt.grid(True, alpha=0.3)
+            plt.savefig(os.path.join(stats_dir, f'connection_count_histogram_{safe_domain}.png'))
+            plt.close()
+
+            with open(os.path.join(stats_dir, f'sample_connection_stats_{safe_domain}.csv'), 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['sample_x', 'sample_y', 'sample_z', 'sample_value', 'connection_count'])
+                for pos, sample_value, connection_count in sample_connection_rows:
+                    writer.writerow([pos[0], pos[1], pos[2], sample_value, connection_count])
         
         # Save raw stats to CSV
         with open(os.path.join(stats_dir, f'path_stats_{safe_domain}.csv'), 'w', newline='') as f:
