@@ -8995,9 +8995,24 @@ def _format_interpolator_run_counts(interpolator):
 
     return f" ({', '.join(counts)})"
 
+
+def _format_elapsed_runtime(elapsed_seconds):
+    total_seconds = max(float(elapsed_seconds or 0.0), 0.0)
+    if total_seconds < 60:
+        return f"{total_seconds:.1f}s"
+
+    whole_seconds = int(round(total_seconds))
+    minutes, seconds = divmod(whole_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s"
+
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m {seconds:02d}s"
+
 def _run_interpolator_with_progress(interpolator, dims, iterations, desc, on_first_iteration=None):
     profile = _get_interpolator_run_profile(interpolator, dims, iterations)
     print(profile['message'])
+    started_at = time.perf_counter()
 
     if profile['single_pass']:
         pbar = tqdm(total=profile['total'], desc=f"{desc} ({profile['desc_suffix']})", unit=profile['unit'])
@@ -9020,22 +9035,30 @@ def _run_interpolator_with_progress(interpolator, dims, iterations, desc, on_fir
         interpolated_blocks = metadata.get('interpolated_blocks')
         if interpolated_blocks is not None:
             pbar.set_postfix_str(f"interpolated={interpolated_blocks:,}")
+        elapsed_text = _format_elapsed_runtime(time.perf_counter() - started_at)
         pbar.n = pbar.total
-        pbar.set_description(f"{desc} (completed)")
+        pbar.set_description(f"{desc} (completed in {elapsed_text})")
         pbar.close()
-        print("Completed single pass")
+        print(f"Completed single pass in {elapsed_text}")
         return should_continue
 
     pbar = tqdm(range(profile['total']), desc=desc, unit=profile['unit'])
     should_continue = True
+    completed_iteration = 0
     for i in pbar:
         should_continue = interpolator.run_iteration(dims)
+        completed_iteration = i + 1
         if i == 0 and on_first_iteration is not None:
             on_first_iteration()
         if not should_continue or interpolator.is_converged():
-            pbar.set_description(f"{desc} (converged)")
-            print(f"Converged at iteration {i+1}")
+            elapsed_text = _format_elapsed_runtime(time.perf_counter() - started_at)
+            pbar.set_description(f"{desc} (converged in {elapsed_text})")
+            print(f"Converged at iteration {i+1} in {elapsed_text}")
             break
+    else:
+        elapsed_text = _format_elapsed_runtime(time.perf_counter() - started_at)
+        pbar.set_description(f"{desc} (completed in {elapsed_text})")
+        print(f"Completed {completed_iteration} iterations in {elapsed_text}")
     pbar.close()
     return should_continue
 
@@ -9103,6 +9126,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
     dims = tuple(blocks._block_info['dims'])
     block_evaluated_samples_file = getattr(plotter, '_block_evaluated_samples_file', None)
     post_process_config = {'domain_algorithm_overrides': getattr(plotter, '_domain_post_process_overrides', {})}
+    started_at = time.perf_counter()
     
     # Check if we have multiple interpolators (sequential domain processing)
     if hasattr(blocks, '_interpolators'):
@@ -9311,6 +9335,10 @@ def silent_interpolation(plotter, iterations, interpolation_file):
     interpolation_file = export_blocks_to_file(blocks, interpolation_file)
     if block_evaluated_samples_file:
         export_block_evaluated_samples_to_csv(blocks, block_evaluated_samples_file)
+    elapsed_text = _format_elapsed_runtime(time.perf_counter() - started_at)
+    print(f"Interpolation complete! Results saved to:\n  {interpolation_file}\nElapsed: {elapsed_text}")
+    if block_evaluated_samples_file:
+        print(f"Block-evaluated samples saved to:\n  {block_evaluated_samples_file}")
 
 def load_lfc_colormap(lfc_file):
     """Load a Leapfrog .lfc file returning (ListedColormap, boundaries, labels).
@@ -15408,6 +15436,7 @@ if __name__ == "__main__":
         def run_interpolation_only(self):
             """Run interpolation without visualization"""
             try:
+                started_at = time.perf_counter()
                 cfg = self.to_dict(include_runtime_state=True)
                 interpolation_file = resolve_interpolation_csv_export_path(cfg['interpolation_file'])
                 cfg['interpolation_file'] = interpolation_file
@@ -15699,13 +15728,14 @@ if __name__ == "__main__":
                 self.interp_edit.setText(interpolation_file)
                 if block_evaluated_samples_file:
                     export_block_evaluated_samples_to_csv(blocks, block_evaluated_samples_file)
-                print(f"Interpolation complete! Results saved to:\n  {interpolation_file}")
+                elapsed_text = _format_elapsed_runtime(time.perf_counter() - started_at)
+                print(f"Interpolation complete! Results saved to:\n  {interpolation_file}\nElapsed: {elapsed_text}")
                 if block_evaluated_samples_file:
                     print(f"Block-evaluated samples saved to:\n  {block_evaluated_samples_file}")
                 print("=" * 60)
                 self._prefer_interpolation_file_for_viewer = not _blocks_use_adaptive_leaf_cover(blocks)
                 
-                success_lines = [f"Interpolation complete!\nResults saved to:\n{interpolation_file}"]
+                success_lines = [f"Interpolation complete!\nResults saved to:\n{interpolation_file}\n\nElapsed: {elapsed_text}"]
                 if block_evaluated_samples_file:
                     success_lines.append(f"Block-evaluated samples saved to:\n{block_evaluated_samples_file}")
                 QtWidgets.QMessageBox.information(self, "Success", "\n\n".join(success_lines))
