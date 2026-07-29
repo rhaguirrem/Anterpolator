@@ -1,4 +1,5 @@
 import colorsys
+from decimal import Decimal, InvalidOperation
 import importlib
 import os
 import sys
@@ -42,6 +43,230 @@ def _value_passes_filter_range(values, value_filter_min=None, value_filter_max=N
     lower, upper = _normalize_value_filter_bounds(value_filter_min, value_filter_max)
     values = np.asarray(values, dtype=np.float32)
     return (values >= lower) & (values <= upper)
+
+
+DISPLAY_BLOCK_FILTER_FIELD_ALIASES = {
+    'value': 'Value',
+    'domain': 'Domain',
+    'is_sample': 'Is_Sample',
+}
+
+
+def _canonicalize_display_block_filter_field(field):
+    text = str(field or '').strip()
+    if not text:
+        return ''
+    return DISPLAY_BLOCK_FILTER_FIELD_ALIASES.get(text.lower(), text)
+
+
+def _normalize_categorical_filter_token(value):
+    if pd.isna(value):
+        return ''
+
+    text = str(value).strip()
+    if not text:
+        return ''
+
+    lowered = text.lower()
+    if '.' not in text and 'e' not in lowered:
+        return text
+
+    try:
+        numeric_value = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return text
+
+    if not numeric_value.is_finite():
+        return text
+
+    normalized = format(numeric_value.normalize(), 'f')
+    if '.' in normalized:
+        normalized = normalized.rstrip('0').rstrip('.')
+    if normalized == '-0':
+        normalized = '0'
+    return normalized or '0'
+
+
+def _normalize_display_block_is_sample_token(value):
+    if pd.isna(value):
+        return ''
+    if isinstance(value, (bool, np.bool_)):
+        return 'True' if bool(value) else 'False'
+
+    text = str(value).strip()
+    if not text:
+        return ''
+
+    lowered = text.lower()
+    if lowered in {'true', '1', 'yes', 'y', 'sample'}:
+        return 'True'
+    if lowered in {'false', '0', 'no', 'n', 'block'}:
+        return 'False'
+    return text
+
+
+def _normalize_display_block_categorical_value(field, value):
+    canonical_field = _canonicalize_display_block_filter_field(field)
+    if canonical_field == 'Is_Sample':
+        return _normalize_display_block_is_sample_token(value)
+    if canonical_field == 'Value':
+        return _normalize_categorical_filter_token(value)
+    if pd.isna(value):
+        return ''
+    return str(value).strip()
+
+
+def _normalize_display_block_filters(filters):
+    normalized_filters = []
+    for raw_filter in filters or []:
+        filter_spec = dict(raw_filter or {})
+        field = _canonicalize_display_block_filter_field(filter_spec.get('field', ''))
+        filter_type = str(filter_spec.get('type', '')).strip().lower()
+        if not field or filter_type not in {'categorical', 'numeric'}:
+            continue
+
+        if filter_type == 'categorical':
+            values = []
+            seen_values = set()
+            for raw_value in filter_spec.get('values', []) or []:
+                normalized_value = _normalize_display_block_categorical_value(field, raw_value)
+                if normalized_value in seen_values:
+                    continue
+                seen_values.add(normalized_value)
+                values.append(normalized_value)
+            if not values:
+                continue
+            normalized_filters.append({'field': field, 'type': 'categorical', 'values': values})
+            continue
+
+        min_value = filter_spec.get('min', None)
+        max_value = filter_spec.get('max', None)
+        min_value = None if min_value in ('', None) else float(min_value)
+        max_value = None if max_value in ('', None) else float(max_value)
+        if min_value is not None and max_value is not None and min_value > max_value:
+            min_value, max_value = max_value, min_value
+        normalized_filters.append({'field': field, 'type': 'numeric', 'min': min_value, 'max': max_value})
+
+    return normalized_filters
+
+
+def _extract_display_block_value_range(filters):
+    min_candidates = []
+    max_candidates = []
+    for filter_spec in _normalize_display_block_filters(filters):
+        if filter_spec.get('field') != 'Value' or filter_spec.get('type') != 'numeric':
+            continue
+        if filter_spec.get('min', None) is not None:
+            min_candidates.append(float(filter_spec['min']))
+        if filter_spec.get('max', None) is not None:
+            max_candidates.append(float(filter_spec['max']))
+    return (max(min_candidates) if min_candidates else None, min(max_candidates) if max_candidates else None)
+
+
+def _summarize_display_block_filter(filter_spec):
+    field = str(filter_spec.get('field', '')).strip()
+    filter_type = str(filter_spec.get('type', '')).strip().lower()
+    if filter_type == 'categorical':
+        values = [str(value) for value in filter_spec.get('values', [])]
+        preview = ', '.join(values[:3])
+        if len(values) > 3:
+            preview += ', ...'
+        return f"{field} in [{preview}]"
+    min_value = filter_spec.get('min', None)
+    max_value = filter_spec.get('max', None)
+    if min_value is None and max_value is None:
+        return f'{field}: all numeric values'
+    if min_value is None:
+        return f'{field} <= {max_value}'
+    if max_value is None:
+        return f'{field} >= {min_value}'
+    return f'{field} in [{min_value}, {max_value}]'
+
+
+def _describe_display_block_filters(filters, max_entries=2):
+    summaries = [_summarize_display_block_filter(spec) for spec in _normalize_display_block_filters(filters)]
+    if not summaries:
+        return 'none'
+    preview = summaries[:max_entries]
+    if len(summaries) > max_entries:
+        preview.append(f'+{len(summaries) - max_entries} more')
+    return '; '.join(preview)
+
+
+def _display_block_filter_mask(snapshot, filters):
+    positions = snapshot.get('positions', np.zeros((0, 3), dtype=np.float32))
+    row_count = len(positions)
+    if row_count == 0:
+        return np.zeros(0, dtype=bool)
+
+    normalized_filters = _normalize_display_block_filters(filters)
+    if not normalized_filters:
+        return np.ones(row_count, dtype=bool)
+
+    mask = np.ones(row_count, dtype=bool)
+    values = np.asarray(snapshot['values'], dtype=np.float32)
+    domains = np.asarray(snapshot['domains'], dtype=object)
+    is_sample = np.asarray(snapshot['is_sample'], dtype=bool)
+
+    for filter_spec in normalized_filters:
+        field = filter_spec['field']
+        filter_type = filter_spec['type']
+
+        if field == 'Value':
+            if filter_type == 'numeric':
+                local_mask = np.isfinite(values)
+                min_value = filter_spec.get('min', None)
+                max_value = filter_spec.get('max', None)
+                if min_value is not None:
+                    local_mask &= values >= float(min_value)
+                if max_value is not None:
+                    local_mask &= values <= float(max_value)
+            else:
+                normalized_values = np.asarray([
+                    _normalize_display_block_categorical_value('Value', value)
+                    for value in values
+                ], dtype=object)
+                local_mask = np.isin(normalized_values, list(filter_spec.get('values', [])))
+        elif field == 'Domain':
+            normalized_domains = np.asarray([
+                _normalize_display_block_categorical_value('Domain', value)
+                for value in domains
+            ], dtype=object)
+            if filter_type == 'numeric':
+                numeric_domains = pd.to_numeric(normalized_domains, errors='coerce')
+                local_mask = ~pd.isna(numeric_domains)
+                min_value = filter_spec.get('min', None)
+                max_value = filter_spec.get('max', None)
+                if min_value is not None:
+                    local_mask &= numeric_domains >= float(min_value)
+                if max_value is not None:
+                    local_mask &= numeric_domains <= float(max_value)
+                local_mask = np.asarray(local_mask, dtype=bool)
+            else:
+                local_mask = np.isin(normalized_domains, list(filter_spec.get('values', [])))
+        else:
+            if filter_type == 'numeric':
+                numeric_is_sample = is_sample.astype(np.float32)
+                local_mask = np.ones(row_count, dtype=bool)
+                min_value = filter_spec.get('min', None)
+                max_value = filter_spec.get('max', None)
+                if min_value is not None:
+                    local_mask &= numeric_is_sample >= float(min_value)
+                if max_value is not None:
+                    local_mask &= numeric_is_sample <= float(max_value)
+            else:
+                allowed_tokens = set(filter_spec.get('values', []))
+                local_mask = np.zeros(row_count, dtype=bool)
+                if 'True' in allowed_tokens:
+                    local_mask |= is_sample
+                if 'False' in allowed_tokens:
+                    local_mask |= ~is_sample
+
+        mask &= np.asarray(local_mask, dtype=bool)
+        if not np.any(mask):
+            break
+
+    return mask
 
 
 def get_taichi_module():
@@ -445,6 +670,7 @@ class TaichiInterpolationViewer:
         sample_values,
         blocks_data,
         block_size,
+        display_block_filters=None,
         value_filter=0.0,
         value_filter_min=None,
         value_filter_max=None,
@@ -466,8 +692,16 @@ class TaichiInterpolationViewer:
         self.min_bounds = np.asarray(self.block_info.get('min_bounds', np.zeros(3)), dtype=np.float32)
         self.positions_are_world = bool(self.block_info.get('positions_are_world', False))
         self.value_filter = float(value_filter)
-        self.value_filter_min = float(value_filter if value_filter_min is None else value_filter_min)
+        self.value_filter_min = None if value_filter_min is None else float(value_filter_min)
         self.value_filter_max = None if value_filter_max is None else float(value_filter_max)
+        if display_block_filters is None:
+            legacy_min = self.value_filter if self.value_filter_min is None else self.value_filter_min
+            self.display_block_filters = _normalize_display_block_filters([
+                {'field': 'Value', 'type': 'numeric', 'min': legacy_min, 'max': self.value_filter_max}
+            ])
+        else:
+            self.display_block_filters = _normalize_display_block_filters(display_block_filters)
+        self._sync_display_filter_bounds()
         self.config = config or {}
         self.window_title = window_title
         self.lfc_colors = lfc_colors or []
@@ -538,9 +772,20 @@ class TaichiInterpolationViewer:
         self.blocks_data = state['blocks_data']
         self.block_size = np.asarray(state['block_size'], dtype=np.float32)
         self.value_filter = float(state.get('value_filter', 0.0))
-        self.value_filter_min = float(state.get('value_filter_min', self.value_filter))
+        self.value_filter_min = state.get('value_filter_min', None)
+        if self.value_filter_min is not None:
+            self.value_filter_min = float(self.value_filter_min)
         raw_value_filter_max = state.get('value_filter_max')
         self.value_filter_max = None if raw_value_filter_max is None else float(raw_value_filter_max)
+        display_block_filters = state.get('display_block_filters', None)
+        if display_block_filters is None:
+            legacy_min = self.value_filter if self.value_filter_min is None else self.value_filter_min
+            self.display_block_filters = _normalize_display_block_filters([
+                {'field': 'Value', 'type': 'numeric', 'min': legacy_min, 'max': self.value_filter_max}
+            ])
+        else:
+            self.display_block_filters = _normalize_display_block_filters(display_block_filters)
+        self._sync_display_filter_bounds()
         self.config = state.get('config', {}) or {}
         self.window_title = state.get('window_title', self.window_title)
         self.lfc_colors = state.get('lfc_colors', []) or []
@@ -888,15 +1133,13 @@ class TaichiInterpolationViewer:
                         self._clear_external_wheel_delta()
                         self._set_status('View reset to initial camera position.')
                     elif event_key == '[':
-                        self.value_filter_min -= 1.0
-                        self.value_filter = self.value_filter_min
+                        self._adjust_display_value_filter_min(-1.0)
                         self._refresh_render_data()
-                        self._set_status(f"value_filter_min={self.value_filter_min}, value_filter_max={self.value_filter_max}")
+                        self._set_status(self._display_filter_text())
                     elif event_key == ']':
-                        self.value_filter_min += 1.0
-                        self.value_filter = self.value_filter_min
+                        self._adjust_display_value_filter_min(1.0)
                         self._refresh_render_data()
-                        self._set_status(f"value_filter_min={self.value_filter_min}, value_filter_max={self.value_filter_max}")
+                        self._set_status(self._display_filter_text())
                     elif event_key_lower == 'z':
                         self._apply_zoom_delta(camera, orbit_pivot, 1.0, movement_speed, wheel_zoom_factor)
                         self._set_status('Zoom in')
@@ -1271,6 +1514,8 @@ class TaichiInterpolationViewer:
         interp.next_block_id = (max(existing_ids) + 1) if existing_ids else 1
 
     def _run_single_interpolator_iteration(self, interp, dims):
+        if getattr(interp, '_post_process_only', False):
+            return False, False, True
         self._ensure_interpolator_next_block_id(interp)
         try:
             previous_blocks = len(interp.get_interpolated_values())
@@ -1300,8 +1545,6 @@ class TaichiInterpolationViewer:
             return 'skip'
         domain_overrides = self.config.get('domain_algorithm_overrides') or {}
         domain_cfg = domain_overrides.get(domain) or {}
-        if domain_cfg.get('skip', False):
-            return 'skip'
         mode = str(domain_cfg.get('post_process', 'skip')).strip().lower()
         if mode in ('fill_with_average', 'fill average', 'fill_average', 'fill'):
             return 'fill_with_average'
@@ -1445,18 +1688,63 @@ class TaichiInterpolationViewer:
             return np.full((len(self.sample_points), 3), 0.6, dtype=np.float32)
         return map_values_to_colors(self.sample_values, self.lfc_colors, self.lfc_bins)
 
+    def _sync_display_filter_bounds(self):
+        value_filter_min, value_filter_max = _extract_display_block_value_range(self.display_block_filters)
+        self.value_filter_min = value_filter_min
+        self.value_filter_max = value_filter_max
+        self.value_filter = 0.0 if value_filter_min is None else float(value_filter_min)
+
+    def _block_filter_mask(self, snapshot=None):
+        snapshot = self._raw_snapshot if snapshot is None else snapshot
+        if snapshot is None:
+            return np.zeros(0, dtype=bool)
+        return _display_block_filter_mask(snapshot, self.display_block_filters)
+
+    def _display_filter_text(self):
+        return f"Filters: {_describe_display_block_filters(self.display_block_filters)}"
+
+    def _adjust_display_value_filter_min(self, delta):
+        delta = float(delta)
+        filters = [dict(entry) for entry in self.display_block_filters]
+        target_index = None
+        for index, filter_spec in enumerate(filters):
+            if filter_spec.get('field') == 'Value' and filter_spec.get('type') == 'numeric':
+                target_index = index
+                break
+
+        if target_index is None:
+            base_min = 0.0 if self.value_filter_min is None else float(self.value_filter_min)
+            filters.insert(0, {
+                'field': 'Value',
+                'type': 'numeric',
+                'min': base_min + delta,
+                'max': self.value_filter_max,
+            })
+        else:
+            updated_filter = dict(filters[target_index])
+            base_min = updated_filter.get('min', None)
+            base_min = 0.0 if base_min is None else float(base_min)
+            updated_filter['min'] = base_min + delta
+            max_value = updated_filter.get('max', None)
+            if max_value is not None and updated_filter['min'] > float(max_value):
+                updated_filter['min'] = float(max_value)
+            filters[target_index] = updated_filter
+
+        self.display_block_filters = _normalize_display_block_filters(filters)
+        self._sync_display_filter_bounds()
+
     def _block_display_arrays(self):
         snapshot = self._raw_snapshot
         if snapshot is None or len(snapshot['positions']) == 0:
             return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
 
+        mask = self._block_filter_mask(snapshot)
+
         if self.color_mode == 'domain' and self.domain_data_available:
-            mask = np.ones(len(snapshot['positions']), dtype=bool)
             colors = [self._domain_color_map.get(str(domain).strip() or 'Undomained', self._domain_color_map['Undomained']) for domain in snapshot['domains']]
             return snapshot['positions'][mask], np.asarray(colors, dtype=np.float32)[mask]
 
         values = snapshot['values']
-        mask = snapshot['is_sample'] | _value_passes_filter_range(values, self.value_filter_min, self.value_filter_max)
         colors = map_values_to_colors(values, self.lfc_colors, self.lfc_bins)
         return snapshot['positions'][mask], colors[mask]
 
@@ -1745,10 +2033,7 @@ class TaichiInterpolationViewer:
 
         mask = np.zeros(len(snapshot['positions']), dtype=bool)
         if self.show_blocks:
-            if self.color_mode == 'domain' and self.domain_data_available:
-                mask |= np.ones(len(snapshot['positions']), dtype=bool)
-            else:
-                mask |= snapshot['is_sample'] | _value_passes_filter_range(snapshot['values'], self.value_filter_min, self.value_filter_max)
+            mask |= self._block_filter_mask(snapshot)
         if self.show_samples and not self.show_blocks:
             mask |= snapshot['is_sample']
         if not np.any(mask):
@@ -2264,11 +2549,7 @@ class TaichiInterpolationViewer:
             gui.text(f"Filled faces: {'on' if self.show_filled_block_faces else 'off'}", color=(0.84, 0.84, 0.84))
             gui.text(f"Flat faces: {'on' if self._use_flat_block_lighting else 'off'}", color=(0.84, 0.84, 0.84))
             gui.text(f"Visible points: samples={self._sample_count} blocks={self._block_count}", color=(0.84, 0.84, 0.84))
-            if self.value_filter_max is None:
-                filter_text = f"Filter: >= {self.value_filter_min:.2f}"
-            else:
-                filter_text = f"Filter: {self.value_filter_min:.2f} to {self.value_filter_max:.2f}"
-            gui.text(filter_text, color=(0.84, 0.84, 0.84))
+            gui.text(self._display_filter_text(), color=(0.84, 0.84, 0.84))
             if self._last_status:
                 gui.text(self._last_status[:72], color=(0.78, 0.90, 0.98))
 
@@ -2312,6 +2593,7 @@ def create_viewer_from_files(
     sample_z_col=None,
     sample_value_col=None,
     block_size=(10.0, 10.0, 10.0),
+    display_block_filters=None,
     value_filter=0.0,
     value_filter_min=None,
     value_filter_max=None,
@@ -2391,6 +2673,7 @@ def create_viewer_from_files(
         sample_domains=sample_domains,
         blocks_data=blocks_data,
         block_size=block_size,
+        display_block_filters=display_block_filters,
         value_filter=value_filter,
         value_filter_min=value_filter_min,
         value_filter_max=value_filter_max,

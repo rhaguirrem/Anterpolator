@@ -14,7 +14,7 @@ def normalize_provenance_algorithm_name(algo_name: Any) -> Tuple[str, str]:
     if 'fill with average' in name or 'fill_with_average' in name or 'fill average' in name:
         return 'Fill with Average', 'fill_with_average'
     if 'ant colony' in name or 'anterpolator' in name:
-        return 'Anterpolator', 'ant_colony'
+        return 'Ant Colony', 'ant_colony'
     if 'adaptive octree' in name:
         return 'Adaptive Octree', 'adaptive_octree'
     if 'string theory' in name:

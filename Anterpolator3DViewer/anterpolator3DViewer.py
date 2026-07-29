@@ -199,6 +199,7 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             background_value=config.get('background_value', 0.0),
             background_distance=config.get('background_distance', None),
             average_with_blocks=config.get('average_with_blocks', False),
+            prioritize_blank_unvisited_neighbors=config.get('prioritize_blank_unvisited_neighbors', True),
             avoid_visited_threshold_enabled=config.get('avoid_visited_threshold_enabled', False),
             avoid_visited_threshold=config.get('avoid_visited_threshold', 100),
             ants_sampling_percentage=config.get('ants_sampling_percentage', 100.0),
@@ -2334,7 +2335,7 @@ def load_large_blocks_metadata(blocks_file, delimiter, header_line, block_size, 
     if config and 'domain_algorithm_overrides' in config:
         skipped_domains = {
             domain for domain, cfg in config['domain_algorithm_overrides'].items()
-            if cfg.get('skip', False)
+            if cfg.get('skip', False) and _normalize_domain_post_process_mode(cfg.get('post_process', 'skip')) == 'skip'
         }
 
     print(f"Streaming blocks file ({os.path.getsize(blocks_file) / 1024**3:.2f} GiB) with chunks of {chunksize:,} rows.")
@@ -2799,7 +2800,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
 
             if config and 'domain_algorithm_overrides' in config:
                 skipped_domains = {domain for domain, cfg in config['domain_algorithm_overrides'].items()
-                                 if cfg.get('skip', False)}
+                                 if cfg.get('skip', False) and _normalize_domain_post_process_mode(cfg.get('post_process', 'skip')) == 'skip'}
                 if skipped_domains:
                     print(f"Skipping domains: {skipped_domains}")
                     keep_mask = ~domains.isin(skipped_domains)
@@ -3012,10 +3013,44 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             for domain, domain_samples in samples_by_domain.items():
                 # Determine which algorithm for this domain
                 domain_config = config['domain_algorithm_overrides'].get(domain, {})
+                post_process_mode = _normalize_domain_post_process_mode(domain_config.get('post_process', 'skip'))
                 
                 # First Pass
                 if domain_config.get('skip', False):
-                    print(f"  Skipping domain: {domain}")
+                    if post_process_mode == 'skip':
+                        print(f"  Skipping domain: {domain}")
+                        continue
+
+                    print(f"  Domain '{domain}': fill-only post-process using original samples")
+                    domain_interpolators = []
+                    fill_cfg = config.copy()
+                    fill_cfg['algorithm'] = 'ant_colony'
+                    interp_fill = create_interpolator(fill_cfg, domain=domain, current_algorithm='ant_colony')
+
+                    domain_allowed_grid = {pos for pos in allowed_grid if domain_mapping.get(pos) == domain}
+                    domain_sample_mapping = {pos: domain for pos in domain_samples}
+                    print(f"  Domain '{domain}' volume: {len(domain_allowed_grid)} blocks")
+
+                    has_extra_blocks = len(domain_allowed_grid) > len(domain_samples) * 1.2
+                    print(f"  Domain '{domain}' sparse check: allowed={len(domain_allowed_grid)}, samples={len(domain_samples)}, has_extra={has_extra_blocks}")
+
+                    if has_extra_blocks:
+                        interp_fill.allowed_grid_override = domain_allowed_grid
+                        interp_fill.domain_mapping = {pos: domain for pos in domain_allowed_grid}
+                        use_mapping = True
+                    else:
+                        interp_fill.allowed_grid_override = None
+                        interp_fill.domain_mapping = None
+                        use_mapping = False
+
+                    interp_fill.initialize_blocks(domain_samples, tuple(block_info['dims']),
+                                             all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping,
+                                             sample_domain_mapping=domain_sample_mapping,
+                                             sample_block_counts={pos: multiblock._sample_block_counts.get(pos, 1) for pos in domain_samples},
+                                             sample_block_weight_sums={pos: multiblock._sample_block_weight_sums.get(pos, 1.0) for pos in domain_samples})
+                    interp_fill._post_process_only = True
+                    domain_interpolators.append(interp_fill)
+                    multiblock._interpolators[domain] = domain_interpolators
                     continue
                 
                 algo1 = domain_config.get('algorithm', config.get('algorithm', 'ant_colony'))
@@ -3641,13 +3676,16 @@ def _value_passes_filter_range(value, value_filter_min=None, value_filter_max=No
     return lower <= float(value) <= upper
 
 def _should_display_block(plotter, pos, block):
-    if pos in plotter._blocks_data._sample_blocks:
+    filters = getattr(plotter, '_display_block_filters', None)
+    if not filters:
         return True
-    return _value_passes_filter_range(
-        _get_block_raw_value(block),
-        getattr(plotter, '_value_filter_min', getattr(plotter, '_value_filter', 0.0)),
-        getattr(plotter, '_value_filter_max', None),
-    )
+
+    record = {
+        'Value': _get_block_raw_value(block),
+        'Domain': block.cell_data['Domain'][0] if 'Domain' in block.cell_data else 'Undomained',
+        'Is_Sample': pos in plotter._blocks_data._sample_blocks,
+    }
+    return display_block_record_matches_filters(record, filters)
 
 def _create_visible_blocks(plotter):
     pv = _require_pyvista()
@@ -3657,7 +3695,7 @@ def _create_visible_blocks(plotter):
         if _should_display_block(plotter, pos, block):
             visible_blocks.append(block)
             visible_positions.add(pos)
-    if len(visible_blocks) == 0 and len(plotter._block_lookup) > 0:
+    if len(visible_blocks) == 0 and len(plotter._block_lookup) > 0 and not getattr(plotter, '_display_block_filters', None):
         for block in plotter._block_lookup.values():
             visible_blocks.append(block)
         visible_positions = set(plotter._block_lookup.keys())
@@ -3885,8 +3923,7 @@ def update_interpolation(plotter):
         if new_block_count > 0 and not new_visible_added:
             print(
                 "New blocks were created, but none passed the visibility filter. "
-                f"Current value_filter_range=({getattr(plotter, '_value_filter_min', getattr(plotter, '_value_filter', 0.0))}, "
-                f"{getattr(plotter, '_value_filter_max', 'inf')})."
+                f"Active display filters: {describe_display_block_filters(getattr(plotter, '_display_block_filters', []))}."
             )
 
         plotter.render()
@@ -4097,16 +4134,22 @@ def resolve_equation_finder_export_path(configured_path=None, samples_file=None,
     return os.path.join(output_dir, f"{base_name}+{domain_suffix}+{value_suffix}_equations.csv")
 
 
-def load_samples_preview_dataframe(samples_file, samples_delimiter=None, samples_header_line=1, max_rows=500):
-    delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
+def load_csv_preview_dataframe(csv_file, delimiter=None, header_line=1, max_rows=500):
+    if is_bmf_file(csv_file):
+        df = read_autodetect_csv(csv_file, min_cols=1)
+        df = df.head(max(int(max_rows or 0), 1)).reset_index(drop=True)
+        df._detected_delimiter = 'bmf'
+        return df, 'bmf'
+
+    delimiter = delimiter or detect_csv_delimiter(csv_file)
     preview_rows = max(int(max_rows or 0), 1)
 
-    if samples_header_line and samples_header_line != 1:
-        effective_header_line = resolve_effective_csv_header_line(samples_file, samples_header_line)
-        headers = parse_header_line(samples_file, delimiter, effective_header_line)
+    if header_line and header_line != 1:
+        effective_header_line = resolve_effective_csv_header_line(csv_file, header_line)
+        headers = parse_header_line(csv_file, delimiter, effective_header_line)
         final_names = build_unique_column_names(headers)
         read_kwargs = prepare_csv_read_kwargs(
-            samples_file,
+            csv_file,
             delimiter=delimiter,
             header=None,
             names=final_names,
@@ -4114,17 +4157,17 @@ def load_samples_preview_dataframe(samples_file, samples_delimiter=None, samples
             comment='#',
             nrows=preview_rows + 1,
         )
-        df = pd.read_csv(samples_file, **read_kwargs)
+        df = pd.read_csv(csv_file, **read_kwargs)
         if df.shape[0] and all(str(df.iloc[0, i]).strip() == final_names[i] for i in range(min(len(final_names), df.shape[1]))):
             df = df.iloc[1:].reset_index(drop=True)
     else:
         read_kwargs = prepare_csv_read_kwargs(
-            samples_file,
+            csv_file,
             delimiter=delimiter,
             comment='#',
             nrows=preview_rows,
         )
-        df = pd.read_csv(samples_file, **read_kwargs)
+        df = pd.read_csv(csv_file, **read_kwargs)
 
     df = strip_leading_non_data_rows(df)
 
@@ -4134,6 +4177,39 @@ def load_samples_preview_dataframe(samples_file, samples_delimiter=None, samples
 
     df._detected_delimiter = delimiter
     return df, delimiter
+
+
+def load_samples_preview_dataframe(samples_file, samples_delimiter=None, samples_header_line=1, max_rows=500):
+    return load_csv_preview_dataframe(
+        samples_file,
+        delimiter=samples_delimiter,
+        header_line=samples_header_line,
+        max_rows=max_rows,
+    )
+
+
+def build_display_block_filter_preview_frame(df, value_col=None, domain_col=None, is_sample_value=None):
+    preview = pd.DataFrame(index=df.index)
+    if value_col and value_col in df.columns:
+        preview['Value'] = df[value_col]
+    else:
+        preview['Value'] = np.nan
+
+    if domain_col and domain_col in df.columns:
+        preview['Domain'] = df[domain_col].fillna('').astype(str).str.strip()
+    else:
+        preview['Domain'] = ''
+
+    if is_sample_value is None:
+        if 'Is_Sample' in df.columns:
+            preview['Is_Sample'] = df['Is_Sample'].map(_normalize_display_block_is_sample_token)
+        else:
+            preview['Is_Sample'] = 'False'
+    else:
+        preview['Is_Sample'] = 'True' if bool(is_sample_value) else 'False'
+
+    preview['Is_Sample'] = preview['Is_Sample'].replace('', 'False')
+    return preview[['Value', 'Domain', 'Is_Sample']].copy()
 
 
 def infer_numeric_sample_columns(df, delimiter=None, minimum_success_ratio=0.8):
@@ -4721,6 +4797,208 @@ def get_configured_block_filters(config):
     if filters is None:
         filters = config.get('block_volume_weighted_filters', [])
     return [dict(entry) for entry in (filters or [])]
+
+
+def get_configured_display_block_filters(config):
+    if not config:
+        return []
+
+    filters = config.get('display_block_filters', None)
+    if filters is not None:
+        return normalize_display_block_filters(filters)
+
+    legacy_min = config.get('value_filter_min', config.get('value_filter', None))
+    legacy_max = config.get('value_filter_max', None)
+    if legacy_min in ('', None) and legacy_max in ('', None):
+        return []
+
+    min_value = None if legacy_min in ('', None) else float(legacy_min)
+    max_value = None if legacy_max in ('', None) else float(legacy_max)
+    if max_value is not None and max_value >= 1e9:
+        max_value = None
+    if min_value is None and max_value is None:
+        return []
+    return normalize_display_block_filters([
+        {'field': 'Value', 'type': 'numeric', 'min': min_value, 'max': max_value}
+    ])
+
+
+DISPLAY_BLOCK_FILTER_FIELD_ALIASES = {
+    'value': 'Value',
+    'domain': 'Domain',
+    'is_sample': 'Is_Sample',
+}
+DISPLAY_BLOCK_FILTER_FIELDS = tuple(DISPLAY_BLOCK_FILTER_FIELD_ALIASES.values())
+
+
+def _canonicalize_display_block_filter_field(field):
+    text = str(field or '').strip()
+    if not text:
+        return ''
+    return DISPLAY_BLOCK_FILTER_FIELD_ALIASES.get(text.lower(), text)
+
+
+def _normalize_display_block_is_sample_token(value):
+    if pd.isna(value):
+        return ''
+    if isinstance(value, (bool, np.bool_)):
+        return 'True' if bool(value) else 'False'
+
+    text = str(value).strip()
+    if not text:
+        return ''
+
+    lowered = text.lower()
+    if lowered in {'true', '1', 'yes', 'y', 'sample'}:
+        return 'True'
+    if lowered in {'false', '0', 'no', 'n', 'block'}:
+        return 'False'
+    return text
+
+
+def _normalize_display_block_categorical_value(field, value):
+    canonical_field = _canonicalize_display_block_filter_field(field)
+    if canonical_field == 'Is_Sample':
+        return _normalize_display_block_is_sample_token(value)
+    if canonical_field == 'Value':
+        return _normalize_categorical_filter_token(value)
+    if pd.isna(value):
+        return ''
+    return str(value).strip()
+
+
+def _coerce_display_block_numeric_value(value):
+    numeric_value = pd.to_numeric([value], errors='coerce')[0]
+    if pd.isna(numeric_value):
+        return None
+    return float(numeric_value)
+
+
+def normalize_display_block_filters(filters):
+    normalized_filters = []
+    for raw_filter in filters or []:
+        filter_spec = dict(raw_filter or {})
+        field = _canonicalize_display_block_filter_field(filter_spec.get('field', ''))
+        filter_type = str(filter_spec.get('type', '')).strip().lower()
+
+        if not field:
+            raise ValueError('Each display filter must define a field name.')
+        if field not in DISPLAY_BLOCK_FILTER_FIELDS:
+            supported = ', '.join(DISPLAY_BLOCK_FILTER_FIELDS)
+            raise ValueError(f'Display filter field not supported: {field}. Supported fields: {supported}')
+
+        if filter_type == 'categorical':
+            values = []
+            seen_values = set()
+            for raw_value in filter_spec.get('values', []) or []:
+                normalized_value = _normalize_display_block_categorical_value(field, raw_value)
+                if normalized_value in seen_values:
+                    continue
+                seen_values.add(normalized_value)
+                values.append(normalized_value)
+            if not values:
+                raise ValueError(f'Categorical display filter for {field} must include at least one value.')
+            normalized_filters.append({
+                'field': field,
+                'type': 'categorical',
+                'values': values,
+            })
+            continue
+
+        if filter_type == 'numeric':
+            min_value = filter_spec.get('min', None)
+            max_value = filter_spec.get('max', None)
+            min_value = None if min_value in ('', None) else float(min_value)
+            max_value = None if max_value in ('', None) else float(max_value)
+            if min_value is not None and max_value is not None and min_value > max_value:
+                raise ValueError(f'Numeric display filter for {field} has min greater than max.')
+            normalized_filters.append({
+                'field': field,
+                'type': 'numeric',
+                'min': min_value,
+                'max': max_value,
+            })
+            continue
+
+        raise ValueError(f'Unsupported display filter type for {field}: {filter_type}')
+
+    return normalized_filters
+
+
+def get_display_block_filter_summaries(filters):
+    return [summarize_sample_filter_spec(spec) for spec in normalize_display_block_filters(filters)]
+
+
+def format_display_block_filters_summary(filters, empty_text='No display filters configured. All blocks remain visible.', max_lines=4):
+    summaries = get_display_block_filter_summaries(filters)
+    if not summaries:
+        return empty_text
+    if len(summaries) <= max_lines:
+        return '\n'.join(summaries)
+    remaining = len(summaries) - max_lines
+    return '\n'.join(summaries[:max_lines] + [f'... {remaining} more'])
+
+
+def describe_display_block_filters(filters, max_entries=2):
+    summaries = get_display_block_filter_summaries(filters)
+    if not summaries:
+        return 'none'
+    preview = summaries[:max_entries]
+    if len(summaries) > max_entries:
+        preview.append(f'+{len(summaries) - max_entries} more')
+    return '; '.join(preview)
+
+
+def extract_display_block_value_range(filters):
+    min_candidates = []
+    max_candidates = []
+    for filter_spec in normalize_display_block_filters(filters):
+        if filter_spec.get('field') != 'Value' or filter_spec.get('type') != 'numeric':
+            continue
+        min_value = filter_spec.get('min', None)
+        max_value = filter_spec.get('max', None)
+        if min_value is not None:
+            min_candidates.append(float(min_value))
+        if max_value is not None:
+            max_candidates.append(float(max_value))
+
+    effective_min = max(min_candidates) if min_candidates else None
+    effective_max = min(max_candidates) if max_candidates else None
+    return effective_min, effective_max
+
+
+def display_block_record_matches_filters(record, filters):
+    for filter_spec in filters or []:
+        field = _canonicalize_display_block_filter_field(filter_spec.get('field', ''))
+        if not field:
+            return False
+
+        value = record.get(field, None)
+        filter_type = str(filter_spec.get('type', '')).strip().lower()
+        if filter_type == 'categorical':
+            allowed_values = {
+                _normalize_display_block_categorical_value(field, candidate)
+                for candidate in filter_spec.get('values', []) or []
+            }
+            if _normalize_display_block_categorical_value(field, value) not in allowed_values:
+                return False
+            continue
+
+        if filter_type == 'numeric':
+            numeric_value = _coerce_display_block_numeric_value(value)
+            if numeric_value is None:
+                return False
+            min_value = filter_spec.get('min', None)
+            max_value = filter_spec.get('max', None)
+            if min_value is not None and numeric_value < float(min_value):
+                return False
+            if max_value is not None and numeric_value > float(max_value):
+                return False
+            continue
+
+        return False
+
+    return True
 
 
 def _normalize_categorical_filter_token(value):
@@ -9122,8 +9400,6 @@ def _get_domain_post_process_mode(config, domain):
         return 'skip'
     domain_overrides = config.get('domain_algorithm_overrides') or {}
     domain_cfg = domain_overrides.get(domain) or {}
-    if domain_cfg.get('skip', False):
-        return 'skip'
     return _normalize_domain_post_process_mode(domain_cfg.get('post_process', 'skip'))
 
 def _run_domain_post_process(interpolator, dims, mode, domain_label=None):
@@ -9155,33 +9431,38 @@ def silent_interpolation(plotter, iterations, interpolation_file):
             
             # --- Pass 1 ---
             interp1 = interpolator_list[0]
-            algo_name1 = interp1.get_algorithm_name()
-            print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 1 ({algo_name1}) ===")
-            seed_original_sample_provenance(interp1)
-            pass1_snapshot = snapshot_interpolator_state(interp1)
-            
-            # Force verbose for first iteration if it's an AntColony
-            if hasattr(interp1, 'verbose'):
-                original_verbose = interp1.verbose
-                interp1.verbose = True
-
-            _run_interpolator_with_progress(
-                interp1,
-                dims,
-                iterations,
-                f"Domain {domain} - Pass 1",
-                on_first_iteration=(lambda interp=interp1, verbose=original_verbose: setattr(interp, 'verbose', verbose)) if hasattr(interp1, 'verbose') else None,
-            )
-            
-            # Generate stats for Pass 1 if String Theory
             output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
-            _run_interpolator_statistics_with_retry(interp1, output_dir, f"{domain}_Pass1")
-            finalize_phase_provenance(interp1, 'First Pass', algo_name1, pass1_snapshot)
+            if getattr(interp1, '_post_process_only', False):
+                print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Post-process only (Fill with Average) ===")
+                seed_original_sample_provenance(interp1)
+                last_interp = interp1
+            else:
+                algo_name1 = interp1.get_algorithm_name()
+                print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 1 ({algo_name1}) ===")
+                seed_original_sample_provenance(interp1)
+                pass1_snapshot = snapshot_interpolator_state(interp1)
+                
+                # Force verbose for first iteration if it's an AntColony
+                if hasattr(interp1, 'verbose'):
+                    original_verbose = interp1.verbose
+                    interp1.verbose = True
 
-            last_interp = interp1
+                _run_interpolator_with_progress(
+                    interp1,
+                    dims,
+                    iterations,
+                    f"Domain {domain} - Pass 1",
+                    on_first_iteration=(lambda interp=interp1, verbose=original_verbose: setattr(interp, 'verbose', verbose)) if hasattr(interp1, 'verbose') else None,
+                )
+                
+                # Generate stats for Pass 1 if String Theory
+                _run_interpolator_statistics_with_retry(interp1, output_dir, f"{domain}_Pass1")
+                finalize_phase_provenance(interp1, 'First Pass', algo_name1, pass1_snapshot)
+
+                last_interp = interp1
 
             # --- Pass 2 ---
-            if len(interpolator_list) > 1:
+            if not getattr(interp1, '_post_process_only', False) and len(interpolator_list) > 1:
                 interp2 = interpolator_list[1]
                 algo_name2 = interp2.get_algorithm_name()
                 print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 2 ({algo_name2}) ===")
@@ -9310,7 +9591,6 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                      finalize_phase_provenance(interp2, 'Second Pass', algo_name2, pass2_snapshot)
                 
                 # Generate stats for Pass 2 if String Theory
-                output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
                 _run_interpolator_statistics_with_retry(interp2, output_dir, f"{domain}_Pass2")
                 last_interp = interp2
 
@@ -9478,6 +9758,8 @@ def build_taichi_viewer_state_from_config(config):
         and str(config.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
     )
     wants_domain_any = wants_st_domain or wants_ant_domain
+    display_block_filters = get_configured_display_block_filters(config)
+    value_filter_min, value_filter_max = extract_display_block_value_range(display_block_filters)
     sample_filters = get_configured_sample_filters(config)
     block_filters = get_configured_block_filters(config)
     needs_sample_domains = should_resolve_sample_domains_for_interpolation(
@@ -9631,9 +9913,10 @@ def build_taichi_viewer_state_from_config(config):
         'sample_domains': sample_domains,
         'blocks_data': blocks,
         'block_size': config['block_size'],
-        'value_filter': config.get('value_filter', config.get('value_filter_min', 0.0)),
-        'value_filter_min': config.get('value_filter_min', config.get('value_filter', 0.0)),
-        'value_filter_max': config.get('value_filter_max'),
+        'display_block_filters': display_block_filters,
+        'value_filter': 0.0 if value_filter_min is None else value_filter_min,
+        'value_filter_min': value_filter_min,
+        'value_filter_max': value_filter_max,
         'lfc_colors': lfc_colors,
         'lfc_bins': lfc_bins,
         'lfc_tick_labels': tick_labels,
@@ -9644,6 +9927,8 @@ def build_taichi_viewer_state_from_config(config):
 
 def build_taichi_viewer_state_from_interpolation_file(config):
     taichi_runtime = _load_taichi_runtime_module()
+    display_block_filters = get_configured_display_block_filters(config)
+    value_filter_min, value_filter_max = extract_display_block_value_range(display_block_filters)
 
     samples_file = config['samples_file']
     interpolation_file = str(config.get('interpolation_file') or '').strip()
@@ -9758,9 +10043,10 @@ def build_taichi_viewer_state_from_interpolation_file(config):
         'sample_domains': None if sample_domains is None else np.asarray(sample_domains, dtype=object),
         'blocks_data': blocks_data,
         'block_size': config['block_size'],
-        'value_filter': config.get('value_filter', config.get('value_filter_min', 0.0)),
-        'value_filter_min': config.get('value_filter_min', config.get('value_filter', 0.0)),
-        'value_filter_max': config.get('value_filter_max'),
+        'display_block_filters': display_block_filters,
+        'value_filter': 0.0 if value_filter_min is None else value_filter_min,
+        'value_filter_min': value_filter_min,
+        'value_filter_max': value_filter_max,
         'lfc_colors': lfc_colors,
         'lfc_bins': lfc_bins,
         'lfc_tick_labels': tick_labels,
@@ -9777,6 +10063,8 @@ def build_taichi_viewer_state_from_existing_state(config, existing_state):
 
     merged_config = dict(existing_state.get('config', {}) or {})
     merged_config.update(config)
+    display_block_filters = get_configured_display_block_filters(merged_config)
+    value_filter_min, value_filter_max = extract_display_block_value_range(display_block_filters)
 
     sample_values = existing_state.get('sample_values')
     sample_domains = existing_state.get('sample_domains')
@@ -9787,9 +10075,10 @@ def build_taichi_viewer_state_from_existing_state(config, existing_state):
         'sample_domains': None if sample_domains is None else np.asarray(sample_domains, dtype=object),
         'blocks_data': existing_state['blocks_data'],
         'block_size': np.asarray(existing_state['block_size'], dtype=np.float32),
-        'value_filter': config.get('value_filter', config.get('value_filter_min', existing_state.get('value_filter', 0.0))),
-        'value_filter_min': config.get('value_filter_min', config.get('value_filter', existing_state.get('value_filter_min', existing_state.get('value_filter', 0.0)))),
-        'value_filter_max': config.get('value_filter_max', existing_state.get('value_filter_max')),
+        'display_block_filters': display_block_filters,
+        'value_filter': existing_state.get('value_filter', 0.0) if value_filter_min is None else value_filter_min,
+        'value_filter_min': value_filter_min,
+        'value_filter_max': value_filter_max,
         'lfc_colors': lfc_colors,
         'lfc_bins': lfc_bins,
         'lfc_tick_labels': tick_labels,
@@ -9819,7 +10108,7 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, val
                                sample_x_col=None, sample_y_col=None, sample_z_col=None, sample_value_col=None,
                                blocks_header_line=1,
                                block_x_col=None, block_y_col=None, block_z_col=None, block_domain_col=None,
-                               config=None):
+                               config=None, display_block_filters=None):
     pv = _require_pyvista()
     try:
         print(f"Loading sample file from {samples_file}...")
@@ -10039,9 +10328,18 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, val
             sample_weights=sample_weights,
         )
 
+        if display_block_filters is None:
+            if config:
+                display_block_filters = get_configured_display_block_filters(config)
+            else:
+                display_block_filters = normalize_display_block_filters([
+                    {'field': 'Value', 'type': 'numeric', 'min': value_filter, 'max': value_filter_max}
+                ])
+
         # Store settings in plotter
         plotter._blocks_data = blocks
         plotter._verbose = verbose
+        plotter._display_block_filters = normalize_display_block_filters(display_block_filters)
         plotter._value_filter = value_filter  # Legacy lower-bound alias
         plotter._value_filter_min = value_filter
         plotter._value_filter_max = value_filter_max
@@ -10240,7 +10538,8 @@ if __name__ == "__main__":
             info = QtWidgets.QLabel("Configure which algorithm to use for each domain.\n"
                                   "You can configure a second pass to run after the first one completes.\n"
                                   "The second pass uses the output of the first pass as input.\n"
-                                  "Post-process runs once after the last enabled pass for that domain.")
+                                  "Post-process runs once after the last enabled pass for that domain.\n"
+                                  "If both passes are skipped, post-process can still run using the original samples as reference.")
             info.setWordWrap(True)
             layout.addWidget(info)
             
@@ -10318,8 +10617,7 @@ if __name__ == "__main__":
             if text == 'skip':
                 algo2_combo.setCurrentText('skip')
                 algo2_combo.setEnabled(False)
-                post_process_combo.setCurrentText('skip')
-                post_process_combo.setEnabled(False)
+                post_process_combo.setEnabled(True)
             else:
                 algo2_combo.setEnabled(True)
                 post_process_combo.setEnabled(True)
@@ -10374,7 +10672,7 @@ if __name__ == "__main__":
                     algo2_combo.setCurrentText(algo)
 
         def apply_post_process_to_all(self):
-            """Apply same post-process option to all eligible domains"""
+            """Apply same post-process option to all domains"""
             options = ['skip', 'fill_with_average']
             mode, ok = QtWidgets.QInputDialog.getItem(
                 self, 'Apply to All', 'Select post-process for all domains:',
@@ -10385,9 +10683,6 @@ if __name__ == "__main__":
                     algo1_combo = self.table.cellWidget(i, 1)
                     post_process_combo = self.table.cellWidget(i, 3)
                     if not algo1_combo or not post_process_combo:
-                        continue
-                    if algo1_combo.currentText() == 'skip':
-                        post_process_combo.setCurrentText('skip')
                         continue
                     post_process_combo.setCurrentText(mode)
         
@@ -10418,7 +10713,7 @@ if __name__ == "__main__":
                     if algo2 != 'skip':
                         config['second_pass_algorithm'] = algo2
 
-                    if algo1 != 'skip' and post_process != 'skip':
+                    if post_process != 'skip':
                         config['post_process'] = post_process
                     
                     if config:
@@ -10825,12 +11120,16 @@ if __name__ == "__main__":
             self.interp_edit = QtWidgets.QLineEdit('')
             self.configure_block_domain_metrics_filters_btn = QtWidgets.QPushButton('Configure Sample Filters...')
             self.configure_block_volume_weighted_filters_btn = QtWidgets.QPushButton('Configure Block Filters...')
+            self.configure_display_block_filters_btn = QtWidgets.QPushButton('Configure Display Filters...')
             self.block_domain_sample_filters = []
             self.block_volume_weighted_filters = []
+            self.display_block_filters = []
             self.block_domain_metrics_filters_summary = QtWidgets.QLabel('No sample filters configured. These filters apply app-wide.')
             self.block_domain_metrics_filters_summary.setWordWrap(True)
             self.block_volume_weighted_filters_summary = QtWidgets.QLabel('No block filters configured. These filters apply app-wide.')
             self.block_volume_weighted_filters_summary.setWordWrap(True)
+            self.display_block_filters_summary = QtWidgets.QLabel('No display filters configured. All blocks remain visible.')
+            self.display_block_filters_summary.setWordWrap(True)
 
             def add_file_row(label, line_edit, filter_str, form_layout, extra_button=None):
                 h = QtWidgets.QHBoxLayout()
@@ -12198,6 +12497,7 @@ if __name__ == "__main__":
             self._refresh_equation_finder_predictor_columns()
             self._update_block_domain_metrics_filters_summary()
             self._update_block_volume_weighted_filters_summary()
+            self._update_display_block_filters_summary()
 
             # === ANT COLONY TAB ===
             def dbl_spin(default, minv, maxv, step=0.1):
@@ -12229,19 +12529,6 @@ if __name__ == "__main__":
             self.background_distance = dbl_spin(32.0, 0.0, 1e9, 1.0)
             self.background_distance.setToolTip('Distance from samples beyond which the background value is applied.\nUnit: Grid blocks.')
 
-            self.value_filter_min = dbl_spin(0.0, -1e9, 1e9, 1.0)
-            self.value_filter_min.setToolTip('Minimum visible block value for Ant Colony value mode.\nSample blocks remain visible regardless of the range.')
-            self.value_filter_max = dbl_spin(1e9, -1e9, 1e9, 1.0)
-            self.value_filter_max.setToolTip('Maximum visible block value for Ant Colony value mode.\nSample blocks remain visible regardless of the range.')
-            value_filter_widget = QtWidgets.QWidget()
-            value_filter_layout = QtWidgets.QHBoxLayout(value_filter_widget)
-            value_filter_layout.setContentsMargins(0, 0, 0, 0)
-            value_filter_layout.setSpacing(6)
-            value_filter_layout.addWidget(QtWidgets.QLabel('Min'))
-            value_filter_layout.addWidget(self.value_filter_min)
-            value_filter_layout.addWidget(QtWidgets.QLabel('Max'))
-            value_filter_layout.addWidget(self.value_filter_max)
-
             self.avoid_visited_enabled = QtWidgets.QCheckBox(); self.avoid_visited_enabled.setChecked(False)
             self.avoid_visited_enabled.setToolTip('If checked, ants will avoid moving into blocks that have already been visited more than the threshold.')
 
@@ -12251,6 +12538,9 @@ if __name__ == "__main__":
             self.average_with_blocks = QtWidgets.QCheckBox(); self.average_with_blocks.setChecked(True)
             self.average_with_blocks.setToolTip('Ant Colony only. When an ant revisits a non-sample block that already has a value, the new neighbor-based estimate is averaged 50/50 with the block\'s current value instead of replacing it outright. This smooths repeated updates and reduces oscillation.')
 
+            self.prioritize_blank_unvisited_neighbors = QtWidgets.QCheckBox(); self.prioritize_blank_unvisited_neighbors.setChecked(True)
+            self.prioritize_blank_unvisited_neighbors.setToolTip('If checked, ants prefer moving into blank or unvisited neighbor cells before following existing paths. Disable this to focus the simulation on already created cells and rely on post-process filling for untouched areas.')
+
             ant_form.addRow('Range Size', self.range_size)
             ant_form.addRow('Max Pheromone', self.max_pheromone)
             ant_form.addRow('Ants per Sample', self.ants_per_sample)
@@ -12259,10 +12549,10 @@ if __name__ == "__main__":
             ant_form.addRow('Iterations (silent)', self.iterations)
             ant_form.addRow('Background Value', self.background_value)
             ant_form.addRow('Background Distance', self.background_distance)
-            ant_form.addRow('Value Filter', value_filter_widget)
             ant_form.addRow('Avoid Heavily-Visited', self.avoid_visited_enabled)
             ant_form.addRow('Visited Threshold', self.avoid_visited_threshold)
             ant_form.addRow('Average With Blocks', self.average_with_blocks)
+            ant_form.addRow('Prioritize Blank/Unvisited', self.prioritize_blank_unvisited_neighbors)
 
             # Ant Colony domain interpolation toggle
             self.ant_interpolate_target = QtWidgets.QComboBox(); self.ant_interpolate_target.addItems(['Value', 'Domain'])
@@ -12370,10 +12660,10 @@ if __name__ == "__main__":
 
             self.st_interpolate_target = QtWidgets.QComboBox()
             self.st_interpolate_target.addItems(['Value', 'Domain'])
-            self.st_interpolate_target.setToolTip('Select what String Theory should interpolate:\nValue: numeric grade/value (current behavior).\nDomain: categorical domain strings from samples (requires a Domain column in samples).')
+            self.st_interpolate_target.setToolTip('Select what String Theory should interpolate:\nValue: numeric values from samples.\nDomain: categorical domain strings from samples (requires a Domain column in samples).')
             
             self.st_grade_difference = dbl_spin(1.0, 0.0, 1000.0, 0.1)
-            self.st_grade_difference.setToolTip('Maximum grade difference allowed for a connection.')
+            self.st_grade_difference.setToolTip('Maximum value difference allowed for a connection.')
 
             def update_st_target_ui():
                 is_domain = (self.st_interpolate_target.currentText().strip().lower() == 'domain')
@@ -12381,14 +12671,14 @@ if __name__ == "__main__":
                 if is_domain:
                     self.st_grade_difference.setToolTip('Not used in Domain mode.')
                 else:
-                    self.st_grade_difference.setToolTip('Maximum grade difference allowed for a connection.')
+                    self.st_grade_difference.setToolTip('Maximum value difference allowed for a connection.')
 
             self.st_interpolate_target.currentIndexChanged.connect(update_st_target_ui)
             self._update_st_target_ui = update_st_target_ui
             self._update_st_target_ui()
             
             self.st_connect_to_all = QtWidgets.QCheckBox(); self.st_connect_to_all.setChecked(True)
-            self.st_connect_to_all.setToolTip('If checked, connects to ALL valid samples within threshold.\nIf unchecked, connects only to the single best match (closest grade, then closest distance).')
+            self.st_connect_to_all.setToolTip('If checked, connects to ALL valid samples within threshold.\nIf unchecked, connects only to the single best match (closest value, then closest distance).')
 
             self.st_max_connections = int_spin(1, 1, 1000, 1)
             self.st_max_connections.setToolTip('Number of valid samples to connect to when "Connect to All Valid" is unchecked.\nMinimum: 1.')
@@ -12426,9 +12716,9 @@ if __name__ == "__main__":
             self.st_collision_policy.setToolTip('How to handle blocks where multiple strings overlap:\noverwrite: Use the latest value (order dependent).\naverage: Calculate running average of all strings.\nmin: Keep the minimum value.\nmax: Keep the maximum value.')
 
             self.st_processing_order = QtWidgets.QComboBox()
-            self.st_processing_order.addItems(['ascending', 'random'])
+            self.st_processing_order.addItems(['ascending', 'descending', 'random'])
             self.st_processing_order.setCurrentText('ascending')
-            self.st_processing_order.setToolTip('Order in which samples are processed:\nascending: Process lowest grade samples first (builds network bottom-up).\nrandom: Process samples in random order.')
+            self.st_processing_order.setToolTip('Order in which samples are processed:\nascending: Process lowest values first.\ndescending: Process highest values first.\nrandom: Process samples in random order.')
 
             self.st_filter_by_frequency = QtWidgets.QCheckBox(); self.st_filter_by_frequency.setChecked(False)
             self.st_filter_by_frequency.setToolTip('If checked, filters paths based on Azimuth and Dip frequency.')
@@ -12493,6 +12783,9 @@ if __name__ == "__main__":
             self.taichi_sample_diameter = dbl_spin(1.0, 0.001, 1e6, 0.1)
             self.taichi_sample_diameter.setToolTip('Sample diameter in model units for the Taichi mesh viewer. Default is 1 unit.')
             display_form.addRow('Sample Diameter', self.taichi_sample_diameter)
+            self.configure_display_block_filters_btn.clicked.connect(self.configure_display_block_filters)
+            display_form.addRow('Block Filters', self.configure_display_block_filters_btn)
+            display_form.addRow('', self.display_block_filters_summary)
 
             advanced_form.addRow('Default Pass Algorithms', default_algo_layout)
 
@@ -12671,6 +12964,8 @@ if __name__ == "__main__":
             self._domain_catalog_cache = None
 
         def to_dict(self, include_runtime_state=False):
+            display_block_filters = normalize_display_block_filters(self.display_block_filters)
+            value_filter_min, value_filter_max = extract_display_block_value_range(display_block_filters)
             config = {
                 'samples_file': self.samples_edit.text(),
                 'blocks_file': self.blocks_edit.text(),
@@ -12767,9 +13062,11 @@ if __name__ == "__main__":
                 'iterations': self.iterations.value(),
                 'background_value': self.background_value.value(),
                 'background_distance': self.background_distance.value(),
-                'value_filter': self.value_filter_min.value(),
-                'value_filter_min': self.value_filter_min.value(),
-                'value_filter_max': self.value_filter_max.value(),
+                'display_block_filters': display_block_filters,
+                'value_filter': (-1e9 if value_filter_min is None else value_filter_min),
+                'value_filter_min': value_filter_min,
+                'value_filter_max': value_filter_max,
+                'prioritize_blank_unvisited_neighbors': self.prioritize_blank_unvisited_neighbors.isChecked(),
                 'avoid_visited_threshold_enabled': self.avoid_visited_enabled.isChecked(),
                 'avoid_visited_threshold': self.avoid_visited_threshold.value(),
                 'ant_colony_interpolate_target': self.ant_interpolate_target.currentText().strip().lower(),
@@ -12836,8 +13133,10 @@ if __name__ == "__main__":
             try:
                 self.block_domain_sample_filters = []
                 self.block_volume_weighted_filters = []
+                self.display_block_filters = []
                 self._update_block_domain_metrics_filters_summary()
                 self._update_block_volume_weighted_filters_summary()
+                self._update_display_block_filters_summary()
                 if 'samples_file' in config: self.samples_edit.setText(config['samples_file'])
                 if 'blocks_file' in config: self.blocks_edit.setText(config['blocks_file'])
                 if 'color_file' in config: self.color_edit.setText(config['color_file'])
@@ -13040,11 +13339,9 @@ if __name__ == "__main__":
                 if 'iterations' in config: self.iterations.setValue(config['iterations'])
                 if 'background_value' in config: self.background_value.setValue(config['background_value'])
                 if 'background_distance' in config: self.background_distance.setValue(config['background_distance'])
-                if 'value_filter_min' in config:
-                    self.value_filter_min.setValue(config['value_filter_min'])
-                elif 'value_filter' in config:
-                    self.value_filter_min.setValue(config['value_filter'])
-                if 'value_filter_max' in config: self.value_filter_max.setValue(config['value_filter_max'])
+                self.display_block_filters = get_configured_display_block_filters(config)
+                self._update_display_block_filters_summary()
+                if 'prioritize_blank_unvisited_neighbors' in config: self.prioritize_blank_unvisited_neighbors.setChecked(bool(config['prioritize_blank_unvisited_neighbors']))
                 if 'avoid_visited_threshold_enabled' in config: self.avoid_visited_enabled.setChecked(config['avoid_visited_threshold_enabled'])
                 if 'avoid_visited_threshold' in config: self.avoid_visited_threshold.setValue(config['avoid_visited_threshold'])
                 if 'ant_colony_interpolate_target' in config:
@@ -13265,6 +13562,61 @@ if __name__ == "__main__":
                 delimiter=delimiter,
                 header_line=header_line,
             )
+
+        def _build_display_block_filter_data_source(self, config):
+            interpolation_file = str(config.get('interpolation_file') or '').strip()
+            preview_frames = []
+
+            if interpolation_file and os.path.isfile(interpolation_file):
+                preview_df, _ = load_csv_preview_dataframe(interpolation_file, max_rows=1000)
+                preview_frames.append(
+                    build_display_block_filter_preview_frame(
+                        preview_df,
+                        value_col='Value',
+                        domain_col='Domain',
+                        is_sample_value=None,
+                    )
+                )
+            else:
+                samples_file = str(config.get('samples_file') or '').strip()
+                if samples_file and os.path.isfile(samples_file):
+                    sample_preview_df, _ = load_samples_preview_dataframe(
+                        samples_file,
+                        samples_delimiter=config.get('samples_delimiter'),
+                        samples_header_line=config.get('samples_header_line', 1),
+                        max_rows=1000,
+                    )
+                    preview_frames.append(
+                        build_display_block_filter_preview_frame(
+                            sample_preview_df,
+                            value_col=config.get('sample_value_col'),
+                            domain_col=config.get('sample_domain_col'),
+                            is_sample_value=True,
+                        )
+                    )
+
+                blocks_file = str(config.get('blocks_file') or '').strip()
+                if blocks_file and os.path.isfile(blocks_file):
+                    block_preview_df, _ = load_csv_preview_dataframe(
+                        blocks_file,
+                        delimiter=config.get('blocks_delimiter'),
+                        header_line=config.get('blocks_header_line', 1),
+                        max_rows=1000,
+                    )
+                    preview_frames.append(
+                        build_display_block_filter_preview_frame(
+                            block_preview_df,
+                            value_col=None,
+                            domain_col=config.get('block_domain_col'),
+                            is_sample_value=False,
+                        )
+                    )
+
+            if not preview_frames:
+                raise ValueError('Select a valid interpolation, samples, or blocks file first.')
+
+            combined_preview = pd.concat(preview_frames, ignore_index=True)
+            return FilterDataSource(combined_preview)
 
         def _get_selected_block_value_transfer_columns(self):
             if not hasattr(self, 'block_value_transfer_cols'):
@@ -14611,6 +14963,16 @@ if __name__ == "__main__":
             self.block_volume_weighted_filters_summary.setText('\n'.join(summaries[:4]))
             self.configure_block_volume_weighted_filters_btn.setText(f'Configure Block Filters... ({count} active)')
 
+        def _update_display_block_filters_summary(self):
+            count = len(self.display_block_filters)
+            if count == 0:
+                self.display_block_filters_summary.setText('No display filters configured. All blocks remain visible.')
+                self.configure_display_block_filters_btn.setText('Configure Display Filters...')
+                return
+
+            self.display_block_filters_summary.setText(format_display_block_filters_summary(self.display_block_filters))
+            self.configure_display_block_filters_btn.setText(f'Configure Display Filters... ({count} active)')
+
         def configure_block_domain_metrics_filters(self):
             cursor_set = False
             try:
@@ -14648,6 +15010,27 @@ if __name__ == "__main__":
                     self._invalidate_domain_catalog_cache()
             except Exception as exc:
                 QtWidgets.QMessageBox.critical(self, 'Error', f'Could not configure block filters:\n{exc}')
+            finally:
+                if cursor_set:
+                    QtWidgets.QApplication.restoreOverrideCursor()
+
+        def configure_display_block_filters(self):
+            cursor_set = False
+            try:
+                cfg = self.to_dict()
+                filter_source = self._build_display_block_filter_data_source(cfg)
+
+                dialog = SampleFiltersDialog(
+                    filter_source,
+                    filters=self.display_block_filters,
+                    parent=self,
+                    subject_label='Display Block',
+                )
+                if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                    self.display_block_filters = normalize_display_block_filters(dialog.get_filters())
+                    self._update_display_block_filters_summary()
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(self, 'Error', f'Could not configure display filters:\n{exc}')
             finally:
                 if cursor_set:
                     QtWidgets.QApplication.restoreOverrideCursor()
@@ -15661,27 +16044,32 @@ if __name__ == "__main__":
                         
                         # --- Pass 1 ---
                         interp1 = interpolator_list[0]
-                        algo_name1 = interp1.get_algorithm_name()
-                        print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 1 ({algo_name1}) ===")
-                        seed_original_sample_provenance(interp1)
-                        pass1_snapshot = snapshot_interpolator_state(interp1)
-
-                        _run_interpolator_with_progress(
-                            interp1,
-                            dims,
-                            iterations,
-                            f"Domain {domain} - Pass 1",
-                        )
-                        finalize_phase_provenance(interp1, 'First Pass', algo_name1, pass1_snapshot)
-                        
-                        # Generate stats for Pass 1 if String Theory
                         output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
-                        _run_interpolator_statistics_with_retry(interp1, output_dir, f"{domain}_Pass1", parent=self)
+                        if getattr(interp1, '_post_process_only', False):
+                            print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Post-process only (Fill with Average) ===")
+                            seed_original_sample_provenance(interp1)
+                            last_interp = interp1
+                        else:
+                            algo_name1 = interp1.get_algorithm_name()
+                            print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 1 ({algo_name1}) ===")
+                            seed_original_sample_provenance(interp1)
+                            pass1_snapshot = snapshot_interpolator_state(interp1)
 
-                        last_interp = interp1
+                            _run_interpolator_with_progress(
+                                interp1,
+                                dims,
+                                iterations,
+                                f"Domain {domain} - Pass 1",
+                            )
+                            finalize_phase_provenance(interp1, 'First Pass', algo_name1, pass1_snapshot)
+                            
+                            # Generate stats for Pass 1 if String Theory
+                            _run_interpolator_statistics_with_retry(interp1, output_dir, f"{domain}_Pass1", parent=self)
+
+                            last_interp = interp1
 
                         # --- Pass 2 ---
-                        if len(interpolator_list) > 1:
+                        if not getattr(interp1, '_post_process_only', False) and len(interpolator_list) > 1:
                             interp2 = interpolator_list[1]
                             algo_name2 = interp2.get_algorithm_name()
                             print(f"\n=== Domain {domain_idx}/{len(blocks._interpolators)}: {domain} - Pass 2 ({algo_name2}) ===")
@@ -15723,7 +16111,6 @@ if __name__ == "__main__":
                             finalize_phase_provenance(interp2, 'Second Pass', algo_name2, pass2_snapshot)
                             
                             # Generate stats for Pass 2 if String Theory
-                            output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
                             _run_interpolator_statistics_with_retry(interp2, output_dir, f"{domain}_Pass2", parent=self)
                             last_interp = interp2
 

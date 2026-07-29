@@ -12,7 +12,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import anterpolator3DViewer as viewer_module
-from ant_colony import Block
+from ant_colony import Ant, AntColonyInterpolator, Block
 from provenance_utils import finalize_phase_provenance, seed_original_sample_provenance, snapshot_interpolator_state
 
 from anterpolator3DViewer import (
@@ -2091,7 +2091,247 @@ def test_collect_export_block_data_uses_cumulative_provenance_labels():
     assert by_pos[(0, 0, 0)]['Source'] == 'Original Sample'
     assert by_pos[(0, 0, 0)]['Algorithm'] == 'Sample'
     assert by_pos[(1, 0, 0)]['Source'] == 'First Pass + Second Pass + Post-process'
-    assert by_pos[(1, 0, 0)]['Algorithm'] == 'String Theory + Anterpolator + Fill with Average'
+    assert by_pos[(1, 0, 0)]['Algorithm'] == 'String Theory + Ant Colony + Fill with Average'
+
+
+def test_ant_colony_backtracks_from_dead_end_second_pass_cell():
+    interp = AntColonyInterpolator(range_size=10)
+    interp.allowed_positions = {(0, 0, 0), (1, 0, 0)}
+    interp.blocks = {
+        (0, 0, 0): Block(
+            value=12.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=1,
+            pheromone=4,
+            visited=True,
+            visit_count=3,
+            ant_count=0,
+            distance_to_sample=1,
+            nearest_sample_value=12.0,
+            domain='default',
+        ),
+        (1, 0, 0): Block(
+            value=4.0,
+            is_sample=False,
+            mark_class=5.0,
+            block_id=2,
+            pheromone=3,
+            visited=True,
+            visit_count=1,
+            ant_count=1,
+            distance_to_sample=2,
+            nearest_sample_value=4.0,
+            domain='default',
+        ),
+    }
+    ant = Ant(origin_block=(0, 0, 0), current_pos=(1, 0, 0), mark_class=5.0)
+    ant.domain = 'default'
+    ant.previous_pos = (0, 0, 0)
+    ant.steps_history = [(1, 0, 0)]
+    interp.ants = [ant]
+
+    moved = interp.move_ants((2, 1, 1), quiet=True)
+
+    assert moved is True
+    assert ant.current_pos == (0, 0, 0)
+    assert ant.previous_pos == (1, 0, 0)
+    assert interp.blocks[(1, 0, 0)].ant_count == 0
+    assert interp.blocks[(0, 0, 0)].ant_count == 1
+
+
+def test_create_interpolator_can_disable_blank_unvisited_priority():
+    interp = viewer_module.create_interpolator({
+        'algorithm': 'ant_colony',
+        'prioritize_blank_unvisited_neighbors': False,
+    })
+
+    assert interp.prioritize_blank_unvisited_neighbors is False
+
+
+def test_ant_colony_can_defer_blank_unvisited_priority(monkeypatch):
+    monkeypatch.setattr('ant_colony.random.shuffle', lambda seq: None)
+
+    dims = (2, 2, 1)
+    allowed_positions = {(0, 0, 0), (0, 1, 0), (1, 0, 0)}
+
+    def build_interpolator(prioritize_blank):
+        interp = AntColonyInterpolator(range_size=10, prioritize_blank_unvisited_neighbors=prioritize_blank)
+        interp.allowed_positions = set(allowed_positions)
+        interp.blocks = {
+            (0, 0, 0): Block(
+                value=10.0,
+                is_sample=True,
+                mark_class=15.0,
+                block_id=1,
+                pheromone=5,
+                visited=True,
+                visit_count=1,
+                ant_count=0,
+                distance_to_sample=0,
+                nearest_sample_value=10.0,
+                domain='default',
+            ),
+            (1, 0, 0): Block(
+                value=20.0,
+                is_sample=False,
+                mark_class=15.0,
+                block_id=2,
+                pheromone=4,
+                visited=True,
+                visit_count=2,
+                ant_count=0,
+                distance_to_sample=1,
+                nearest_sample_value=20.0,
+                domain='default',
+            ),
+        }
+        ant = Ant(origin_block=(0, 0, 0), current_pos=(0, 0, 0), mark_class=15.0)
+        ant.domain = 'default'
+        interp.ants = [ant]
+        return interp, ant
+
+    prioritized_interp, prioritized_ant = build_interpolator(True)
+    deferred_interp, deferred_ant = build_interpolator(False)
+
+    assert prioritized_interp.move_ants(dims, quiet=True) is True
+    assert deferred_interp.move_ants(dims, quiet=True) is True
+
+    assert prioritized_ant.current_pos == (0, 1, 0)
+    assert (0, 1, 0) in prioritized_interp.blocks
+    assert deferred_ant.current_pos == (1, 0, 0)
+    assert (0, 1, 0) not in deferred_interp.blocks
+
+
+def test_get_domain_post_process_mode_allows_fill_only_domains():
+    config = {
+        'domain_algorithm_overrides': {
+            'A': {
+                'skip': True,
+                'post_process': 'fill_with_average',
+            }
+        }
+    }
+
+    assert viewer_module._get_domain_post_process_mode(config, 'A') == 'fill_with_average'
+
+
+def test_create_blocks_keeps_fill_only_domain_overrides(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        samples_path, blocks_path, base_config = _prepare_sample_block_cache_create_blocks_test(monkeypatch, td)
+        calls = []
+
+        class _FakeInterpolator:
+            def __init__(self, algorithm):
+                self.algorithm = algorithm
+                self.blocks = {}
+
+            def initialize_blocks(self, *args, **kwargs):
+                self.initialized_args = args
+                self.initialized_kwargs = kwargs
+
+            def create_ants(self):
+                raise AssertionError('fill-only interpolator should not create ants')
+
+            def get_algorithm_name(self):
+                return self.algorithm
+
+        def _fake_create_interpolator(config, domain=None, current_algorithm=None):
+            calls.append({
+                'algorithm': config.get('algorithm'),
+                'domain': domain,
+                'current_algorithm': current_algorithm,
+            })
+            return _FakeInterpolator(config.get('algorithm'))
+
+        monkeypatch.setattr(viewer_module, 'create_interpolator', _fake_create_interpolator)
+
+        config = dict(base_config)
+        config['domain_algorithm_overrides'] = {
+            'A': {
+                'skip': True,
+                'post_process': 'fill_with_average',
+            }
+        }
+
+        blocks = create_blocks(
+            points=np.array([[0.0, 0.0, 0.0]], dtype=float),
+            values=np.array([7.0], dtype=float),
+            block_size=(10.0, 10.0, 10.0),
+            blocks_file=blocks_path,
+            blocks_delimiter=",",
+            blocks_header_line=1,
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            config=config,
+            sample_domains=np.array(["A"], dtype=object),
+            build_visual_blocks=False,
+        )
+
+        assert 'A' in blocks._interpolators
+        assert len(blocks._interpolators['A']) == 1
+        assert getattr(blocks._interpolators['A'][0], '_post_process_only', False) is True
+        assert calls == [{'algorithm': 'ant_colony', 'domain': 'A', 'current_algorithm': 'ant_colony'}]
+
+
+def test_silent_interpolation_executes_fill_only_domain_post_process(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A"},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": "A"},
+            ]
+        ).to_csv(blocks_path, index=False)
+
+        config = {
+            "algorithm": "ant_colony",
+            "process_domains_sequentially": False,
+            "expand_interpolation_exports_to_subblocks": True,
+            "block_size": (10.0, 10.0, 10.0),
+            "domain_algorithm_overrides": {
+                "A": {
+                    "skip": True,
+                    "post_process": "fill_with_average",
+                }
+            },
+        }
+
+        blocks = create_blocks(
+            points=np.array([[0.0, 0.0, 0.0]], dtype=float),
+            values=np.array([7.0], dtype=float),
+            block_size=(10.0, 10.0, 10.0),
+            blocks_file=blocks_path,
+            blocks_delimiter=",",
+            blocks_header_line=1,
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_domain_col="dom",
+            config=config,
+            sample_domains=np.array(["A"], dtype=object),
+            build_visual_blocks=False,
+        )
+
+        monkeypatch.setattr(viewer_module, "_run_interpolator_statistics_with_retry", lambda *args, **kwargs: None)
+        monkeypatch.setattr(viewer_module, "export_blocks_to_file", lambda blocks_obj, path: path)
+
+        class _FakePlotter:
+            pass
+
+        plotter = _FakePlotter()
+        plotter._blocks_data = blocks
+        plotter._domain_post_process_overrides = config["domain_algorithm_overrides"]
+
+        out_path = os.path.join(td, "out.csv")
+        viewer_module.silent_interpolation(plotter, iterations=1, interpolation_file=out_path)
+
+        interp = blocks._interpolators["A"][0]
+        assert getattr(interp, "_post_process_only", False) is True
+        assert (1, 0, 0) in interp.blocks
+        assert interp.blocks[(1, 0, 0)].value is not None
 
 
 def test_export_blocks_to_csv_streams_large_subblock_expansion(monkeypatch):

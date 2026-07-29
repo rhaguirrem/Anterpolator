@@ -31,6 +31,7 @@ class Ant:
     steps: int = 0
     origin_sample_id: int = 0
     domain: str = ""
+    previous_pos: Optional[Tuple[int, int, int]] = None
     steps_history: List[Tuple[int, int, int]] = None
 
     def __post_init__(self):
@@ -47,6 +48,7 @@ class AntColonyInterpolator(InterpolatorBase):
         background_distance=None,
         average_with_blocks=False,
         interpolation_target: str = 'value',
+                 prioritize_blank_unvisited_neighbors: bool = True,
                  avoid_visited_threshold_enabled: bool = False,
                  avoid_visited_threshold: int = 100,
                  ants_sampling_percentage: float = 100.0,
@@ -64,6 +66,7 @@ class AntColonyInterpolator(InterpolatorBase):
         self.background_value = background_value
         self.background_distance = background_distance
         self.average_with_blocks = average_with_blocks
+        self.prioritize_blank_unvisited_neighbors = bool(prioritize_blank_unvisited_neighbors)
         target = (interpolation_target or 'value').strip().lower()
         if target in ('numeric', 'number', 'grade', 'value'):
             target = 'value'
@@ -313,63 +316,70 @@ class AntColonyInterpolator(InterpolatorBase):
             neighbors = self.get_neighbors(ant.current_pos, dims)
             random.shuffle(neighbors)
             next_pos = None
+            previous_pos = ant.previous_pos
+
+            def try_blank_or_unvisited_neighbor() -> bool:
+                nonlocal next_pos, found_valid
+                for npos in neighbors:
+                    if npos not in self.blocks and npos in self.allowed_positions:
+                        domain = "default"
+                        if hasattr(self, 'domain_mapping'):
+                            domain = self.domain_mapping.get(npos, "Undomained")
+                            if self.avoid_visited_threshold_enabled and domain in self.domains_frozen:
+                                if debug_first_iteration:
+                                    debug_stats['neighbors_frozen_domain'] += 1
+                                continue
+                            if domain != ant.domain:
+                                if debug_first_iteration:
+                                    debug_stats['neighbors_domain_mismatch'] += 1
+                                continue
+                        self.blocks[npos] = Block(
+                            value=None,
+                            is_sample=False,
+                            mark_class=current_block.mark_class,
+                            block_id=self.next_block_id,
+                            pheromone=max(0, current_block.pheromone - 1),
+                            visited=False,
+                            visit_count=0,
+                            ant_count=0,
+                            distance_to_sample=current_block.distance_to_sample + 1,
+                            nearest_sample_value=current_block.nearest_sample_value,
+                            domain=domain
+                        )
+                        self.domain_created_counts[domain] = self.domain_created_counts.get(domain, 0) + 1
+                        self.next_block_id += 1
+                        next_pos = npos
+                        if debug_first_iteration:
+                            debug_stats['blocks_created'] += 1
+                            found_valid = True
+                        return True
+                    if npos not in self.blocks and npos not in self.allowed_positions:
+                        if debug_first_iteration:
+                            debug_stats['neighbors_not_in_allowed'] += 1
+                        continue
+                    if npos in self.blocks:
+                        nblock = self.blocks[npos]
+                        if not nblock.visited and nblock.domain == ant.domain and nblock.mark_class <= ant.mark_class:
+                            if self.avoid_visited_threshold_enabled and nblock.domain in self.domains_frozen:
+                                continue
+                            next_pos = npos
+                            return True
+                return False
             
             # Track why neighbors are rejected (debug)
             if debug_first_iteration:
                 found_valid = False
             
             # Priority 1: Forward expansion to uncreated or unvisited neighbor within domain
-            for npos in neighbors:
-                if npos not in self.blocks and npos in self.allowed_positions:
-                    domain = "default"
-                    if hasattr(self, 'domain_mapping'):
-                        domain = self.domain_mapping.get(npos, "Undomained")
-                        if self.avoid_visited_threshold_enabled and domain in self.domains_frozen:
-                            if debug_first_iteration:
-                                debug_stats['neighbors_frozen_domain'] += 1
-                            continue
-                        if domain != ant.domain:
-                            if debug_first_iteration:
-                                debug_stats['neighbors_domain_mismatch'] += 1
-                            continue
-                    self.blocks[npos] = Block(
-                        value=None,
-                        is_sample=False,
-                        mark_class=current_block.mark_class,
-                        block_id=self.next_block_id,
-                        pheromone=max(0, current_block.pheromone - 1),
-                        visited=False,
-                        visit_count=0,
-                        ant_count=0,
-                        distance_to_sample=current_block.distance_to_sample + 1,
-                        nearest_sample_value=current_block.nearest_sample_value,
-                        domain=domain
-                    )
-                    # Track domain creation
-                    self.domain_created_counts[domain] = self.domain_created_counts.get(domain, 0) + 1
-                    self.next_block_id += 1
-                    next_pos = npos
-                    if debug_first_iteration:
-                        debug_stats['blocks_created'] += 1
-                        found_valid = True
-                    break
-                elif npos not in self.blocks and npos not in self.allowed_positions:
-                    if debug_first_iteration:
-                        debug_stats['neighbors_not_in_allowed'] += 1
-                elif npos in self.blocks:
-                    nblock = self.blocks[npos]
-                    if not nblock.visited and nblock.domain == ant.domain and nblock.mark_class <= ant.mark_class:
-                        if self.avoid_visited_threshold_enabled and nblock.domain in self.domains_frozen:
-                            continue
-                        next_pos = npos
-                        break
+            if self.prioritize_blank_unvisited_neighbors:
+                try_blank_or_unvisited_neighbor()
             if next_pos is None:
                 # Priority 2: same mark_class, different nearest sample, shortest distance-to-sample
                 candidates = [
                     (npos, self.blocks[npos]) for npos in neighbors
                     if npos in self.blocks and self.blocks[npos].mark_class == ant.mark_class and
                     self.blocks[npos].nearest_sample_value != current_block.nearest_sample_value and
-                    self.blocks[npos].domain == ant.domain and (not ant.steps_history or npos != ant.steps_history[-1]) and
+                    self.blocks[npos].domain == ant.domain and (previous_pos is None or npos != previous_pos) and
                     (not self.avoid_visited_threshold_enabled or self.blocks[npos].domain not in self.domains_frozen)
                 ]
                 if candidates:
@@ -384,7 +394,7 @@ class AntColonyInterpolator(InterpolatorBase):
                 # Priority 3: value closer to ant's origin sample
                 candidates = [
                     (npos, self.blocks[npos]) for npos in neighbors
-                    if npos in self.blocks and self.blocks[npos].domain == ant.domain and self.blocks[npos].mark_class <= ant.mark_class and (not ant.steps_history or npos != ant.steps_history[-1]) and (not self.avoid_visited_threshold_enabled or self.blocks[npos].domain not in self.domains_frozen)
+                    if npos in self.blocks and self.blocks[npos].domain == ant.domain and self.blocks[npos].mark_class <= ant.mark_class and (previous_pos is None or npos != previous_pos) and (not self.avoid_visited_threshold_enabled or self.blocks[npos].domain not in self.domains_frozen)
                 ]
                 if candidates:
                     if self.avoid_visited_threshold_enabled:
@@ -398,7 +408,7 @@ class AntColonyInterpolator(InterpolatorBase):
                 # Priority 4: random valid neighbor
                 valid_neighbors = [
                     npos for npos in neighbors
-                    if npos in self.blocks and self.blocks[npos].domain == ant.domain and self.blocks[npos].mark_class <= ant.mark_class and (not ant.steps_history or npos != ant.steps_history[-1]) and (not self.avoid_visited_threshold_enabled or self.blocks[npos].domain not in self.domains_frozen)
+                    if npos in self.blocks and self.blocks[npos].domain == ant.domain and self.blocks[npos].mark_class <= ant.mark_class and (previous_pos is None or npos != previous_pos) and (not self.avoid_visited_threshold_enabled or self.blocks[npos].domain not in self.domains_frozen)
                 ]
                 if valid_neighbors:
                     if self.avoid_visited_threshold_enabled:
@@ -410,8 +420,16 @@ class AntColonyInterpolator(InterpolatorBase):
                             next_pos = random.choice(valid_neighbors)
                     else:
                         next_pos = random.choice(valid_neighbors)
-                else:
-                    next_pos = ant.steps_history[-1] if ant.steps_history else ant.current_pos
+                if next_pos is None and not self.prioritize_blank_unvisited_neighbors:
+                    try_blank_or_unvisited_neighbor()
+
+            if next_pos is None:
+                if previous_pos in neighbors and previous_pos in self.blocks:
+                    previous_block = self.blocks[previous_pos]
+                    if previous_block.domain == ant.domain:
+                        next_pos = previous_pos
+                if next_pos is None:
+                    continue
 
             # Apply move
             if next_pos not in self.blocks:
@@ -449,7 +467,6 @@ class AntColonyInterpolator(InterpolatorBase):
                     self.blocks[next_pos].mark_class = self.get_mark_class(self.blocks[next_pos].value)
                     changes_made = True
                 else:
-                    ant.steps_history.append(ant.current_pos)
                     continue
             else:
                 next_block = self.blocks[next_pos]
@@ -484,6 +501,7 @@ class AntColonyInterpolator(InterpolatorBase):
                     changes_made = True
             if ant.current_pos in self.blocks:
                 self.blocks[ant.current_pos].ant_count = max(0, self.blocks[ant.current_pos].ant_count - 1)
+            ant.previous_pos = ant.current_pos
             ant.current_pos = next_pos
             ant.steps += 1
             ant.steps_history.append(next_pos)
@@ -568,7 +586,7 @@ class AntColonyInterpolator(InterpolatorBase):
                     else:
                         score = 0
                 # Avoid immediate backtracking
-                if ant.steps_history and npos == ant.steps_history[-1]:
+                if ant.previous_pos is not None and npos == ant.previous_pos:
                     score -= 1
                 candidates.append((score, npos))
 
@@ -617,6 +635,7 @@ class AntColonyInterpolator(InterpolatorBase):
 
             if ant.current_pos in self.blocks:
                 self.blocks[ant.current_pos].ant_count = max(0, self.blocks[ant.current_pos].ant_count - 1)
+            ant.previous_pos = ant.current_pos
             ant.current_pos = next_pos
             ant.steps += 1
             ant.steps_history.append(next_pos)
@@ -691,6 +710,7 @@ class AntColonyInterpolator(InterpolatorBase):
         for ant in self.ants:
             if ant.current_pos not in self.blocks:
                 ant.current_pos = ant.origin_block
+                ant.previous_pos = None
                 ant.steps = 0
 
     def get_blocks_data(self) -> Dict[Tuple[int, int, int], float]:
@@ -930,5 +950,6 @@ class AntColonyInterpolator(InterpolatorBase):
             'range_size': self.range_size,
             'max_pheromone': self.max_pheromone,
             'ants_per_sample': self.ants_per_sample,
+            'prioritize_blank_unvisited_neighbors': self.prioritize_blank_unvisited_neighbors,
             'domains_frozen': list(self.domains_frozen) if self.avoid_visited_threshold_enabled else []
         }
