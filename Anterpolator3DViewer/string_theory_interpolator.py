@@ -108,6 +108,7 @@ class StringTheoryInterpolator(InterpolatorBase):
                 self.blocks[pos] = {'value': val, 'is_sample': True, 'count': 1}
         
         # Prepare samples for processing
+        reverse_order = (self.processing_order == 'descending')
         if self.processing_order == 'random':
             import random
             items = list(sample_blocks.items())
@@ -117,15 +118,17 @@ class StringTheoryInterpolator(InterpolatorBase):
                 print("String Theory: Processing samples in RANDOM order.")
         else:
             if self.interpolation_target == 'domain':
-                # No grade in domain mode; keep deterministic ordering.
-                self.sorted_samples = sorted(sample_blocks.items(), key=lambda x: x[0])
+                # No numeric value ordering in domain mode; keep deterministic coordinate ordering.
+                self.sorted_samples = sorted(sample_blocks.items(), key=lambda x: x[0], reverse=reverse_order)
                 if self.verbose:
-                    print("String Theory: Processing samples in ASCENDING coordinate order (domain mode).")
+                    direction = 'DESCENDING' if reverse_order else 'ASCENDING'
+                    print(f"String Theory: Processing samples in {direction} coordinate order (domain mode).")
             else:
-                # Sort by grade (value) ascending (default)
-                self.sorted_samples = sorted(sample_blocks.items(), key=lambda x: x[1])
+                # Sort by value ascending/descending.
+                self.sorted_samples = sorted(sample_blocks.items(), key=lambda x: x[1], reverse=reverse_order)
                 if self.verbose:
-                    print("String Theory: Processing samples in ASCENDING value order.")
+                    direction = 'DESCENDING' if reverse_order else 'ASCENDING'
+                    print(f"String Theory: Processing samples in {direction} value order.")
         
         # Prepare KDTree for fast spatial queries
         coords = np.array([list(k) for k in sample_blocks.keys()])
