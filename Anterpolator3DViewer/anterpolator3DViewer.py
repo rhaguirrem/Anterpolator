@@ -3627,10 +3627,27 @@ def _build_block_lookup(blocks, min_bounds, block_size):
         lookup[pos] = block
     return lookup
 
+
+def _normalize_value_filter_bounds(value_filter_min=None, value_filter_max=None):
+    lower = -float('inf') if value_filter_min is None else float(value_filter_min)
+    upper = float('inf') if value_filter_max is None else float(value_filter_max)
+    if lower > upper:
+        lower, upper = upper, lower
+    return lower, upper
+
+
+def _value_passes_filter_range(value, value_filter_min=None, value_filter_max=None):
+    lower, upper = _normalize_value_filter_bounds(value_filter_min, value_filter_max)
+    return lower <= float(value) <= upper
+
 def _should_display_block(plotter, pos, block):
     if pos in plotter._blocks_data._sample_blocks:
         return True
-    return _get_block_raw_value(block) >= plotter._value_filter
+    return _value_passes_filter_range(
+        _get_block_raw_value(block),
+        getattr(plotter, '_value_filter_min', getattr(plotter, '_value_filter', 0.0)),
+        getattr(plotter, '_value_filter_max', None),
+    )
 
 def _create_visible_blocks(plotter):
     pv = _require_pyvista()
@@ -3868,7 +3885,8 @@ def update_interpolation(plotter):
         if new_block_count > 0 and not new_visible_added:
             print(
                 "New blocks were created, but none passed the visibility filter. "
-                f"Current value_filter={plotter._value_filter}."
+                f"Current value_filter_range=({getattr(plotter, '_value_filter_min', getattr(plotter, '_value_filter', 0.0))}, "
+                f"{getattr(plotter, '_value_filter_max', 'inf')})."
             )
 
         plotter.render()
@@ -9613,7 +9631,9 @@ def build_taichi_viewer_state_from_config(config):
         'sample_domains': sample_domains,
         'blocks_data': blocks,
         'block_size': config['block_size'],
-        'value_filter': config.get('value_filter', 0.0),
+        'value_filter': config.get('value_filter', config.get('value_filter_min', 0.0)),
+        'value_filter_min': config.get('value_filter_min', config.get('value_filter', 0.0)),
+        'value_filter_max': config.get('value_filter_max'),
         'lfc_colors': lfc_colors,
         'lfc_bins': lfc_bins,
         'lfc_tick_labels': tick_labels,
@@ -9738,7 +9758,9 @@ def build_taichi_viewer_state_from_interpolation_file(config):
         'sample_domains': None if sample_domains is None else np.asarray(sample_domains, dtype=object),
         'blocks_data': blocks_data,
         'block_size': config['block_size'],
-        'value_filter': config.get('value_filter', 0.0),
+        'value_filter': config.get('value_filter', config.get('value_filter_min', 0.0)),
+        'value_filter_min': config.get('value_filter_min', config.get('value_filter', 0.0)),
+        'value_filter_max': config.get('value_filter_max'),
         'lfc_colors': lfc_colors,
         'lfc_bins': lfc_bins,
         'lfc_tick_labels': tick_labels,
@@ -9765,7 +9787,9 @@ def build_taichi_viewer_state_from_existing_state(config, existing_state):
         'sample_domains': None if sample_domains is None else np.asarray(sample_domains, dtype=object),
         'blocks_data': existing_state['blocks_data'],
         'block_size': np.asarray(existing_state['block_size'], dtype=np.float32),
-        'value_filter': config.get('value_filter', existing_state.get('value_filter', 0.0)),
+        'value_filter': config.get('value_filter', config.get('value_filter_min', existing_state.get('value_filter', 0.0))),
+        'value_filter_min': config.get('value_filter_min', config.get('value_filter', existing_state.get('value_filter_min', existing_state.get('value_filter', 0.0)))),
+        'value_filter_max': config.get('value_filter_max', existing_state.get('value_filter_max')),
         'lfc_colors': lfc_colors,
         'lfc_bins': lfc_bins,
         'lfc_tick_labels': tick_labels,
@@ -9787,7 +9811,7 @@ def launch_taichi_viewer_from_config(config, external_state_callback=None):
     viewer_state = build_taichi_viewer_state_from_config(config)
     launch_taichi_viewer_with_state(viewer_state, external_state_callback=external_state_callback)
 
-def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, verbose=False, iterations=100, range_size=10, max_pheromone=150, ants_per_sample=3, blocks_file=None, color_file=None, background_value=0.0, background_distance=None, average_with_blocks=False,
+def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, value_filter_max=None, verbose=False, iterations=100, range_size=10, max_pheromone=150, ants_per_sample=3, blocks_file=None, color_file=None, background_value=0.0, background_distance=None, average_with_blocks=False,
                                samples_delimiter=None, blocks_delimiter=None, fill_unvisited_domainwise=False,
                                avoid_visited_threshold_enabled=False,
                                avoid_visited_threshold=100,
@@ -10018,7 +10042,9 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, ver
         # Store settings in plotter
         plotter._blocks_data = blocks
         plotter._verbose = verbose
-        plotter._value_filter = value_filter  # Store value_filter
+        plotter._value_filter = value_filter  # Legacy lower-bound alias
+        plotter._value_filter_min = value_filter
+        plotter._value_filter_max = value_filter_max
         plotter._domain_post_process_overrides = dict((config or {}).get('domain_algorithm_overrides', {}))
         plotter._avoid_visited_threshold_enabled = avoid_visited_threshold_enabled
         plotter._avoid_visited_threshold = avoid_visited_threshold
@@ -12203,8 +12229,18 @@ if __name__ == "__main__":
             self.background_distance = dbl_spin(32.0, 0.0, 1e9, 1.0)
             self.background_distance.setToolTip('Distance from samples beyond which the background value is applied.\nUnit: Grid blocks.')
 
-            self.value_filter = dbl_spin(0.0, -1e9, 1e9, 1.0)
-            self.value_filter.setToolTip('Minimum value threshold for samples to spawn ants.\nSamples with values below this will be ignored.')
+            self.value_filter_min = dbl_spin(0.0, -1e9, 1e9, 1.0)
+            self.value_filter_min.setToolTip('Minimum visible block value for Ant Colony value mode.\nSample blocks remain visible regardless of the range.')
+            self.value_filter_max = dbl_spin(1e9, -1e9, 1e9, 1.0)
+            self.value_filter_max.setToolTip('Maximum visible block value for Ant Colony value mode.\nSample blocks remain visible regardless of the range.')
+            value_filter_widget = QtWidgets.QWidget()
+            value_filter_layout = QtWidgets.QHBoxLayout(value_filter_widget)
+            value_filter_layout.setContentsMargins(0, 0, 0, 0)
+            value_filter_layout.setSpacing(6)
+            value_filter_layout.addWidget(QtWidgets.QLabel('Min'))
+            value_filter_layout.addWidget(self.value_filter_min)
+            value_filter_layout.addWidget(QtWidgets.QLabel('Max'))
+            value_filter_layout.addWidget(self.value_filter_max)
 
             self.avoid_visited_enabled = QtWidgets.QCheckBox(); self.avoid_visited_enabled.setChecked(False)
             self.avoid_visited_enabled.setToolTip('If checked, ants will avoid moving into blocks that have already been visited more than the threshold.')
@@ -12223,7 +12259,7 @@ if __name__ == "__main__":
             ant_form.addRow('Iterations (silent)', self.iterations)
             ant_form.addRow('Background Value', self.background_value)
             ant_form.addRow('Background Distance', self.background_distance)
-            ant_form.addRow('Value Filter', self.value_filter)
+            ant_form.addRow('Value Filter', value_filter_widget)
             ant_form.addRow('Avoid Heavily-Visited', self.avoid_visited_enabled)
             ant_form.addRow('Visited Threshold', self.avoid_visited_threshold)
             ant_form.addRow('Average With Blocks', self.average_with_blocks)
@@ -12731,7 +12767,9 @@ if __name__ == "__main__":
                 'iterations': self.iterations.value(),
                 'background_value': self.background_value.value(),
                 'background_distance': self.background_distance.value(),
-                'value_filter': self.value_filter.value(),
+                'value_filter': self.value_filter_min.value(),
+                'value_filter_min': self.value_filter_min.value(),
+                'value_filter_max': self.value_filter_max.value(),
                 'avoid_visited_threshold_enabled': self.avoid_visited_enabled.isChecked(),
                 'avoid_visited_threshold': self.avoid_visited_threshold.value(),
                 'ant_colony_interpolate_target': self.ant_interpolate_target.currentText().strip().lower(),
@@ -13002,7 +13040,11 @@ if __name__ == "__main__":
                 if 'iterations' in config: self.iterations.setValue(config['iterations'])
                 if 'background_value' in config: self.background_value.setValue(config['background_value'])
                 if 'background_distance' in config: self.background_distance.setValue(config['background_distance'])
-                if 'value_filter' in config: self.value_filter.setValue(config['value_filter'])
+                if 'value_filter_min' in config:
+                    self.value_filter_min.setValue(config['value_filter_min'])
+                elif 'value_filter' in config:
+                    self.value_filter_min.setValue(config['value_filter'])
+                if 'value_filter_max' in config: self.value_filter_max.setValue(config['value_filter_max'])
                 if 'avoid_visited_threshold_enabled' in config: self.avoid_visited_enabled.setChecked(config['avoid_visited_threshold_enabled'])
                 if 'avoid_visited_threshold' in config: self.avoid_visited_threshold.setValue(config['avoid_visited_threshold'])
                 if 'ant_colony_interpolate_target' in config:

@@ -30,6 +30,20 @@ VOLUME_RENDERER_CANVAS_MODULE = None
 ti = None
 
 
+def _normalize_value_filter_bounds(value_filter_min=None, value_filter_max=None):
+    lower = -float('inf') if value_filter_min is None else float(value_filter_min)
+    upper = float('inf') if value_filter_max is None else float(value_filter_max)
+    if lower > upper:
+        lower, upper = upper, lower
+    return lower, upper
+
+
+def _value_passes_filter_range(values, value_filter_min=None, value_filter_max=None):
+    lower, upper = _normalize_value_filter_bounds(value_filter_min, value_filter_max)
+    values = np.asarray(values, dtype=np.float32)
+    return (values >= lower) & (values <= upper)
+
+
 def get_taichi_module():
     global TI_MODULE, ti
     if TI_MODULE is not None:
@@ -432,6 +446,8 @@ class TaichiInterpolationViewer:
         blocks_data,
         block_size,
         value_filter=0.0,
+        value_filter_min=None,
+        value_filter_max=None,
         lfc_colors=None,
         lfc_bins=None,
         lfc_tick_labels=None,
@@ -450,6 +466,8 @@ class TaichiInterpolationViewer:
         self.min_bounds = np.asarray(self.block_info.get('min_bounds', np.zeros(3)), dtype=np.float32)
         self.positions_are_world = bool(self.block_info.get('positions_are_world', False))
         self.value_filter = float(value_filter)
+        self.value_filter_min = float(value_filter if value_filter_min is None else value_filter_min)
+        self.value_filter_max = None if value_filter_max is None else float(value_filter_max)
         self.config = config or {}
         self.window_title = window_title
         self.lfc_colors = lfc_colors or []
@@ -520,6 +538,9 @@ class TaichiInterpolationViewer:
         self.blocks_data = state['blocks_data']
         self.block_size = np.asarray(state['block_size'], dtype=np.float32)
         self.value_filter = float(state.get('value_filter', 0.0))
+        self.value_filter_min = float(state.get('value_filter_min', self.value_filter))
+        raw_value_filter_max = state.get('value_filter_max')
+        self.value_filter_max = None if raw_value_filter_max is None else float(raw_value_filter_max)
         self.config = state.get('config', {}) or {}
         self.window_title = state.get('window_title', self.window_title)
         self.lfc_colors = state.get('lfc_colors', []) or []
@@ -867,13 +888,15 @@ class TaichiInterpolationViewer:
                         self._clear_external_wheel_delta()
                         self._set_status('View reset to initial camera position.')
                     elif event_key == '[':
-                        self.value_filter -= 1.0
+                        self.value_filter_min -= 1.0
+                        self.value_filter = self.value_filter_min
                         self._refresh_render_data()
-                        self._set_status(f"value_filter={self.value_filter}")
+                        self._set_status(f"value_filter_min={self.value_filter_min}, value_filter_max={self.value_filter_max}")
                     elif event_key == ']':
-                        self.value_filter += 1.0
+                        self.value_filter_min += 1.0
+                        self.value_filter = self.value_filter_min
                         self._refresh_render_data()
-                        self._set_status(f"value_filter={self.value_filter}")
+                        self._set_status(f"value_filter_min={self.value_filter_min}, value_filter_max={self.value_filter_max}")
                     elif event_key_lower == 'z':
                         self._apply_zoom_delta(camera, orbit_pivot, 1.0, movement_speed, wheel_zoom_factor)
                         self._set_status('Zoom in')
@@ -1433,7 +1456,7 @@ class TaichiInterpolationViewer:
             return snapshot['positions'][mask], np.asarray(colors, dtype=np.float32)[mask]
 
         values = snapshot['values']
-        mask = snapshot['is_sample'] | (values >= self.value_filter)
+        mask = snapshot['is_sample'] | _value_passes_filter_range(values, self.value_filter_min, self.value_filter_max)
         colors = map_values_to_colors(values, self.lfc_colors, self.lfc_bins)
         return snapshot['positions'][mask], colors[mask]
 
@@ -1725,7 +1748,7 @@ class TaichiInterpolationViewer:
             if self.color_mode == 'domain' and self.domain_data_available:
                 mask |= np.ones(len(snapshot['positions']), dtype=bool)
             else:
-                mask |= snapshot['is_sample'] | (snapshot['values'] >= self.value_filter)
+                mask |= snapshot['is_sample'] | _value_passes_filter_range(snapshot['values'], self.value_filter_min, self.value_filter_max)
         if self.show_samples and not self.show_blocks:
             mask |= snapshot['is_sample']
         if not np.any(mask):
@@ -2241,7 +2264,11 @@ class TaichiInterpolationViewer:
             gui.text(f"Filled faces: {'on' if self.show_filled_block_faces else 'off'}", color=(0.84, 0.84, 0.84))
             gui.text(f"Flat faces: {'on' if self._use_flat_block_lighting else 'off'}", color=(0.84, 0.84, 0.84))
             gui.text(f"Visible points: samples={self._sample_count} blocks={self._block_count}", color=(0.84, 0.84, 0.84))
-            gui.text(f"Filter: {self.value_filter:.2f}", color=(0.84, 0.84, 0.84))
+            if self.value_filter_max is None:
+                filter_text = f"Filter: >= {self.value_filter_min:.2f}"
+            else:
+                filter_text = f"Filter: {self.value_filter_min:.2f} to {self.value_filter_max:.2f}"
+            gui.text(filter_text, color=(0.84, 0.84, 0.84))
             if self._last_status:
                 gui.text(self._last_status[:72], color=(0.78, 0.90, 0.98))
 
@@ -2286,6 +2313,8 @@ def create_viewer_from_files(
     sample_value_col=None,
     block_size=(10.0, 10.0, 10.0),
     value_filter=0.0,
+    value_filter_min=None,
+    value_filter_max=None,
 ):
     colors, bins, _ = load_lfc_colormap(color_file)
     tick_labels = build_lfc_tick_labels(colors, bins)
@@ -2363,6 +2392,8 @@ def create_viewer_from_files(
         blocks_data=blocks_data,
         block_size=block_size,
         value_filter=value_filter,
+        value_filter_min=value_filter_min,
+        value_filter_max=value_filter_max,
         lfc_colors=colors,
         lfc_bins=bins,
         lfc_tick_labels=tick_labels,
