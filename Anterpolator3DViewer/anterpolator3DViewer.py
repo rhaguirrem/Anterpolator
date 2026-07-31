@@ -156,6 +156,38 @@ class TrimmedDisplayDoubleSpinBox(QtWidgets.QDoubleSpinBox):
             text = text.replace('.', decimal_point)
         return text
 
+
+def _normalize_active_algorithm_config(config):
+    if not isinstance(config, dict):
+        return config
+
+    algo_type = str(config.get('algorithm', 'ant_colony')).strip().lower()
+    if algo_type != 'ant_colony_ii':
+        return config
+
+    ac2_params = dict(config.get('ant_colony_ii_params', {}) or {})
+    if not ac2_params:
+        return config
+
+    normalized = dict(config)
+    field_map = {
+        'range_size': 'range_size',
+        'max_pheromone': 'max_pheromone',
+        'ants_per_sample': 'ants_per_sample',
+        'ants_sampling_percentage': 'ants_sampling_percentage',
+        'pheromone_decay_rate': 'pheromone_decay_rate',
+        'background_value': 'background_value',
+        'background_distance': 'background_distance',
+        'average_with_blocks': 'average_with_blocks',
+        'avoid_visited_threshold_enabled': 'avoid_visited_threshold_enabled',
+        'avoid_visited_threshold': 'avoid_visited_threshold',
+    }
+    for source_key, target_key in field_map.items():
+        if source_key in ac2_params:
+            normalized[target_key] = ac2_params[source_key]
+
+    return normalized
+
 # --- Interpolator Factory ---
 def create_interpolator(config, domain=None, current_algorithm=None):
     """
@@ -205,6 +237,32 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             ants_sampling_percentage=config.get('ants_sampling_percentage', 100.0),
             pheromone_decay_rate=config.get('pheromone_decay_rate', 1),
             interpolation_target=ant_target,
+        )
+
+    elif algo_type == 'ant_colony_ii':
+        from ant_colony_ii import AntColonyIIInterpolator
+
+        ac2_params = config.get('ant_colony_ii_params', {})
+        ac2_target = ac2_params.get('interpolate_target', config.get('ant_colony_interpolate_target', 'value'))
+        return AntColonyIIInterpolator(
+            range_size=ac2_params.get('range_size', config.get('range_size', 10)),
+            max_pheromone=ac2_params.get('max_pheromone', config.get('max_pheromone', 150)),
+            ants_per_sample=ac2_params.get('ants_per_sample', config.get('ants_per_sample', 3)),
+            verbose=config.get('verbose', False),
+            background_value=ac2_params.get('background_value', config.get('background_value', 0.0)),
+            background_distance=ac2_params.get('background_distance', config.get('background_distance', None)),
+            average_with_blocks=ac2_params.get('average_with_blocks', config.get('average_with_blocks', False)),
+            avoid_visited_threshold_enabled=ac2_params.get('avoid_visited_threshold_enabled', config.get('avoid_visited_threshold_enabled', False)),
+            avoid_visited_threshold=ac2_params.get('avoid_visited_threshold', config.get('avoid_visited_threshold', 100)),
+            ants_sampling_percentage=ac2_params.get('ants_sampling_percentage', config.get('ants_sampling_percentage', 100.0)),
+            pheromone_decay_rate=ac2_params.get('pheromone_decay_rate', config.get('pheromone_decay_rate', 1)),
+            interpolation_target=ac2_target,
+            explore_bias=ac2_params.get('explore_bias', 2.5),
+            trail_bias=ac2_params.get('trail_bias', 1.5),
+            same_mark_bias=ac2_params.get('same_mark_bias', 2.0),
+            return_bias=ac2_params.get('return_bias', 4.0),
+            revisit_penalty=ac2_params.get('revisit_penalty', 0.2),
+            background_return_enabled=ac2_params.get('background_return_enabled', True),
         )
     
     elif algo_type == 'molecular_clock':
@@ -2595,6 +2653,17 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                   sample_domains=None,
                   sample_weights=None,
                   build_visual_blocks=True):
+    config = _normalize_active_algorithm_config(config)
+    if isinstance(config, dict):
+        range_size = config.get('range_size', range_size)
+        max_pheromone = config.get('max_pheromone', max_pheromone)
+        ants_per_sample = config.get('ants_per_sample', ants_per_sample)
+        background_value = config.get('background_value', background_value)
+        background_distance = config.get('background_distance', background_distance)
+        average_with_blocks = config.get('average_with_blocks', average_with_blocks)
+        avoid_visited_threshold_enabled = config.get('avoid_visited_threshold_enabled', avoid_visited_threshold_enabled)
+        avoid_visited_threshold = config.get('avoid_visited_threshold', avoid_visited_threshold)
+
     pv = _require_pyvista() if build_visual_blocks else None
     original_points_array = np.array(points, copy=True)
     original_values_array = np.array(values, copy=True)
@@ -10586,12 +10655,12 @@ if __name__ == "__main__":
                 self.table.setItem(i, 0, domain_item)
 
                 algo1_combo = QtWidgets.QComboBox()
-                algo1_combo.addItems(['(use default)', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory', 'skip'])
+                algo1_combo.addItems(['(use default)', 'ant_colony', 'ant_colony_ii', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory', 'skip'])
                 algo1_combo.setCurrentText('(use default)')
                 self.table.setCellWidget(i, 1, algo1_combo)
 
                 algo2_combo = QtWidgets.QComboBox()
-                algo2_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory'])
+                algo2_combo.addItems(['skip', 'ant_colony', 'ant_colony_ii', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory'])
                 algo2_combo.setCurrentText('skip')
                 self.table.setCellWidget(i, 2, algo2_combo)
 
@@ -10642,7 +10711,7 @@ if __name__ == "__main__":
 
         def apply_to_all(self):
             """Apply same first pass algorithm to all domains"""
-            algorithms = ['(use default)', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory', 'skip']
+            algorithms = ['(use default)', 'ant_colony', 'ant_colony_ii', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory', 'skip']
             algo, ok = QtWidgets.QInputDialog.getItem(
                 self, 'Apply to All', 'Select first pass algorithm for all domains:', 
                 algorithms, 0, False
@@ -10655,7 +10724,7 @@ if __name__ == "__main__":
 
         def apply_second_pass_to_all(self):
             """Apply same second pass algorithm to all eligible domains"""
-            algorithms = ['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory']
+            algorithms = ['skip', 'ant_colony', 'ant_colony_ii', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory']
             algo, ok = QtWidgets.QInputDialog.getItem(
                 self, 'Apply to All', 'Select second pass algorithm for all domains:',
                 algorithms, 0, False
@@ -11077,6 +11146,10 @@ if __name__ == "__main__":
             ant_tab = QtWidgets.QWidget()
             ant_form = QtWidgets.QFormLayout()
             ant_tab.setLayout(ant_form)
+
+            ac2_tab = QtWidgets.QWidget()
+            ac2_form = QtWidgets.QFormLayout()
+            ac2_tab.setLayout(ac2_form)
             
             # Tab 3: Molecular Clock Parameters
             mc_tab = QtWidgets.QWidget()
@@ -11107,6 +11180,7 @@ if __name__ == "__main__":
             tabs.addTab(operations_tab, "Operations")
             tabs.addTab(st_tab, "String Theory")
             tabs.addTab(ant_tab, "Ant Colony")
+            tabs.addTab(ac2_tab, "Ant Colony II")
             tabs.addTab(mc_tab, "Molecular Clock")
             tabs.addTab(gk_tab, "Gaussian Kernel")
             tabs.addTab(octree_tab, "Adaptive Octree")
@@ -12541,6 +12615,75 @@ if __name__ == "__main__":
             self.prioritize_blank_unvisited_neighbors = QtWidgets.QCheckBox(); self.prioritize_blank_unvisited_neighbors.setChecked(True)
             self.prioritize_blank_unvisited_neighbors.setToolTip('If checked, ants prefer moving into blank or unvisited neighbor cells before following existing paths. Disable this to focus the simulation on already created cells and rely on post-process filling for untouched areas.')
 
+            self.ac2_range_size = dbl_spin(0.2, 0.0001, 1e6, 0.1)
+            self.ac2_range_size.setToolTip('Value tolerance / Bin size for Ant Colony II mark-class grouping.')
+
+            self.ac2_max_pheromone = int_spin(1000, 1, 10_000_000, 10)
+            self.ac2_max_pheromone.setToolTip('Maximum pheromone level used by Ant Colony II trail reinforcement.')
+
+            self.ac2_ants_per_sample = int_spin(16, 1, 10000, 1)
+            self.ac2_ants_per_sample.setToolTip('Number of Ant Colony II agents spawned from each sample.')
+
+            self.ac2_ants_sampling_percentage = dbl_spin(100.0, 0.001, 100.0, 1.0)
+            self.ac2_ants_sampling_percentage.setToolTip('Percentage of samples that spawn Ant Colony II agents.')
+
+            self.ac2_pheromone_decay_rate = int_spin(1, 0, 10, 1)
+            self.ac2_pheromone_decay_rate.setToolTip('Trail decay rate for Ant Colony II.')
+
+            self.ac2_iterations = int_spin(500, 1, 10_000_000, 50)
+            self.ac2_iterations.setToolTip('Number of iterations to run the simulation in silent mode. This is the same shared run-length control used by the main Ant Colony setup.')
+
+            self.ac2_background_value = dbl_spin(0.0, -1e9, 1e9, 0.1)
+            self.ac2_background_value.setToolTip('Background value used when Ant Colony II exceeds its support distance.')
+
+            self.ac2_background_distance = dbl_spin(32.0, 0.0, 1e9, 1.0)
+            self.ac2_background_distance.setToolTip('Distance where Ant Colony II flips from exploration into return behavior.')
+
+            self.ac2_average_with_blocks = QtWidgets.QCheckBox(); self.ac2_average_with_blocks.setChecked(True)
+            self.ac2_average_with_blocks.setToolTip('Average revisited Ant Colony II block values with the current block value instead of replacing them outright.')
+
+            self.ac2_avoid_visited_enabled = QtWidgets.QCheckBox(); self.ac2_avoid_visited_enabled.setChecked(False)
+            self.ac2_avoid_visited_enabled.setToolTip('If checked, Ant Colony II will avoid heavily revisited blocks after the threshold.')
+
+            self.ac2_avoid_visited_threshold = QtWidgets.QSpinBox(); self.ac2_avoid_visited_threshold.setRange(1, 10_000_000); self.ac2_avoid_visited_threshold.setValue(100)
+            self.ac2_avoid_visited_threshold.setToolTip('Maximum visits allowed per block before Ant Colony II starts avoiding it.')
+
+            self.ac2_explore_bias = dbl_spin(2.5, 0.01, 100.0, 0.1)
+            self.ac2_explore_bias.setToolTip('Weight favoring frontier expansion while the ant is still in exploration mode.')
+
+            self.ac2_trail_bias = dbl_spin(1.5, 0.0, 100.0, 0.1)
+            self.ac2_trail_bias.setToolTip('Weight favoring stronger pheromone trails when choosing a move.')
+
+            self.ac2_same_mark_bias = dbl_spin(2.0, 0.01, 100.0, 0.1)
+            self.ac2_same_mark_bias.setToolTip('Weight favoring neighbors that stay within the ant\'s current mark class.')
+
+            self.ac2_return_bias = dbl_spin(4.0, 0.0, 100.0, 0.1)
+            self.ac2_return_bias.setToolTip('Weight favoring moves back toward sample-supported regions once the background distance is reached.')
+
+            self.ac2_revisit_penalty = dbl_spin(0.2, 0.0, 100.0, 0.05)
+            self.ac2_revisit_penalty.setToolTip('Penalty applied to heavily revisited cells so Ant Colony II does not collapse into a single loop.')
+
+            self.ac2_background_return_enabled = QtWidgets.QCheckBox(); self.ac2_background_return_enabled.setChecked(True)
+            self.ac2_background_return_enabled.setToolTip('If checked, reaching Background Distance switches Ant Colony II into return mode instead of continuing to push deeper into blank space.')
+
+            self.ac2_interpolate_target = QtWidgets.QComboBox(); self.ac2_interpolate_target.addItems(['Value', 'Domain'])
+            self.ac2_interpolate_target.setToolTip('Select what Ant Colony II should interpolate.')
+
+            def sync_iteration_spins(value):
+                value = int(value)
+                if self.iterations.value() != value:
+                    self.iterations.blockSignals(True)
+                    self.iterations.setValue(value)
+                    self.iterations.blockSignals(False)
+                if self.ac2_iterations.value() != value:
+                    self.ac2_iterations.blockSignals(True)
+                    self.ac2_iterations.setValue(value)
+                    self.ac2_iterations.blockSignals(False)
+
+            self.iterations.valueChanged.connect(sync_iteration_spins)
+            self.ac2_iterations.valueChanged.connect(sync_iteration_spins)
+            sync_iteration_spins(self.iterations.value())
+
             ant_form.addRow('Range Size', self.range_size)
             ant_form.addRow('Max Pheromone', self.max_pheromone)
             ant_form.addRow('Ants per Sample', self.ants_per_sample)
@@ -12558,6 +12701,25 @@ if __name__ == "__main__":
             self.ant_interpolate_target = QtWidgets.QComboBox(); self.ant_interpolate_target.addItems(['Value', 'Domain'])
             self.ant_interpolate_target.setToolTip('Select what Ant Colony should interpolate:\nValue: numeric grade/value (current behavior).\nDomain: categorical domain strings from samples (requires a Domain column in samples).')
             ant_form.addRow('Interpolate', self.ant_interpolate_target)
+
+            ac2_form.addRow('Range Size', self.ac2_range_size)
+            ac2_form.addRow('Max Pheromone', self.ac2_max_pheromone)
+            ac2_form.addRow('Ants per Sample', self.ac2_ants_per_sample)
+            ac2_form.addRow('Samples with Ants (%)', self.ac2_ants_sampling_percentage)
+            ac2_form.addRow('Pheromone Decay Rate', self.ac2_pheromone_decay_rate)
+            ac2_form.addRow('Iterations (silent)', self.ac2_iterations)
+            ac2_form.addRow('Background Value', self.ac2_background_value)
+            ac2_form.addRow('Background Distance', self.ac2_background_distance)
+            ac2_form.addRow('Avoid Heavily-Visited', self.ac2_avoid_visited_enabled)
+            ac2_form.addRow('Visited Threshold', self.ac2_avoid_visited_threshold)
+            ac2_form.addRow('Average With Blocks', self.ac2_average_with_blocks)
+            ac2_form.addRow('Explore Bias', self.ac2_explore_bias)
+            ac2_form.addRow('Trail Bias', self.ac2_trail_bias)
+            ac2_form.addRow('Same Mark-Class Bias', self.ac2_same_mark_bias)
+            ac2_form.addRow('Return Bias', self.ac2_return_bias)
+            ac2_form.addRow('Revisit Penalty', self.ac2_revisit_penalty)
+            ac2_form.addRow('Enable Return Mode', self.ac2_background_return_enabled)
+            ac2_form.addRow('Interpolate', self.ac2_interpolate_target)
 
             # === MOLECULAR CLOCK TAB ===
             self.mc_spatial_weight = dbl_spin(1.0, 0.0, 100.0, 0.1)
@@ -12757,10 +12919,10 @@ if __name__ == "__main__":
             self.blank_sample_domain_behavior.setToolTip('How to handle blank sample domains during domain-based interpolation or metrics.\nSkip: exclude blank-domain rows.\nInfer From Blocks: infer missing sample domains from the blocks model when possible.')
 
             self.algorithm_combo = QtWidgets.QComboBox()
-            self.algorithm_combo.addItems(['ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory'])
+            self.algorithm_combo.addItems(['ant_colony', 'ant_colony_ii', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory'])
 
             self.second_pass_combo = QtWidgets.QComboBox()
-            self.second_pass_combo.addItems(['skip', 'ant_colony', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory'])
+            self.second_pass_combo.addItems(['skip', 'ant_colony', 'ant_colony_ii', 'molecular_clock', 'gaussian_kernel', 'adaptive_octree', 'string_theory'])
             self.second_pass_combo.setCurrentText('skip')
 
             def validate_algorithms():
@@ -13093,6 +13255,25 @@ if __name__ == "__main__":
                     'support_density_alpha': self.octree_support_density_alpha.value(),
                     'include_dense_provenance': self.octree_include_dense_provenance.isChecked(),
                 },
+                'ant_colony_ii_params': {
+                    'range_size': self.ac2_range_size.value(),
+                    'max_pheromone': self.ac2_max_pheromone.value(),
+                    'ants_per_sample': self.ac2_ants_per_sample.value(),
+                    'ants_sampling_percentage': self.ac2_ants_sampling_percentage.value(),
+                    'pheromone_decay_rate': self.ac2_pheromone_decay_rate.value(),
+                    'background_value': self.ac2_background_value.value(),
+                    'background_distance': self.ac2_background_distance.value(),
+                    'average_with_blocks': self.ac2_average_with_blocks.isChecked(),
+                    'avoid_visited_threshold_enabled': self.ac2_avoid_visited_enabled.isChecked(),
+                    'avoid_visited_threshold': self.ac2_avoid_visited_threshold.value(),
+                    'explore_bias': self.ac2_explore_bias.value(),
+                    'trail_bias': self.ac2_trail_bias.value(),
+                    'same_mark_bias': self.ac2_same_mark_bias.value(),
+                    'return_bias': self.ac2_return_bias.value(),
+                    'revisit_penalty': self.ac2_revisit_penalty.value(),
+                    'background_return_enabled': self.ac2_background_return_enabled.isChecked(),
+                    'interpolate_target': self.ac2_interpolate_target.currentText().strip().lower(),
+                },
                 'string_theory_params': {
                     'interpolate_target': self.st_interpolate_target.currentText().strip().lower(),
                     'distance_threshold': self.st_distance_threshold.value(),
@@ -13347,6 +13528,27 @@ if __name__ == "__main__":
                 if 'ant_colony_interpolate_target' in config:
                     tgt = str(config['ant_colony_interpolate_target']).strip().lower()
                     self.ant_interpolate_target.setCurrentText('Domain' if tgt == 'domain' else 'Value')
+                if 'ant_colony_ii_params' in config:
+                    ac2 = config['ant_colony_ii_params']
+                    if 'range_size' in ac2: self.ac2_range_size.setValue(ac2['range_size'])
+                    if 'max_pheromone' in ac2: self.ac2_max_pheromone.setValue(ac2['max_pheromone'])
+                    if 'ants_per_sample' in ac2: self.ac2_ants_per_sample.setValue(ac2['ants_per_sample'])
+                    if 'ants_sampling_percentage' in ac2: self.ac2_ants_sampling_percentage.setValue(ac2['ants_sampling_percentage'])
+                    if 'pheromone_decay_rate' in ac2: self.ac2_pheromone_decay_rate.setValue(ac2['pheromone_decay_rate'])
+                    if 'background_value' in ac2: self.ac2_background_value.setValue(ac2['background_value'])
+                    if 'background_distance' in ac2: self.ac2_background_distance.setValue(ac2['background_distance'])
+                    if 'average_with_blocks' in ac2: self.ac2_average_with_blocks.setChecked(bool(ac2['average_with_blocks']))
+                    if 'avoid_visited_threshold_enabled' in ac2: self.ac2_avoid_visited_enabled.setChecked(bool(ac2['avoid_visited_threshold_enabled']))
+                    if 'avoid_visited_threshold' in ac2: self.ac2_avoid_visited_threshold.setValue(int(ac2['avoid_visited_threshold']))
+                    if 'explore_bias' in ac2: self.ac2_explore_bias.setValue(float(ac2['explore_bias']))
+                    if 'trail_bias' in ac2: self.ac2_trail_bias.setValue(float(ac2['trail_bias']))
+                    if 'same_mark_bias' in ac2: self.ac2_same_mark_bias.setValue(float(ac2['same_mark_bias']))
+                    if 'return_bias' in ac2: self.ac2_return_bias.setValue(float(ac2['return_bias']))
+                    if 'revisit_penalty' in ac2: self.ac2_revisit_penalty.setValue(float(ac2['revisit_penalty']))
+                    if 'background_return_enabled' in ac2: self.ac2_background_return_enabled.setChecked(bool(ac2['background_return_enabled']))
+                    if 'interpolate_target' in ac2:
+                        tgt = str(ac2['interpolate_target']).strip().lower()
+                        self.ac2_interpolate_target.setCurrentText('Domain' if tgt == 'domain' else 'Value')
                 if 'molecular_clock_params' in config:
                     mc = config['molecular_clock_params']
                     if 'spatial_weight' in mc: self.mc_spatial_weight.setValue(mc['spatial_weight'])

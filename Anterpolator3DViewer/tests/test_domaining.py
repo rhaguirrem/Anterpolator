@@ -13,7 +13,8 @@ if PROJECT_ROOT not in sys.path:
 
 import anterpolator3DViewer as viewer_module
 from ant_colony import Ant, AntColonyInterpolator, Block
-from provenance_utils import finalize_phase_provenance, seed_original_sample_provenance, snapshot_interpolator_state
+from ant_colony_ii import AntColonyIIInterpolator
+from provenance_utils import finalize_phase_provenance, normalize_provenance_algorithm_name, seed_original_sample_provenance, snapshot_interpolator_state
 
 from anterpolator3DViewer import (
     _run_interpolator_statistics_with_retry,
@@ -2147,6 +2148,215 @@ def test_create_interpolator_can_disable_blank_unvisited_priority():
     })
 
     assert interp.prioritize_blank_unvisited_neighbors is False
+
+
+def test_create_interpolator_supports_ant_colony_ii():
+    interp = viewer_module.create_interpolator({
+        'algorithm': 'ant_colony_ii',
+        'ant_colony_ii_params': {
+            'explore_bias': 3.0,
+            'background_return_enabled': True,
+        },
+    })
+
+    assert isinstance(interp, AntColonyIIInterpolator)
+    assert interp.explore_bias == 3.0
+    assert normalize_provenance_algorithm_name(interp.get_algorithm_name()) == ('Ant Colony II', 'ant_colony_ii')
+
+
+def test_ant_colony_ii_returns_toward_supported_region(monkeypatch):
+    monkeypatch.setattr('ant_colony_ii.random.shuffle', lambda seq: None)
+    monkeypatch.setattr(
+        'ant_colony_ii.random.choices',
+        lambda population, weights, k: [population[weights.index(max(weights))]],
+    )
+
+    interp = AntColonyIIInterpolator(background_distance=2, return_bias=10.0, explore_bias=5.0)
+    interp.allowed_positions = {(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)}
+    interp.blocks = {
+        (0, 0, 0): Block(
+            value=10.0,
+            is_sample=True,
+            mark_class=15.0,
+            block_id=1,
+            pheromone=10,
+            visited=True,
+            visit_count=1,
+            ant_count=0,
+            distance_to_sample=0,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+        (1, 0, 0): Block(
+            value=10.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=2,
+            pheromone=8,
+            visited=True,
+            visit_count=2,
+            ant_count=0,
+            distance_to_sample=1,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+        (2, 0, 0): Block(
+            value=0.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=3,
+            pheromone=6,
+            visited=True,
+            visit_count=1,
+            ant_count=1,
+            distance_to_sample=2,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+    }
+    ant = Ant(origin_block=(0, 0, 0), current_pos=(2, 0, 0), mark_class=15.0)
+    ant.domain = 'default'
+    interp.ants = [ant]
+
+    moved = interp.move_ants((4, 1, 1), quiet=True)
+
+    assert moved is True
+    assert ant.current_pos == (1, 0, 0)
+    assert (3, 0, 0) not in interp.blocks
+
+
+def test_ant_colony_ii_first_visit_does_not_average_with_zero(monkeypatch):
+    monkeypatch.setattr('ant_colony_ii.random.shuffle', lambda seq: None)
+    monkeypatch.setattr('ant_colony_ii.random.choices', lambda population, weights, k: [population[0]])
+
+    interp = AntColonyIIInterpolator(average_with_blocks=True, background_distance=None)
+    interp.allowed_positions = {(0, 0, 0), (1, 0, 0)}
+    interp.blocks = {
+        (0, 0, 0): Block(
+            value=80.0,
+            is_sample=True,
+            mark_class=85.0,
+            block_id=1,
+            pheromone=10,
+            visited=True,
+            visit_count=1,
+            ant_count=1,
+            distance_to_sample=0,
+            nearest_sample_value=80.0,
+            domain='default',
+        ),
+    }
+    ant = Ant(origin_block=(0, 0, 0), current_pos=(0, 0, 0), mark_class=85.0)
+    ant.domain = 'default'
+    interp.ants = [ant]
+
+    moved = interp.move_ants((2, 1, 1), quiet=True)
+
+    assert moved is True
+    assert ant.current_pos == (1, 0, 0)
+    assert interp.blocks[(1, 0, 0)].value == 80.0
+
+
+def test_ant_colony_ii_values_relax_toward_background():
+    interp = AntColonyIIInterpolator(background_value=100.0, background_distance=4.0, average_with_blocks=False)
+    interp.blocks = {
+        (0, 0, 0): Block(
+            value=40.0,
+            is_sample=True,
+            mark_class=45.0,
+            block_id=1,
+            pheromone=10,
+            visited=True,
+            visit_count=1,
+            ant_count=0,
+            distance_to_sample=0,
+            nearest_sample_value=40.0,
+            domain='default',
+        ),
+        (1, 0, 0): Block(
+            value=40.0,
+            is_sample=False,
+            mark_class=45.0,
+            block_id=2,
+            pheromone=8,
+            visited=True,
+            visit_count=1,
+            ant_count=0,
+            distance_to_sample=1,
+            nearest_sample_value=40.0,
+            domain='default',
+        ),
+        (2, 0, 0): Block(
+            value=None,
+            is_sample=False,
+            mark_class=45.0,
+            block_id=3,
+            pheromone=7,
+            visited=False,
+            visit_count=0,
+            ant_count=0,
+            distance_to_sample=2,
+            nearest_sample_value=40.0,
+            domain='default',
+        ),
+    }
+    ant = Ant(origin_block=(0, 0, 0), current_pos=(1, 0, 0), mark_class=45.0)
+    ant.domain = 'default'
+
+    value = interp.calculate_block_value((2, 0, 0), (3, 1, 1), ant)
+
+    assert 40.0 < value < 100.0
+
+
+def test_create_blocks_normalizes_active_ant_colony_ii_settings(monkeypatch):
+    captured = {}
+
+    class _FakeInterpolator:
+        def initialize_blocks(self, *args, **kwargs):
+            self.initialized_args = args
+            self.initialized_kwargs = kwargs
+
+        def create_ants(self):
+            self.created_ants = True
+
+    def _fake_create_interpolator(config, domain=None, current_algorithm=None):
+        captured['config'] = dict(config)
+        return _FakeInterpolator()
+
+    monkeypatch.setattr(viewer_module, 'create_interpolator', _fake_create_interpolator)
+
+    blocks = create_blocks(
+        np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=float),
+        np.array([80.0, 90.0], dtype=float),
+        block_size=(10.0, 10.0, 10.0),
+        config={
+            'algorithm': 'ant_colony_ii',
+            'background_value': 0.0,
+            'background_distance': 32.0,
+            'range_size': 5.0,
+            'ants_per_sample': 1,
+            'max_pheromone': 1000,
+            'average_with_blocks': False,
+            'ant_colony_ii_params': {
+                'background_value': 100.0,
+                'background_distance': 250.0,
+                'range_size': 7.0,
+                'ants_per_sample': 2,
+                'max_pheromone': 2000,
+                'average_with_blocks': True,
+            },
+        },
+        build_visual_blocks=False,
+    )
+
+    assert blocks is not None
+    assert captured['config']['algorithm'] == 'ant_colony_ii'
+    assert captured['config']['background_value'] == 100.0
+    assert captured['config']['background_distance'] == 250.0
+    assert captured['config']['range_size'] == 7.0
+    assert captured['config']['ants_per_sample'] == 2
+    assert captured['config']['max_pheromone'] == 2000
+    assert captured['config']['average_with_blocks'] is True
 
 
 def test_ant_colony_can_defer_blank_unvisited_priority(monkeypatch):
