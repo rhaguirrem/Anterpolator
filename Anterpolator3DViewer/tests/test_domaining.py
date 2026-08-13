@@ -20,6 +20,7 @@ from anterpolator3DViewer import (
     _run_interpolator_statistics_with_retry,
     _build_export_blocks_dataframe,
     _restore_list_widget_selection,
+    _select_majority_sample_block_ids,
     FilterDataSource,
     apply_blank_sample_domain_behavior,
     compute_domain_sensitive_assignment_mask,
@@ -34,6 +35,7 @@ from anterpolator3DViewer import (
     export_domain_interpolation_confidence_metrics,
     export_domained_samples_from_blocks,
     export_samples_with_block_values_from_blocks,
+    load_samples_dataframe,
     load_block_domain_catalog,
     load_large_blocks_metadata,
     normalize_selected_sample_domain_column,
@@ -2155,13 +2157,237 @@ def test_create_interpolator_supports_ant_colony_ii():
         'algorithm': 'ant_colony_ii',
         'ant_colony_ii_params': {
             'explore_bias': 3.0,
+            'directional_alignment_bias': 0.4,
+            'directional_cross_class_cap': 0.2,
             'background_return_enabled': True,
         },
     })
 
     assert isinstance(interp, AntColonyIIInterpolator)
     assert interp.explore_bias == 3.0
+    assert interp.directional_alignment_bias == 0.4
+    assert interp.directional_cross_class_cap == 0.2
     assert normalize_provenance_algorithm_name(interp.get_algorithm_name()) == ('Ant Colony II', 'ant_colony_ii')
+
+
+def test_create_interpolator_passes_string_theory_same_hole_flag():
+    interp = viewer_module.create_interpolator({
+        'algorithm': 'string_theory',
+        'string_theory_params': {
+            'avoid_same_hole_id': True,
+        },
+    })
+
+    assert interp.avoid_same_hole_id is True
+
+
+def test_load_samples_dataframe_allows_explicit_mapping_without_value_column():
+    with tempfile.TemporaryDirectory() as td:
+        samples_path = os.path.join(td, 'samples.csv')
+        pd.DataFrame(
+            [
+                {'sx': 1.0, 'sy': 2.0, 'sz': 3.0, 'hole_id': 'DH_01', 'domain': 'A'},
+                {'sx': 4.0, 'sy': 5.0, 'sz': 6.0, 'hole_id': 'DH_02', 'domain': 'B'},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        df, parsed_cols, rename_map = load_samples_dataframe(
+            samples_path,
+            samples_delimiter=',',
+            samples_header_line=1,
+            sample_x_col='sx',
+            sample_y_col='sy',
+            sample_z_col='sz',
+            sample_value_col='(None)',
+            sample_domain_col='domain',
+            extra_columns=['hole_id'],
+        )
+
+        assert parsed_cols == ['sx', 'sy', 'sz', 'hole_id', 'domain']
+        assert rename_map == {'sx': 'x', 'sy': 'y', 'sz': 'z'}
+        assert list(df.columns) == ['x', 'y', 'z', 'domain', 'hole_id']
+
+
+def test_sample_block_hole_id_requires_unanimous_match():
+    resolved = _select_majority_sample_block_ids({
+        (0, 0, 0): ['DH_01', 'DH_01', 'DH_01'],
+        (1, 0, 0): ['DH_02', 'DH_03'],
+        (2, 0, 0): ['DH_04', '', 'DH_04'],
+        (3, 0, 0): ['', '   '],
+    })
+
+    assert resolved[(0, 0, 0)] == 'DH_01'
+    assert (1, 0, 0) not in resolved
+    assert resolved[(2, 0, 0)] == 'DH_04'
+    assert (3, 0, 0) not in resolved
+
+
+def test_ant_colony_ii_prefers_forward_aligned_same_mark_neighbor(monkeypatch):
+    monkeypatch.setattr('ant_colony_ii.random.shuffle', lambda seq: None)
+    monkeypatch.setattr(
+        'ant_colony_ii.random.choices',
+        lambda population, weights, k: [population[weights.index(max(weights))]],
+    )
+
+    interp = AntColonyIIInterpolator(
+        background_distance=None,
+        trail_bias=0.0,
+        same_mark_bias=1.0,
+        directional_alignment_bias=1.5,
+        revisit_penalty=0.0,
+    )
+    interp.allowed_positions = {
+        (0, 1, 0),
+        (1, 1, 0),
+        (2, 1, 0),
+        (1, 2, 0),
+    }
+    interp.blocks = {
+        (0, 1, 0): Block(
+            value=10.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=1,
+            pheromone=5,
+            visited=True,
+            visit_count=1,
+            ant_count=0,
+            distance_to_sample=0,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+        (1, 1, 0): Block(
+            value=10.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=2,
+            pheromone=5,
+            visited=True,
+            visit_count=1,
+            ant_count=1,
+            distance_to_sample=1,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+        (2, 1, 0): Block(
+            value=10.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=3,
+            pheromone=5,
+            visited=True,
+            visit_count=1,
+            ant_count=0,
+            distance_to_sample=2,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+        (1, 2, 0): Block(
+            value=10.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=4,
+            pheromone=5,
+            visited=True,
+            visit_count=1,
+            ant_count=0,
+            distance_to_sample=2,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+    }
+    ant = Ant(origin_block=(0, 1, 0), current_pos=(1, 1, 0), mark_class=15.0)
+    ant.domain = 'default'
+    ant.previous_pos = (0, 1, 0)
+
+    next_pos = interp._select_next_position(ant, interp.blocks[(1, 1, 0)], (3, 3, 1))
+
+    assert next_pos == (2, 1, 0)
+
+
+def test_ant_colony_ii_caps_cross_class_directional_bonus(monkeypatch):
+    monkeypatch.setattr('ant_colony_ii.random.shuffle', lambda seq: None)
+    monkeypatch.setattr(
+        'ant_colony_ii.random.choices',
+        lambda population, weights, k: [population[weights.index(max(weights))]],
+    )
+
+    interp = AntColonyIIInterpolator(
+        range_size=100.0,
+        background_distance=None,
+        trail_bias=0.0,
+        same_mark_bias=1.0,
+        directional_alignment_bias=10.0,
+        directional_cross_class_cap=0.0,
+        revisit_penalty=0.0,
+    )
+    interp.allowed_positions = {
+        (0, 1, 0),
+        (1, 1, 0),
+        (2, 1, 0),
+        (1, 2, 0),
+    }
+    interp.blocks = {
+        (0, 1, 0): Block(
+            value=10.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=1,
+            pheromone=5,
+            visited=True,
+            visit_count=1,
+            ant_count=0,
+            distance_to_sample=0,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+        (1, 1, 0): Block(
+            value=10.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=2,
+            pheromone=5,
+            visited=True,
+            visit_count=1,
+            ant_count=1,
+            distance_to_sample=1,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+        (2, 1, 0): Block(
+            value=10.0,
+            is_sample=False,
+            mark_class=20.0,
+            block_id=3,
+            pheromone=5,
+            visited=True,
+            visit_count=1,
+            ant_count=0,
+            distance_to_sample=2,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+        (1, 2, 0): Block(
+            value=10.0,
+            is_sample=False,
+            mark_class=15.0,
+            block_id=4,
+            pheromone=5,
+            visited=True,
+            visit_count=1,
+            ant_count=0,
+            distance_to_sample=2,
+            nearest_sample_value=10.0,
+            domain='default',
+        ),
+    }
+    ant = Ant(origin_block=(0, 1, 0), current_pos=(1, 1, 0), mark_class=15.0)
+    ant.domain = 'default'
+    ant.previous_pos = (0, 1, 0)
+
+    next_pos = interp._select_next_position(ant, interp.blocks[(1, 1, 0)], (3, 3, 1))
+
+    assert next_pos == (1, 2, 0)
 
 
 def test_ant_colony_ii_returns_toward_supported_region(monkeypatch):
@@ -2344,6 +2570,8 @@ def test_create_blocks_normalizes_active_ant_colony_ii_settings(monkeypatch):
                 'ants_per_sample': 2,
                 'max_pheromone': 2000,
                 'average_with_blocks': True,
+                'directional_alignment_bias': 0.6,
+                'directional_cross_class_cap': 0.15,
             },
         },
         build_visual_blocks=False,
@@ -2357,6 +2585,8 @@ def test_create_blocks_normalizes_active_ant_colony_ii_settings(monkeypatch):
     assert captured['config']['ants_per_sample'] == 2
     assert captured['config']['max_pheromone'] == 2000
     assert captured['config']['average_with_blocks'] is True
+    assert captured['config']['directional_alignment_bias'] == 0.6
+    assert captured['config']['directional_cross_class_cap'] == 0.15
 
 
 def test_ant_colony_can_defer_blank_unvisited_priority(monkeypatch):

@@ -24,6 +24,8 @@ class AntColonyIIInterpolator(AntColonyInterpolator):
         explore_bias: float = 2.5,
         trail_bias: float = 1.5,
         same_mark_bias: float = 2.0,
+        directional_alignment_bias: float = 0.0,
+        directional_cross_class_cap: float = 0.3,
         return_bias: float = 4.0,
         revisit_penalty: float = 0.2,
         background_return_enabled: bool = True,
@@ -46,6 +48,8 @@ class AntColonyIIInterpolator(AntColonyInterpolator):
         self.explore_bias = float(explore_bias)
         self.trail_bias = float(trail_bias)
         self.same_mark_bias = float(same_mark_bias)
+        self.directional_alignment_bias = float(directional_alignment_bias)
+        self.directional_cross_class_cap = min(max(float(directional_cross_class_cap), 0.0), 1.0)
         self.return_bias = float(return_bias)
         self.revisit_penalty = float(revisit_penalty)
         self.background_return_enabled = bool(background_return_enabled)
@@ -59,11 +63,52 @@ class AntColonyIIInterpolator(AntColonyInterpolator):
             'explore_bias': self.explore_bias,
             'trail_bias': self.trail_bias,
             'same_mark_bias': self.same_mark_bias,
+            'directional_alignment_bias': self.directional_alignment_bias,
+            'directional_cross_class_cap': self.directional_cross_class_cap,
             'return_bias': self.return_bias,
             'revisit_penalty': self.revisit_penalty,
             'background_return_enabled': self.background_return_enabled,
         })
         return metadata
+
+    def _get_directional_alignment_multiplier(self, ant, current_block: Block, npos: Tuple[int, int, int]) -> float:
+        bias = max(self.directional_alignment_bias, 0.0)
+        previous_pos = ant.previous_pos
+        if bias <= 0.0 or previous_pos is None:
+            return 1.0
+
+        forward_vector = tuple(curr - prev for prev, curr in zip(previous_pos, ant.current_pos))
+        candidate_vector = tuple(candidate - curr for curr, candidate in zip(ant.current_pos, npos))
+        forward_norm_sq = sum(component * component for component in forward_vector)
+        candidate_norm_sq = sum(component * component for component in candidate_vector)
+        if forward_norm_sq <= 0 or candidate_norm_sq <= 0:
+            return 1.0
+
+        dot_product = sum(a * b for a, b in zip(forward_vector, candidate_vector))
+        if dot_product <= 0:
+            return 1.0
+
+        forward_norm = forward_norm_sq ** 0.5
+        candidate_norm = candidate_norm_sq ** 0.5
+        alignment = dot_product / (forward_norm * candidate_norm)
+        alignment = min(max(alignment, 0.0), 1.0)
+        if alignment <= 0.0:
+            return 1.0
+
+        target_mark_class = ant.mark_class
+        current_mark_class = getattr(current_block, 'mark_class', None)
+        if current_mark_class is not None:
+            target_mark_class = current_mark_class
+
+        class_similarity = 1.0
+        candidate_block = self.blocks.get(npos)
+        if candidate_block is not None:
+            mark_delta = abs(float(candidate_block.mark_class) - float(target_mark_class))
+            class_similarity = 1.0 / (1.0 + mark_delta / max(float(self.range_size), 1e-9))
+            if mark_delta > 0.0:
+                class_similarity = min(class_similarity, self.directional_cross_class_cap)
+
+        return 1.0 + (bias * alignment * class_similarity)
 
     def create_ants(self):
         super().create_ants()
@@ -127,6 +172,7 @@ class AntColonyIIInterpolator(AntColonyInterpolator):
             score *= 1.0 / (1.0 + current_block.distance_to_sample + 1)
             if previous_pos is not None and npos == previous_pos:
                 score *= 0.5
+            score *= self._get_directional_alignment_multiplier(ant, current_block, npos)
             return {'pos': npos, 'score': max(score, 1e-6), 'domain': domain}
 
         if block.domain != ant.domain:
@@ -145,6 +191,8 @@ class AntColonyIIInterpolator(AntColonyInterpolator):
         else:
             mark_delta = abs(block.mark_class - ant.mark_class)
             score *= 1.0 / (1.0 + mark_delta / max(float(self.range_size), 1e-9))
+
+        score *= self._get_directional_alignment_multiplier(ant, current_block, npos)
 
         if block.nearest_sample_value == current_block.nearest_sample_value:
             score *= 1.15

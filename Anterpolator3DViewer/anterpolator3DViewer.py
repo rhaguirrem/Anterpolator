@@ -181,6 +181,8 @@ def _normalize_active_algorithm_config(config):
         'average_with_blocks': 'average_with_blocks',
         'avoid_visited_threshold_enabled': 'avoid_visited_threshold_enabled',
         'avoid_visited_threshold': 'avoid_visited_threshold',
+        'directional_alignment_bias': 'directional_alignment_bias',
+        'directional_cross_class_cap': 'directional_cross_class_cap',
     }
     for source_key, target_key in field_map.items():
         if source_key in ac2_params:
@@ -260,6 +262,8 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             explore_bias=ac2_params.get('explore_bias', 2.5),
             trail_bias=ac2_params.get('trail_bias', 1.5),
             same_mark_bias=ac2_params.get('same_mark_bias', 2.0),
+            directional_alignment_bias=ac2_params.get('directional_alignment_bias', 0.0),
+            directional_cross_class_cap=ac2_params.get('directional_cross_class_cap', 0.3),
             return_bias=ac2_params.get('return_bias', 4.0),
             revisit_penalty=ac2_params.get('revisit_penalty', 0.2),
             background_return_enabled=ac2_params.get('background_return_enabled', True),
@@ -325,6 +329,7 @@ def create_interpolator(config, domain=None, current_algorithm=None):
         filter_by_frequency = st_params.get('filter_by_frequency', config.get('filter_by_frequency', False))
         min_azimuth_freq = st_params.get('min_azimuth_freq', config.get('min_azimuth_freq', 10.0))
         min_dip_freq = st_params.get('min_dip_freq', config.get('min_dip_freq', 10.0))
+        avoid_same_hole_id = st_params.get('avoid_same_hole_id', config.get('avoid_same_hole_id', False))
 
         interpolate_target = st_params.get('interpolate_target', 'value')
         
@@ -339,6 +344,7 @@ def create_interpolator(config, domain=None, current_algorithm=None):
             filter_by_frequency=filter_by_frequency,
             min_azimuth_freq=min_azimuth_freq,
             min_dip_freq=min_dip_freq,
+            avoid_same_hole_id=avoid_same_hole_id,
             interpolation_target=interpolate_target,
             verbose=config.get('verbose', False)
         )
@@ -825,10 +831,14 @@ def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_
                           sample_x_col=None, sample_y_col=None, sample_z_col=None, sample_value_col=None,
                           sample_domain_col=None, sample_filters=None, progress_label=None,
                           extra_columns=None):
-    explicit_mapping = all([sample_x_col, sample_y_col, sample_z_col, sample_value_col])
+    selected_value_col = str(sample_value_col or '').strip()
+    use_selected_value_col = bool(selected_value_col and selected_value_col != '(None)')
+    explicit_mapping = all([sample_x_col, sample_y_col, sample_z_col])
     if explicit_mapping:
         delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
-        selected_columns = [sample_x_col, sample_y_col, sample_z_col, sample_value_col]
+        selected_columns = [sample_x_col, sample_y_col, sample_z_col]
+        if use_selected_value_col:
+            selected_columns.append(selected_value_col)
         selected_domain_col = str(sample_domain_col or '').strip()
         if selected_domain_col and selected_domain_col != '(None)':
             selected_columns.append(selected_domain_col)
@@ -851,9 +861,25 @@ def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_
             sample_x_col: 'x',
             sample_y_col: 'y',
             sample_z_col: 'z',
-            sample_value_col: 'Value',
         }
+        if use_selected_value_col:
+            rename_map[selected_value_col] = 'Value'
         df = df.rename(columns=rename_map)
+        ordered_columns = ['x', 'y', 'z']
+        if use_selected_value_col and 'Value' in df.columns:
+            ordered_columns.append('Value')
+        if selected_domain_col and selected_domain_col != '(None)' and selected_domain_col in df.columns:
+            ordered_columns.append(selected_domain_col)
+        for column_name in extra_columns or []:
+            normalized = str(column_name or '').strip()
+            if normalized and normalized != '(None)' and normalized in df.columns and normalized not in ordered_columns:
+                ordered_columns.append(normalized)
+        ordered_columns.extend([
+            column_name
+            for column_name in df.columns
+            if column_name not in ordered_columns
+        ])
+        df = df.loc[:, ordered_columns]
         return df, parsed_cols, rename_map
 
     if samples_header_line and samples_header_line != 1 and samples_delimiter:
@@ -892,6 +918,28 @@ def normalize_selected_sample_domain_column(df, sample_domain_col=None):
     return df
 
 
+def normalize_selected_sample_value_column(df, sample_value_col=None, allow_none=False):
+    selected_value_col = str(sample_value_col or '').strip()
+    if selected_value_col and selected_value_col != '(None)':
+        if selected_value_col == 'Value' and 'Value' in df.columns:
+            return df
+        if selected_value_col not in df.columns:
+            raise ValueError(f"Selected sample value column not found in samples file: {selected_value_col}")
+        df = df.copy()
+        df['Value'] = df[selected_value_col]
+        return df
+
+    if 'Value' in df.columns:
+        return df
+
+    if allow_none:
+        df = df.copy()
+        df['Value'] = 0.0
+        return df
+
+    raise ValueError('Please select a value column in "Samples Columns" or switch to a domain interpolation mode that allows Value=(None).')
+
+
 def normalize_selected_sample_weight_column(df, sample_weight_col=None, sample_value_col=None):
     selected_weight_col = str(sample_weight_col or '').strip()
     if not selected_weight_col or selected_weight_col == '(None)':
@@ -913,6 +961,21 @@ def normalize_selected_sample_weight_column(df, sample_weight_col=None, sample_v
 
     df = df.copy()
     df['Weight'] = df[weight_source]
+    return df
+
+
+def normalize_selected_sample_hole_id_column(df, sample_hole_id_col=None):
+    selected_hole_id_col = str(sample_hole_id_col or '').strip()
+    if not selected_hole_id_col or selected_hole_id_col == '(None)':
+        return df
+
+    if selected_hole_id_col == 'HoleId' and 'HoleId' in df.columns:
+        return df
+    if selected_hole_id_col not in df.columns:
+        raise ValueError(f"Selected sample HoleId column not found in samples file: {selected_hole_id_col}")
+
+    df = df.copy()
+    df['HoleId'] = df[selected_hole_id_col]
     return df
 
 
@@ -1431,6 +1494,7 @@ def _build_sample_block_cache_identity(config, mode='blocks_file'):
         'sample_z_col': str(cfg.get('sample_z_col') or ''),
         'sample_value_col': str(cfg.get('sample_value_col') or ''),
         'sample_domain_col': str(cfg.get('sample_domain_col') or ''),
+        'sample_hole_id_col': str(cfg.get('sample_hole_id_col') or ''),
         'sample_weight_col': str(cfg.get('sample_weight_col') or ''),
         'block_x_col': str(cfg.get('block_x_col') or ''),
         'block_y_col': str(cfg.get('block_y_col') or ''),
@@ -1660,6 +1724,23 @@ def _select_majority_sample_block_domains(sample_block_domain_counts):
         if tied_domains:
             resolved_domains[block_idx] = tied_domains[0]
     return resolved_domains
+
+
+def _select_majority_sample_block_ids(sample_block_ids):
+    resolved_ids = {}
+    for block_idx, block_ids in (sample_block_ids or {}).items():
+        normalized_ids = []
+        for sample_id in block_ids:
+            normalized = str(sample_id or '').strip()
+            if not normalized:
+                continue
+            normalized_ids.append(normalized)
+        if not normalized_ids:
+            continue
+        unique_ids = set(normalized_ids)
+        if len(unique_ids) == 1:
+            resolved_ids[block_idx] = normalized_ids[0]
+    return resolved_ids
 
 
 def _build_sample_block_rows(sample_block_values, sample_block_counts, reference_origin, block_size,
@@ -2652,6 +2733,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                   config=None,
                   sample_domains=None,
                   sample_weights=None,
+                  sample_hole_ids=None,
                   build_visual_blocks=True):
     config = _normalize_active_algorithm_config(config)
     if isinstance(config, dict):
@@ -2669,6 +2751,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
     original_values_array = np.array(values, copy=True)
     original_domains_array = np.array(sample_domains, copy=True) if sample_domains is not None else None
     original_weights_array = np.array(sample_weights, copy=True) if sample_weights is not None else None
+    original_hole_ids_array = np.array(sample_hole_ids, copy=True) if sample_hole_ids is not None else None
     # Domain interpolation in String Theory must ignore blocks_file as input.
     st_target = None
     if config and config.get('algorithm') in ('string_theory', 'net_connector'):
@@ -2929,7 +3012,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             sample_domains=sample_domains,
         )
         sample_block_cache = None
-        if not _should_force_rebuild_sample_blocks(config):
+        if sample_hole_ids is None and not _should_force_rebuild_sample_blocks(config):
             sample_block_cache = _load_sample_block_cache(
                 config,
                 len(points),
@@ -2962,6 +3045,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 allowed_grid=allowed_grid,
                 domain_mapping=domain_mapping,
                 sample_domains=sample_domains,
+                sample_ids=sample_hole_ids,
                 sample_weights=sample_weights,
                 progress_label='Assigning points to blocks',
                 block_indices=block_indices,
@@ -2985,6 +3069,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 )
         sample_block_values = sample_block_data['sample_block_values']
         sample_block_counts = sample_block_data['sample_block_counts']
+        sample_block_hole_id_mapping = _select_majority_sample_block_ids(sample_block_data.get('sample_block_ids'))
         if domain_mismatch_count:
             print(f"Rejected {domain_mismatch_count:,} samples whose domain does not match their target block domain.")
         
@@ -3051,6 +3136,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'points': original_points_array,
             'values': original_values_array,
             'domains': original_domains_array,
+            'hole_ids': original_hole_ids_array,
             'block_indices': block_indices,
             'assigned_mask': assigned_mask,
             'sample_block_counts': dict(sample_block_data['sample_block_counts']),
@@ -3058,6 +3144,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         }
         multiblock._sample_block_counts = dict(sample_block_data['sample_block_counts'])
         multiblock._sample_block_weight_sums = dict(sample_block_data['sample_block_weight_sums'])
+        multiblock._sample_block_hole_id_mapping = dict(sample_block_hole_id_mapping)
         load_pbar.update(1)
         load_pbar.set_postfix_str("initializing interpolator")
         
@@ -3115,6 +3202,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     interp_fill.initialize_blocks(domain_samples, tuple(block_info['dims']),
                                              all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping,
                                              sample_domain_mapping=domain_sample_mapping,
+                                             sample_hole_id_mapping={pos: sample_block_hole_id_mapping.get(pos, '') for pos in domain_samples},
                                              sample_block_counts={pos: multiblock._sample_block_counts.get(pos, 1) for pos in domain_samples},
                                              sample_block_weight_sums={pos: multiblock._sample_block_weight_sums.get(pos, 1.0) for pos in domain_samples})
                     interp_fill._post_process_only = True
@@ -3161,6 +3249,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 interp1.initialize_blocks(domain_samples, tuple(block_info['dims']),
                                              all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping,
                                              sample_domain_mapping=domain_sample_mapping,
+                                             sample_hole_id_mapping={pos: sample_block_hole_id_mapping.get(pos, '') for pos in domain_samples},
                                              sample_block_counts={pos: multiblock._sample_block_counts.get(pos, 1) for pos in domain_samples},
                                              sample_block_weight_sums={pos: multiblock._sample_block_weight_sums.get(pos, 1.0) for pos in domain_samples})
                 
@@ -3188,6 +3277,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     interp2.initialize_blocks(domain_samples, tuple(block_info['dims']),
                                              all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_2,
                                              sample_domain_mapping=domain_sample_mapping,
+                                             sample_hole_id_mapping={pos: sample_block_hole_id_mapping.get(pos, '') for pos in domain_samples},
                                              sample_block_counts={pos: multiblock._sample_block_counts.get(pos, 1) for pos in domain_samples},
                                              sample_block_weight_sums={pos: multiblock._sample_block_weight_sums.get(pos, 1.0) for pos in domain_samples})
                     
@@ -3260,6 +3350,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 
                 interp1.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
                                          all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_1,
+                                         sample_hole_id_mapping=getattr(multiblock, '_sample_block_hole_id_mapping', {}),
                                          sample_block_counts=getattr(multiblock, '_sample_block_counts', {}),
                                          sample_block_weight_sums=getattr(multiblock, '_sample_block_weight_sums', {}))
                 if hasattr(interp1, 'create_ants'):
@@ -3295,6 +3386,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 
                 interp2.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
                                          all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping_2,
+                                         sample_hole_id_mapping=getattr(multiblock, '_sample_block_hole_id_mapping', {}),
                                          sample_block_counts=getattr(multiblock, '_sample_block_counts', {}),
                                          sample_block_weight_sums=getattr(multiblock, '_sample_block_weight_sums', {}))
                 if hasattr(interp2, 'create_ants'):
@@ -3345,6 +3437,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 # Use use_domain_mapping=True to respect allowed_grid_override (geometry)
                 interpolator.initialize_blocks(multiblock._sample_blocks, tuple(block_info['dims']),
                                              all_min_bounds, unified_dims.tolist(), use_domain_mapping=use_mapping,
+                                             sample_hole_id_mapping=getattr(multiblock, '_sample_block_hole_id_mapping', {}),
                                              sample_block_counts=getattr(multiblock, '_sample_block_counts', {}),
                                              sample_block_weight_sums=getattr(multiblock, '_sample_block_weight_sums', {}))
                 
@@ -3368,6 +3461,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         block_values = {}
         block_weights = {}
         block_domains = {}
+        block_hole_ids = {}
         block_info = {
             'min_bounds': min_bounds,
             'dims': dims,
@@ -3394,6 +3488,11 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 raise ValueError('Sample weights must have the same length as sample points.')
             if np.any(~np.isfinite(weights_array)) or np.any(weights_array <= 0.0):
                 raise ValueError('Sample weights must be finite values greater than zero.')
+        hole_ids_array = None
+        if sample_hole_ids is not None:
+            hole_ids_array = np.array(sample_hole_ids, dtype=object)
+            if len(hole_ids_array) != len(points_array):
+                raise ValueError('Sample HoleId values must have the same length as sample points.')
         block_indices = ((points_array - min_bounds) // np.array(block_size)).astype(int)
         assigned_mask = np.ones(len(points_array), dtype=bool)
         
@@ -3406,12 +3505,16 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                     block_weights[block_idx] = []
                 if domains_array is not None:
                     block_domains[block_idx] = []
+                if hole_ids_array is not None:
+                    block_hole_ids[block_idx] = []
             blocks[block_idx].append(points_array[i])
             block_values[block_idx].append(values_array[i])
             if weights_array is not None:
                 block_weights[block_idx].append(weights_array[i])
             if domains_array is not None:
                 block_domains[block_idx].append(domains_array[i])
+            if hole_ids_array is not None:
+                block_hole_ids[block_idx].append(hole_ids_array[i])
         next_block_id = 1
 
         # Detect domain interpolation mode (String Theory)
@@ -3506,6 +3609,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             idx: float(np.sum(block_weights[idx])) if weights_array is not None else float(len(vals))
             for idx, vals in block_values.items()
         }
+        sample_block_hole_id_mapping = _select_majority_sample_block_ids(block_hole_ids)
         multiblock._block_info = block_info
         multiblock._sample_blocks = sample_blocks
         multiblock._sample_assignment_data = {
@@ -3513,6 +3617,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'values': original_values_array,
             'domains': original_domains_array,
             'weights': original_weights_array,
+            'hole_ids': original_hole_ids_array,
             'block_indices': block_indices,
             'assigned_mask': assigned_mask,
             'sample_block_counts': dict(sample_block_counts),
@@ -3520,6 +3625,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
         }
         multiblock._sample_block_counts = dict(sample_block_counts)
         multiblock._sample_block_weight_sums = dict(sample_block_weight_sums)
+        multiblock._sample_block_hole_id_mapping = dict(sample_block_hole_id_mapping)
 
         if is_st_domain_interpolation or is_ant_domain_interpolation:
             # Preserve sample block domains for export.
@@ -3557,6 +3663,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 block_size,
                 use_domain_mapping=False,
                 sample_domain_mapping=sample_block_domain_mapping,
+                sample_hole_id_mapping=sample_block_hole_id_mapping,
                 sample_block_counts=sample_block_counts,
                 sample_block_weight_sums=sample_block_weight_sums,
             )
@@ -3578,6 +3685,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 block_size,
                 use_domain_mapping=False,
                 sample_domain_mapping=sample_block_domain_mapping,
+                sample_hole_id_mapping=sample_block_hole_id_mapping,
                 sample_block_counts=sample_block_counts,
                 sample_block_weight_sums=sample_block_weight_sums,
             )
@@ -3627,6 +3735,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 
             interp1.initialize_blocks(sample_blocks, tuple(block_info['dims']),
                                        min_bounds, block_size, use_domain_mapping=use_mapping,
+                                       sample_hole_id_mapping=sample_block_hole_id_mapping,
                                        sample_block_counts=sample_block_counts,
                                        sample_block_weight_sums=sample_block_weight_sums)
             if hasattr(interp1, 'create_ants'):
@@ -3646,6 +3755,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 
             interp2.initialize_blocks(sample_blocks, tuple(block_info['dims']),
                                        min_bounds, block_size, use_domain_mapping=use_mapping,
+                                       sample_hole_id_mapping=sample_block_hole_id_mapping,
                                        sample_block_counts=sample_block_counts,
                                        sample_block_weight_sums=sample_block_weight_sums)
             if hasattr(interp2, 'create_ants'):
@@ -3665,6 +3775,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 
             interpolator.initialize_blocks(sample_blocks, tuple(block_info['dims']),
                                            min_bounds, block_size, use_domain_mapping=use_mapping,
+                                           sample_hole_id_mapping=sample_block_hole_id_mapping,
                                            sample_block_counts=sample_block_counts,
                                            sample_block_weight_sums=sample_block_weight_sums)
             
@@ -9638,6 +9749,7 @@ def silent_interpolation(plotter, iterations, interpolation_file):
                          block_size,
                          use_domain_mapping=use_mapping,
                          sample_domain_mapping=pass1_domain_mapping,
+                         sample_hole_id_mapping={pos: blocks._sample_block_hole_id_mapping.get(pos, '') for pos in pass1_values if hasattr(blocks, '_sample_block_hole_id_mapping')},
                      )
                      copy_interpolator_provenance(interp1, interp2)
                      pass2_snapshot = snapshot_interpolator_state(interp2)
@@ -9848,7 +9960,7 @@ def build_taichi_viewer_state_from_config(config):
         sample_domain_col=config.get('sample_domain_col'),
         sample_filters=sample_filters,
         progress_label='Reading sample file',
-        extra_columns=[config.get('sample_weight_col')],
+        extra_columns=[config.get('sample_weight_col'), config.get('sample_hole_id_col')],
     )
     if parsed_cols is not None:
         print(f"Samples file (custom header line {config.get('samples_header_line', 1)}) parsed columns: {parsed_cols}")
@@ -9878,22 +9990,31 @@ def build_taichi_viewer_state_from_config(config):
 
     if needs_sample_domains:
         df = normalize_selected_sample_domain_column(df, sample_domain_col=config.get('sample_domain_col'))
+
+    if explicit_sample_map:
+        print(f"Applied user sample column mapping: {explicit_sample_map}")
+    elif config.get('sample_x_col') and config.get('sample_y_col') and config.get('sample_z_col'):
+        rename_map = {
+            config.get('sample_x_col'): 'x',
+            config.get('sample_y_col'): 'y',
+            config.get('sample_z_col'): 'z',
+        }
+        selected_value_col = str(config.get('sample_value_col') or '').strip()
+        if selected_value_col and selected_value_col != '(None)':
+            rename_map[selected_value_col] = 'Value'
+        df = df.rename(columns=rename_map)
+
+    df = normalize_selected_sample_value_column(
+        df,
+        sample_value_col=config.get('sample_value_col'),
+        allow_none=wants_domain_any,
+    )
     df = normalize_selected_sample_weight_column(
         df,
         sample_weight_col=config.get('sample_weight_col'),
         sample_value_col=config.get('sample_value_col'),
     )
-
-    if explicit_sample_map:
-        print(f"Applied user sample column mapping: {explicit_sample_map}")
-    elif config.get('sample_x_col') and config.get('sample_y_col') and config.get('sample_z_col') and config.get('sample_value_col'):
-        rename_map = {
-            config.get('sample_x_col'): 'x',
-            config.get('sample_y_col'): 'y',
-            config.get('sample_z_col'): 'z',
-            config.get('sample_value_col'): 'Value',
-        }
-        df = df.rename(columns=rename_map)
+    df = normalize_selected_sample_hole_id_column(df, sample_hole_id_col=config.get('sample_hole_id_col'))
 
     df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
     nan_before = int(df['Value'].isna().sum())
@@ -9945,6 +10066,7 @@ def build_taichi_viewer_state_from_config(config):
     points = df[['x', 'y', 'z']].values
     values = df['Value'].values
     sample_domains = df['Domain'].values if 'Domain' in df.columns else None
+    sample_hole_ids = df['HoleId'].fillna('').astype(str).to_numpy(dtype=object, copy=False) if 'HoleId' in df.columns else None
     print(f"Loaded {len(values)} samples from {samples_file}.")
 
     blocks = create_blocks(
@@ -9970,6 +10092,7 @@ def build_taichi_viewer_state_from_config(config):
         config=config,
         sample_domains=sample_domains,
         sample_weights=sample_weights,
+        sample_hole_ids=sample_hole_ids,
     )
 
     lfc_colormap, lfc_bins, lfc_labels = load_lfc_colormap(config.get('color_file'))
@@ -9998,6 +10121,15 @@ def build_taichi_viewer_state_from_interpolation_file(config):
     taichi_runtime = _load_taichi_runtime_module()
     display_block_filters = get_configured_display_block_filters(config)
     value_filter_min, value_filter_max = extract_display_block_value_range(display_block_filters)
+    wants_st_domain = bool(
+        config.get('algorithm') in ('string_theory', 'net_connector')
+        and str(config.get('string_theory_params', {}).get('interpolate_target', 'value')).strip().lower() == 'domain'
+    )
+    wants_ant_domain = bool(
+        config.get('algorithm') == 'ant_colony'
+        and str(config.get('ant_colony_interpolate_target', 'value')).strip().lower() == 'domain'
+    )
+    wants_domain_any = wants_st_domain or wants_ant_domain
 
     samples_file = config['samples_file']
     interpolation_file = str(config.get('interpolation_file') or '').strip()
@@ -10017,15 +10149,22 @@ def build_taichi_viewer_state_from_interpolation_file(config):
         progress_label='Reading sample file',
     )
 
+    df_samples = normalize_selected_sample_domain_column(df_samples, sample_domain_col=config.get('sample_domain_col'))
+
     if explicit_sample_map:
         pass
-    elif config.get('sample_x_col') and config.get('sample_y_col') and config.get('sample_z_col') and config.get('sample_value_col'):
+    elif config.get('sample_x_col') and config.get('sample_y_col') and config.get('sample_z_col'):
         df_samples = df_samples.rename(columns={
             config.get('sample_x_col'): 'x',
             config.get('sample_y_col'): 'y',
             config.get('sample_z_col'): 'z',
-            config.get('sample_value_col'): 'Value',
         })
+
+    df_samples = normalize_selected_sample_value_column(
+        df_samples,
+        sample_value_col=config.get('sample_value_col'),
+        allow_none=wants_domain_any,
+    )
 
     sample_coord_frame = df_samples[['x', 'y', 'z']].apply(pd.to_numeric, errors='coerce')
     sample_values_series = pd.to_numeric(df_samples['Value'], errors='coerce')
@@ -10212,7 +10351,7 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, val
             sample_domain_col=config.get('sample_domain_col') if config else None,
             sample_filters=sample_filters,
             progress_label='Reading sample file',
-            extra_columns=[config.get('sample_weight_col') if config else None],
+            extra_columns=[config.get('sample_weight_col') if config else None, config.get('sample_hole_id_col') if config else None],
         )
         if parsed_cols is not None:
             print(f"Samples file (custom header line {samples_header_line}) parsed columns: {parsed_cols}")
@@ -10242,38 +10381,57 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, val
 
         if wants_domain_any:
             df = normalize_selected_sample_domain_column(df, sample_domain_col=config.get('sample_domain_col') if config else None)
+
+        if explicit_sample_map:
+            print(f"Applied user sample column mapping: {explicit_sample_map}")
+        elif sample_x_col and sample_y_col and sample_z_col:
+            chosen_columns = [sample_x_col, sample_y_col, sample_z_col]
+            selected_value_col = str(sample_value_col or '').strip()
+            if selected_value_col and selected_value_col != '(None)':
+                chosen_columns.append(selected_value_col)
+            for chosen in chosen_columns:
+                if chosen not in df.columns:
+                    raise ValueError(f"Selected samples column '{chosen}' not present in file.")
+            rename_map = {sample_x_col: 'x', sample_y_col: 'y', sample_z_col: 'z'}
+            if selected_value_col and selected_value_col != '(None)':
+                rename_map[selected_value_col] = 'Value'
+            df = df.rename(columns=rename_map)
+            print(f"Applied user sample column mapping: {rename_map}")
+        else:
+            coord_expected = ['x', 'y', 'z']
+            if any(col not in df.columns for col in coord_expected):
+                first_three = list(df.columns[:3])
+                if len(first_three) == 3:
+                    rename_map = {orig: new for orig, new in zip(first_three, coord_expected)}
+                    df = df.rename(columns=rename_map)
+                    print(f"Mapped first three sample columns to {coord_expected}: {rename_map}")
+                else:
+                    raise ValueError("Samples file must have at least three columns for automatic mapping (x,y,z).")
+            value_required = not wants_domain_any or bool(str(sample_value_col or '').strip() and str(sample_value_col or '').strip() != '(None)')
+            if value_required and 'Value' not in df.columns:
+                for c in df.columns:
+                    if str(c).strip().lower() == 'value':
+                        df = df.rename(columns={c: 'Value'})
+                        break
+            if value_required and 'Value' not in df.columns:
+                first_four = list(df.columns[:4])
+                if len(first_four) == 4:
+                    rename_map = {orig: new for orig, new in zip(first_four, ['x', 'y', 'z', 'Value'])}
+                    df = df.rename(columns=rename_map)
+                    print(f"Mapped first four sample columns to ['x', 'y', 'z', 'Value']: {rename_map}")
+                else:
+                    raise ValueError("Samples file must have at least four columns for automatic mapping (x,y,z,Value).")
+        df = normalize_selected_sample_value_column(
+            df,
+            sample_value_col=sample_value_col,
+            allow_none=wants_domain_any,
+        )
         df = normalize_selected_sample_weight_column(
             df,
             sample_weight_col=config.get('sample_weight_col') if config else None,
             sample_value_col=sample_value_col,
         )
-
-        if explicit_sample_map:
-            print(f"Applied user sample column mapping: {explicit_sample_map}")
-        elif sample_x_col and sample_y_col and sample_z_col and sample_value_col:
-            for chosen in [sample_x_col, sample_y_col, sample_z_col, sample_value_col]:
-                if chosen not in df.columns:
-                    raise ValueError(f"Selected samples column '{chosen}' not present in file.")
-            rename_map = {sample_x_col: 'x', sample_y_col: 'y', sample_z_col: 'z', sample_value_col: 'Value'}
-            df = df.rename(columns=rename_map)
-            print(f"Applied user sample column mapping: {rename_map}")
-        else:
-            expected = ['x', 'y', 'z', 'Value']
-            missing_any = any(col not in df.columns for col in expected)
-            if missing_any:
-                if 'Value' not in df.columns:
-                    for c in df.columns:
-                        if c.lower() == 'value':
-                            df = df.rename(columns={c: 'Value'})
-                            break
-                if any(col not in df.columns for col in expected):
-                    first_four = list(df.columns[:4])
-                    if len(first_four) == 4:
-                        rename_map = {orig: new for orig, new in zip(first_four, expected)}
-                        df = df.rename(columns=rename_map)
-                        print(f"Mapped first four sample columns to {expected}: {rename_map}")
-                    else:
-                        raise ValueError("Samples file must have at least four columns for automatic mapping (x,y,z,Value).")
+        df = normalize_selected_sample_hole_id_column(df, sample_hole_id_col=config.get('sample_hole_id_col') if config else None)
         for col in ['x','y','z','Value']:
             if col not in df.columns:
                 raise ValueError(f"Required column '{col}' not found after mapping.")
@@ -10323,6 +10481,16 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, val
             if len(df) == 0:
                 raise ValueError("After removing blank/non-numeric sample values, no samples remain. Check the configured 'sample_value_col'.")
 
+            for coord_col in ['x', 'y', 'z']:
+                df[coord_col] = pd.to_numeric(df[coord_col], errors='coerce')
+            invalid_coord_mask = ~np.isfinite(df[['x', 'y', 'z']].to_numpy(dtype=float, copy=False)).all(axis=1)
+            invalid_coord_count = int(invalid_coord_mask.sum())
+            if invalid_coord_count:
+                print(f"Detected {invalid_coord_count} sample rows with blank/non-numeric coordinates; these will be excluded from samples.")
+                df = df.loc[~invalid_coord_mask].copy()
+            if len(df) == 0:
+                raise ValueError("After removing invalid sample coordinates, no samples remain. Check the configured sample coordinate columns and header line.")
+
         sample_weights = None
         selected_weight_column = str(config.get('sample_weight_col') if config else '').strip()
         if selected_weight_column and selected_weight_column != '(None)':
@@ -10340,6 +10508,7 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, val
         points = df[['x','y','z']].values
         values = df['Value'].values
         sample_domains = df['Domain'].values if 'Domain' in df.columns else None
+        sample_hole_ids = df['HoleId'].fillna('').astype(str).to_numpy(dtype=object, copy=False) if 'HoleId' in df.columns else None
         # Store scalar range early
         data_min, data_max = float(np.nanmin(values)), float(np.nanmax(values))
         print(f"Sample value range: min={data_min} max={data_max}")
@@ -10395,6 +10564,7 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, val
             config=config,
             sample_domains=sample_domains,
             sample_weights=sample_weights,
+            sample_hole_ids=sample_hole_ids,
         )
 
         if display_block_filters is None:
@@ -11304,7 +11474,7 @@ if __name__ == "__main__":
                 combo_box.view().setMinimumWidth(popup_width)
 
             # Column mapping combo boxes for samples
-            self.sample_x_col = QtWidgets.QComboBox(); self.sample_y_col = QtWidgets.QComboBox(); self.sample_z_col = QtWidgets.QComboBox(); self.sample_value_col = QtWidgets.QComboBox(); self.sample_domain_col = QtWidgets.QComboBox(); self.sample_weight_col = QtWidgets.QComboBox()
+            self.sample_x_col = QtWidgets.QComboBox(); self.sample_y_col = QtWidgets.QComboBox(); self.sample_z_col = QtWidgets.QComboBox(); self.sample_value_col = QtWidgets.QComboBox(); self.sample_domain_col = QtWidgets.QComboBox(); self.sample_hole_id_col = QtWidgets.QComboBox(); self.sample_weight_col = QtWidgets.QComboBox()
             self.sample_blocks_include_ids = QtWidgets.QCheckBox('Include concatenated sample IDs')
             self.sample_blocks_include_ids.setToolTip(
                 'When enabled, export a text metadata column listing the contributing sample IDs for each sample block.'
@@ -11316,7 +11486,7 @@ if __name__ == "__main__":
             self.block_domain_metrics_prefix_with_block_value.setToolTip(
                 'When enabled, closest-sample ID and nearest-sample value/residual metrics are exported as <Block Value Column>_<Metric Name>.'
             )
-            for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col, self.sample_weight_col]:
+            for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col, self.sample_hole_id_col, self.sample_weight_col]:
                 configure_column_combo(cb)
             for cb in self.sample_blocks_id_cols:
                 configure_column_combo(cb)
@@ -11324,12 +11494,15 @@ if __name__ == "__main__":
             for cb in self.block_domain_metrics_id_cols:
                 configure_column_combo(cb)
                 cb.addItem('(None)')
+            self.sample_value_col.addItem('(None)')
             self.sample_domain_col.addItem('(None)')
+            self.sample_hole_id_col.addItem('(None)')
             self.sample_weight_col.addItem('(None)')
-            sample_map_layout = QtWidgets.QHBoxLayout(); sample_map_layout.addWidget(self.sample_x_col); sample_map_layout.addWidget(self.sample_y_col); sample_map_layout.addWidget(self.sample_z_col); sample_map_layout.addWidget(self.sample_value_col); sample_map_layout.addWidget(self.sample_domain_col)
-            for index in range(5):
+            self.sample_hole_id_col.setToolTip('Optional Hole ID column used by String Theory to avoid connecting samples from the same hole when requested.')
+            sample_map_layout = QtWidgets.QHBoxLayout(); sample_map_layout.addWidget(self.sample_x_col); sample_map_layout.addWidget(self.sample_y_col); sample_map_layout.addWidget(self.sample_z_col); sample_map_layout.addWidget(self.sample_value_col); sample_map_layout.addWidget(self.sample_domain_col); sample_map_layout.addWidget(self.sample_hole_id_col)
+            for index in range(6):
                 sample_map_layout.setStretch(index, 1)
-            files_form.addRow('Samples Columns (X Y Z Value Domain)', sample_map_layout)
+            files_form.addRow('Samples Columns (X Y Z Value Domain HoleId)', sample_map_layout)
             self.sample_weight_col.setToolTip('Optional weight column for block-level sample averaging. When selected, Sample Blocks export and interpolation preprocessing use weighted averages instead of plain means.')
             files_form.addRow('Sample Weight Column', self.sample_weight_col)
 
@@ -11369,13 +11542,17 @@ if __name__ == "__main__":
                 path = self.samples_edit.text().strip()
                 delim = self.samples_delim.currentText()
                 header_line = self.samples_header_line.value()
+                current_value = self.sample_value_col.currentText()
                 current_domain = self.sample_domain_col.currentText()
+                current_hole_id = self.sample_hole_id_col.currentText()
                 current_weight = self.sample_weight_col.currentText()
                 current_sample_blocks_id_cols = [cb.currentText() for cb in self.sample_blocks_id_cols]
                 current_metrics_id_cols = [cb.currentText() for cb in self.block_domain_metrics_id_cols]
-                for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col]:
+                for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col]:
                     cb.clear()
+                self.sample_value_col.clear(); self.sample_value_col.addItem('(None)')
                 self.sample_domain_col.clear(); self.sample_domain_col.addItem('(None)')
+                self.sample_hole_id_col.clear(); self.sample_hole_id_col.addItem('(None)')
                 self.sample_weight_col.clear(); self.sample_weight_col.addItem('(None)')
                 for cb in self.sample_blocks_id_cols:
                     cb.clear(); cb.addItem('(None)')
@@ -11385,7 +11562,7 @@ if __name__ == "__main__":
                     return
                 try:
                     cols = parse_effective_header_line(path, delim, header_line)
-                    for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col, self.sample_weight_col]:
+                    for cb in [self.sample_x_col, self.sample_y_col, self.sample_z_col, self.sample_value_col, self.sample_domain_col, self.sample_hole_id_col, self.sample_weight_col]:
                         cb.addItems(cols)
                     for cb in self.sample_blocks_id_cols:
                         cb.addItems(cols)
@@ -11402,11 +11579,20 @@ if __name__ == "__main__":
                     suggest(self.sample_z_col, ['z','elevation','rl'])
                     suggest(self.sample_value_col, ['value','grade'])
                     suggest(self.sample_domain_col, ['domain','dom','dg'])
+                    suggest(self.sample_hole_id_col, ['holeid','hole_id','dhid','bhid','id'])
                     suggest(self.sample_weight_col, ['length','interval_length','sample_length','weight'])
+                    if current_value and current_value != '(None)':
+                        idx = self.sample_value_col.findText(current_value)
+                        if idx >= 0:
+                            self.sample_value_col.setCurrentIndex(idx)
                     if current_domain and current_domain != '(None)':
                         idx = self.sample_domain_col.findText(current_domain)
                         if idx >= 0:
                             self.sample_domain_col.setCurrentIndex(idx)
+                    if current_hole_id and current_hole_id != '(None)':
+                        idx = self.sample_hole_id_col.findText(current_hole_id)
+                        if idx >= 0:
+                            self.sample_hole_id_col.setCurrentIndex(idx)
                     if current_weight and current_weight != '(None)':
                         idx = self.sample_weight_col.findText(current_weight)
                         if idx >= 0:
@@ -12657,6 +12843,12 @@ if __name__ == "__main__":
             self.ac2_same_mark_bias = dbl_spin(2.0, 0.01, 100.0, 0.1)
             self.ac2_same_mark_bias.setToolTip('Weight favoring neighbors that stay within the ant\'s current mark class.')
 
+            self.ac2_directional_alignment_bias = dbl_spin(0.0, 0.0, 100.0, 0.1)
+            self.ac2_directional_alignment_bias.setToolTip('Optional weak bonus for candidates that continue the current movement direction. Strongest for same-mark moves.')
+
+            self.ac2_directional_cross_class_cap = dbl_spin(0.3, 0.0, 1.0, 0.05)
+            self.ac2_directional_cross_class_cap.setToolTip('Maximum fraction of the directional bonus that different-mark candidates can receive.')
+
             self.ac2_return_bias = dbl_spin(4.0, 0.0, 100.0, 0.1)
             self.ac2_return_bias.setToolTip('Weight favoring moves back toward sample-supported regions once the background distance is reached.')
 
@@ -12716,6 +12908,8 @@ if __name__ == "__main__":
             ac2_form.addRow('Explore Bias', self.ac2_explore_bias)
             ac2_form.addRow('Trail Bias', self.ac2_trail_bias)
             ac2_form.addRow('Same Mark-Class Bias', self.ac2_same_mark_bias)
+            ac2_form.addRow('Directional Alignment Bias', self.ac2_directional_alignment_bias)
+            ac2_form.addRow('Directional Cross-Class Cap', self.ac2_directional_cross_class_cap)
             ac2_form.addRow('Return Bias', self.ac2_return_bias)
             ac2_form.addRow('Revisit Penalty', self.ac2_revisit_penalty)
             ac2_form.addRow('Enable Return Mode', self.ac2_background_return_enabled)
@@ -12882,6 +13076,21 @@ if __name__ == "__main__":
             self.st_processing_order.setCurrentText('ascending')
             self.st_processing_order.setToolTip('Order in which samples are processed:\nascending: Process lowest values first.\ndescending: Process highest values first.\nrandom: Process samples in random order.')
 
+            self.st_avoid_same_hole_id = QtWidgets.QCheckBox(); self.st_avoid_same_hole_id.setChecked(False)
+            self.st_avoid_same_hole_id.setToolTip('When checked, String Theory skips candidate connections between samples that share the same HoleId.')
+
+            def update_st_hole_id_ui(*_args):
+                has_hole_id = self.sample_hole_id_col.currentText().strip() not in ('', '(None)')
+                self.st_avoid_same_hole_id.setEnabled(has_hole_id)
+                if has_hole_id:
+                    self.st_avoid_same_hole_id.setToolTip('When checked, String Theory skips candidate connections between samples that share the same HoleId.')
+                else:
+                    self.st_avoid_same_hole_id.setToolTip('Select a HoleId sample column first. This option is ignored when HoleId is (None).')
+
+            self.sample_hole_id_col.currentTextChanged.connect(update_st_hole_id_ui)
+            self._update_st_hole_id_ui = update_st_hole_id_ui
+            self._update_st_hole_id_ui()
+
             self.st_filter_by_frequency = QtWidgets.QCheckBox(); self.st_filter_by_frequency.setChecked(False)
             self.st_filter_by_frequency.setToolTip('If checked, filters paths based on Azimuth and Dip frequency.')
             
@@ -12903,6 +13112,7 @@ if __name__ == "__main__":
             st_form.addRow('Connections (Min/Max)', conn_layout)
             st_form.addRow('Collision Policy', self.st_collision_policy)
             st_form.addRow('Processing Order', self.st_processing_order)
+            st_form.addRow('Avoid Same HoleId', self.st_avoid_same_hole_id)
             st_form.addRow('Filter by Frequency', self.st_filter_by_frequency)
             st_form.addRow('Min Azimuth Freq (%)', self.st_min_azimuth_freq)
             st_form.addRow('Min Dip Freq (%)', self.st_min_dip_freq)
@@ -13206,6 +13416,7 @@ if __name__ == "__main__":
                 'sample_z_col': self.sample_z_col.currentText(),
                 'sample_value_col': self.sample_value_col.currentText(),
                 'sample_domain_col': self.sample_domain_col.currentText(),
+                'sample_hole_id_col': self.sample_hole_id_col.currentText(),
                 'sample_weight_col': self.sample_weight_col.currentText(),
                 'block_x_col': self.block_x_col.currentText(),
                 'block_y_col': self.block_y_col.currentText(),
@@ -13269,6 +13480,8 @@ if __name__ == "__main__":
                     'explore_bias': self.ac2_explore_bias.value(),
                     'trail_bias': self.ac2_trail_bias.value(),
                     'same_mark_bias': self.ac2_same_mark_bias.value(),
+                    'directional_alignment_bias': self.ac2_directional_alignment_bias.value(),
+                    'directional_cross_class_cap': self.ac2_directional_cross_class_cap.value(),
                     'return_bias': self.ac2_return_bias.value(),
                     'revisit_penalty': self.ac2_revisit_penalty.value(),
                     'background_return_enabled': self.ac2_background_return_enabled.isChecked(),
@@ -13283,6 +13496,7 @@ if __name__ == "__main__":
                     'min_connections': self.st_min_connections.value(),
                     'collision_policy': self.st_collision_policy.currentText(),
                     'processing_order': self.st_processing_order.currentText(),
+                    'avoid_same_hole_id': self.st_avoid_same_hole_id.isChecked(),
                     'filter_by_frequency': self.st_filter_by_frequency.isChecked(),
                     'min_azimuth_freq': self.st_min_azimuth_freq.value(),
                     'min_dip_freq': self.st_min_dip_freq.value()
@@ -13339,6 +13553,7 @@ if __name__ == "__main__":
                 if 'sample_z_col' in config: self.sample_z_col.setCurrentText(config['sample_z_col'])
                 if 'sample_value_col' in config: self.sample_value_col.setCurrentText(config['sample_value_col'])
                 if 'sample_domain_col' in config: self.sample_domain_col.setCurrentText(config['sample_domain_col'])
+                if 'sample_hole_id_col' in config: self.sample_hole_id_col.setCurrentText(config['sample_hole_id_col'])
                 if 'sample_weight_col' in config: self.sample_weight_col.setCurrentText(config['sample_weight_col'])
                 if 'block_x_col' in config: self.block_x_col.setCurrentText(config['block_x_col'])
                 if 'block_y_col' in config: self.block_y_col.setCurrentText(config['block_y_col'])
@@ -13543,6 +13758,8 @@ if __name__ == "__main__":
                     if 'explore_bias' in ac2: self.ac2_explore_bias.setValue(float(ac2['explore_bias']))
                     if 'trail_bias' in ac2: self.ac2_trail_bias.setValue(float(ac2['trail_bias']))
                     if 'same_mark_bias' in ac2: self.ac2_same_mark_bias.setValue(float(ac2['same_mark_bias']))
+                    if 'directional_alignment_bias' in ac2: self.ac2_directional_alignment_bias.setValue(float(ac2['directional_alignment_bias']))
+                    if 'directional_cross_class_cap' in ac2: self.ac2_directional_cross_class_cap.setValue(float(ac2['directional_cross_class_cap']))
                     if 'return_bias' in ac2: self.ac2_return_bias.setValue(float(ac2['return_bias']))
                     if 'revisit_penalty' in ac2: self.ac2_revisit_penalty.setValue(float(ac2['revisit_penalty']))
                     if 'background_return_enabled' in ac2: self.ac2_background_return_enabled.setChecked(bool(ac2['background_return_enabled']))
@@ -13593,12 +13810,15 @@ if __name__ == "__main__":
                     if 'min_connections' in st: self.st_min_connections.setValue(st['min_connections'])
                     if 'collision_policy' in st: self.st_collision_policy.setCurrentText(st['collision_policy'])
                     if 'processing_order' in st: self.st_processing_order.setCurrentText(st['processing_order'])
+                    if 'avoid_same_hole_id' in st: self.st_avoid_same_hole_id.setChecked(bool(st['avoid_same_hole_id']))
                     if 'filter_by_frequency' in st: 
                         self.st_filter_by_frequency.setChecked(st['filter_by_frequency'])
                         self.st_min_azimuth_freq.setEnabled(st['filter_by_frequency'])
                         self.st_min_dip_freq.setEnabled(st['filter_by_frequency'])
                     if 'min_azimuth_freq' in st: self.st_min_azimuth_freq.setValue(st['min_azimuth_freq'])
                     if 'min_dip_freq' in st: self.st_min_dip_freq.setValue(st['min_dip_freq'])
+                    if hasattr(self, '_update_st_hole_id_ui'):
+                        self._update_st_hole_id_ui()
                 # Backward compatibility for tolerance params (ignore or convert?)
                 # If old params exist but new ones don't, we could try to map them, but they are different concepts.
                 # We'll just ignore them for now.
@@ -16118,7 +16338,7 @@ if __name__ == "__main__":
                     sample_domain_col=sample_domain_col,
                     sample_filters=sample_filters,
                     progress_label='Reading sample file',
-                    extra_columns=[cfg.get('sample_weight_col')],
+                    extra_columns=[cfg.get('sample_weight_col'), cfg.get('sample_hole_id_col')],
                 )
 
                 if needs_sample_domains and explicit_sample_map:
@@ -16142,17 +16362,27 @@ if __name__ == "__main__":
 
                 if needs_sample_domains:
                     df = normalize_selected_sample_domain_column(df, sample_domain_col=sample_domain_col)
+
+                if explicit_sample_map:
+                    pass
+                elif sample_x_col and sample_y_col and sample_z_col:
+                    rename_map = {sample_x_col: 'x', sample_y_col: 'y', sample_z_col: 'z'}
+                    selected_value_col = str(sample_value_col or '').strip()
+                    if selected_value_col and selected_value_col != '(None)':
+                        rename_map[selected_value_col] = 'Value'
+                    df = df.rename(columns=rename_map)
+
+                df = normalize_selected_sample_value_column(
+                    df,
+                    sample_value_col=sample_value_col,
+                    allow_none=wants_domain_any,
+                )
                 df = normalize_selected_sample_weight_column(
                     df,
                     sample_weight_col=cfg.get('sample_weight_col'),
                     sample_value_col=sample_value_col,
                 )
-
-                if explicit_sample_map:
-                    pass
-                elif sample_x_col and sample_y_col and sample_z_col and sample_value_col:
-                    rename_map = {sample_x_col: 'x', sample_y_col: 'y', sample_z_col: 'z', sample_value_col: 'Value'}
-                    df = df.rename(columns=rename_map)
+                df = normalize_selected_sample_hole_id_column(df, sample_hole_id_col=cfg.get('sample_hole_id_col'))
                 
                 df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
                 nan_before = int(df['Value'].isna().sum())
@@ -16188,6 +16418,16 @@ if __name__ == "__main__":
                 else:
                     df = df.dropna(subset=['Value'])
 
+                for coord_col in ['x', 'y', 'z']:
+                    df[coord_col] = pd.to_numeric(df[coord_col], errors='coerce')
+                invalid_coord_mask = ~np.isfinite(df[['x', 'y', 'z']].to_numpy(dtype=float, copy=False)).all(axis=1)
+                invalid_coord_count = int(invalid_coord_mask.sum())
+                if invalid_coord_count:
+                    print(f"Detected {invalid_coord_count} sample rows with blank/non-numeric coordinates; these will be excluded from samples.")
+                    df = df.loc[~invalid_coord_mask].copy()
+                if len(df) == 0:
+                    raise ValueError("After removing invalid sample coordinates, no samples remain. Check the configured sample coordinate columns and header line.")
+
                 sample_weights = None
                 selected_weight_column = str(cfg.get('sample_weight_col') or '').strip()
                 if selected_weight_column and selected_weight_column != '(None)':
@@ -16204,6 +16444,7 @@ if __name__ == "__main__":
                 points = df[['x','y','z']].values
                 values = df['Value'].values
                 sample_domains = df['Domain'].values if 'Domain' in df.columns else None
+                sample_hole_ids = df['HoleId'].fillna('').astype(str).to_numpy(dtype=object, copy=False) if 'HoleId' in df.columns else None
                 print(f"Loaded {len(values)} samples from {samples_file}.")
                 
                 # Create blocks with samples
@@ -16230,6 +16471,7 @@ if __name__ == "__main__":
                     config=cfg,
                     sample_domains=sample_domains,
                     sample_weights=sample_weights,
+                    sample_hole_ids=sample_hole_ids,
                     build_visual_blocks=False,
                 )
                 
@@ -16297,6 +16539,7 @@ if __name__ == "__main__":
                                 block_size,
                                 use_domain_mapping=use_mapping,
                                 sample_domain_mapping=pass1_domain_mapping,
+                                sample_hole_id_mapping={pos: blocks._sample_block_hole_id_mapping.get(pos, '') for pos in pass1_values if hasattr(blocks, '_sample_block_hole_id_mapping')},
                             )
                             copy_interpolator_provenance(interp1, interp2)
                             pass2_snapshot = snapshot_interpolator_state(interp2)
