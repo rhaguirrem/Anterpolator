@@ -16,6 +16,7 @@ class StringTheoryInterpolator(InterpolatorBase):
         filter_by_frequency: bool = False,
         min_azimuth_freq: float = 10.0,
         min_dip_freq: float = 10.0,
+        avoid_same_hole_id: bool = False,
         interpolation_target: str = 'value',
         verbose: bool = False,
     ):
@@ -30,6 +31,7 @@ class StringTheoryInterpolator(InterpolatorBase):
         self.filter_by_frequency = filter_by_frequency
         self.min_azimuth_freq = min_azimuth_freq
         self.min_dip_freq = min_dip_freq
+        self.avoid_same_hole_id = bool(avoid_same_hole_id)
 
         target = (interpolation_target or 'value').strip().lower()
         if target in ('numeric', 'number', 'grade', 'value'):
@@ -56,6 +58,7 @@ class StringTheoryInterpolator(InterpolatorBase):
             'grade_rejected': 0,
             'adjacent_rejected': 0,
             'domain_rejected': 0,
+            'same_hole_rejected': 0,
             'obstacle_rejected': 0,
             'connections_made': 0,
             'no_candidates': 0
@@ -85,6 +88,12 @@ class StringTheoryInterpolator(InterpolatorBase):
         # Domain-mode domain mapping is the *target* being interpolated.
         self.use_domain_mapping = kwargs.get('use_domain_mapping', False)
         self.sample_domain_mapping = kwargs.get('sample_domain_mapping', None) or {}
+        raw_hole_id_mapping = kwargs.get('sample_hole_id_mapping', None) or {}
+        self.sample_hole_id_mapping = {
+            pos: str(hole_id).strip()
+            for pos, hole_id in raw_hole_id_mapping.items()
+            if hole_id is not None and str(hole_id).strip() != ''
+        }
 
         self.sample_locations = set(sample_blocks.keys())
         self.blocks = {}
@@ -320,6 +329,13 @@ class StringTheoryInterpolator(InterpolatorBase):
                              self.stats['domain_rejected'] += 1
                              continue
 
+                if self.avoid_same_hole_id:
+                    hole_1 = self.sample_hole_id_mapping.get(s1_pos, '')
+                    hole_2 = self.sample_hole_id_mapping.get(s2_pos, '')
+                    if hole_1 and hole_2 and hole_1 == hole_2:
+                        self.stats['same_hole_rejected'] += 1
+                        continue
+
                 # Check for obstacles (samples in the middle)
                 # Exclude start and end points from check
                 obstacle_found = False
@@ -341,7 +357,6 @@ class StringTheoryInterpolator(InterpolatorBase):
                     # Valid path found!
                     # Buffer it
                     valid_connections_buffer.append((s1_pos, s1_val, s2_pos, s2_val, points_to_fill, path))
-                    
                     # If not connecting to all, stop after max_connections
                     if not self.connect_to_all and len(valid_connections_buffer) >= self.max_connections:
                         break
@@ -428,6 +443,13 @@ class StringTheoryInterpolator(InterpolatorBase):
                     self.stats['adjacent_rejected'] += 1
                     continue
 
+                if self.avoid_same_hole_id:
+                    hole_1 = self.sample_hole_id_mapping.get(s1_pos, '')
+                    hole_2 = self.sample_hole_id_mapping.get(s2_pos, '')
+                    if hole_1 and hole_2 and hole_1 == hole_2:
+                        self.stats['same_hole_rejected'] += 1
+                        continue
+
                 obstacle_found = False
                 points_to_fill = []
                 if len(path) > 2:
@@ -477,15 +499,35 @@ class StringTheoryInterpolator(InterpolatorBase):
         metadata['interpolated_blocks'] = int(self._interpolated_block_count)
         return metadata
 
-    def _collect_sample_connection_rows(self) -> List[Tuple[Tuple[int, int, int], float, int]]:
+    def _get_position_domain(self, pos: Tuple[int, int, int]):
+        block = self.blocks.get(pos, {})
+        domain = block.get('domain')
+        if domain is None and getattr(self, 'domain_mapping', None) is not None:
+            domain = self.domain_mapping.get(pos)
+        if domain is None:
+            return None
+        domain_text = str(domain).strip()
+        return domain_text or None
+
+    def _get_path_domain(self, p1: Tuple[int, int, int], p2: Tuple[int, int, int]):
+        domain_1 = self._get_position_domain(p1)
+        domain_2 = self._get_position_domain(p2)
+        if domain_1 and domain_1 == domain_2:
+            return domain_1
+        return domain_1 or domain_2
+
+    def _collect_sample_connection_rows(self, domain_name=None) -> List[Tuple[Tuple[int, int, int], float, int]]:
         connection_counts = {
             pos: 0
             for pos, block in self.blocks.items()
             if block.get('is_sample')
+            and (domain_name is None or self._get_position_domain(pos) == domain_name)
         }
 
-        for source_pos, _, _ in self.paths:
-            if source_pos in connection_counts:
+        for source_pos, end_pos, _ in self.paths:
+            if source_pos in connection_counts and (
+                domain_name is None or self._get_path_domain(source_pos, end_pos) == domain_name
+            ):
                 connection_counts[source_pos] += 1
 
         rows = []
@@ -497,6 +539,47 @@ class StringTheoryInterpolator(InterpolatorBase):
 
         rows.sort(key=lambda row: (row[1], row[0]))
         return rows
+
+    def _sanitize_statistics_name(self, name: str) -> str:
+        safe_name = "".join([c for c in str(name) if c.isalnum() or c in (' ', '_', '-')]).strip()
+        return safe_name or 'Global'
+
+    def _build_statistics_groups(self, requested_name: str):
+        indexed_paths = list(enumerate(self.paths))
+        groups = [
+            {
+                'name': requested_name,
+                'paths': indexed_paths,
+                'sample_rows': self._collect_sample_connection_rows(),
+                'use_path_domain_category': bool(self.interpolation_target == 'domain'),
+            }
+        ]
+
+        if self.interpolation_target != 'domain':
+            return groups
+
+        domain_paths = {}
+        for path_index, path_record in indexed_paths:
+            p1, p2, _ = path_record
+            domain = self._get_path_domain(p1, p2)
+            if not domain:
+                continue
+            domain_paths.setdefault(domain, []).append((path_index, path_record))
+
+        if len(domain_paths) <= 1:
+            return groups
+
+        requested_safe_name = self._sanitize_statistics_name(requested_name)
+        for domain_name in sorted(domain_paths):
+            if self._sanitize_statistics_name(domain_name) == requested_safe_name:
+                continue
+            groups.append({
+                'name': domain_name,
+                'paths': domain_paths[domain_name],
+                'sample_rows': self._collect_sample_connection_rows(domain_name=domain_name),
+                'use_path_domain_category': False,
+            })
+        return groups
     
     def generate_statistics(self, output_dir: str, domain_name: str = "Global"):
         import matplotlib.pyplot as plt
@@ -507,168 +590,150 @@ class StringTheoryInterpolator(InterpolatorBase):
             print(f"No paths generated for statistics in domain {domain_name}.")
             return
 
-        lengths = []
-        azimuths = []
-        dips = []
-        
-        for p1, p2, path in self.paths:
-            # Calculate length in BLOCKS (grid units)
-            length = np.linalg.norm(np.array(p2) - np.array(p1))
-            lengths.append(length)
-
-            # Calculate orientation using REAL coordinates if available
-            if hasattr(self, 'block_size') and self.block_size is not None:
-                bs = np.array(self.block_size)
-                p1_real = np.array(p1) * bs
-                p2_real = np.array(p2) * bs
-                
-                # Ensure p_start has higher Z (or equal)
-                if p1_real[2] < p2_real[2]:
-                    p_start = p2_real
-                    p_end = p1_real
-                else:
-                    p_start = p1_real
-                    p_end = p2_real
-                
-                dx = p_end[0] - p_start[0]
-                dy = p_end[1] - p_start[1]
-                dz = p_end[2] - p_start[2]
-            else:
-                # Ensure p_start has higher Z (or equal)
-                if p1[2] < p2[2]:
-                    p_start = p2
-                    p_end = p1
-                else:
-                    p_start = p1
-                    p_end = p2
-
-                dx = p_end[0] - p_start[0]
-                dy = p_end[1] - p_start[1]
-                dz = p_end[2] - p_start[2]
-            
-            # Azimuth (0-360)
-            # arctan2(dx, dy) gives angle from North (Y axis) clockwise if we consider:
-            # Y is North, X is East.
-            az = np.degrees(np.arctan2(dx, dy))
-            if az < 0:
-                az += 360
-            azimuths.append(az)
-            
-            # Dip (0 to 90) - positive downwards
-            h_dist = np.sqrt(dx**2 + dy**2)
-            if h_dist == 0:
-                dip = 90.0 # Vertical
-            else:
-                # dz is <= 0 because we swapped to make start higher than end.
-                # We want positive dip [0, 90].
-                dip = np.degrees(np.arctan(abs(dz) / h_dist))
-            dips.append(dip)
-            
         # Create output directory
         stats_dir = os.path.join(output_dir, "StringTheory_Stats")
         os.makedirs(stats_dir, exist_ok=True)
-        
-        # Sanitize domain name for filename
-        safe_domain = "".join([c for c in domain_name if c.isalnum() or c in (' ', '_', '-')]).strip()
-        sample_connection_rows = self._collect_sample_connection_rows()
-        
-        # 1. Path Length Histogram
-        plt.figure(figsize=(10, 6))
-        plt.hist(lengths, bins=50, color='skyblue', edgecolor='black')
-        plt.title(f'Path Length Distribution - {domain_name}')
-        plt.xlabel('Length (blocks)')
-        plt.ylabel('Frequency')
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(stats_dir, f'path_length_histogram_{safe_domain}.png'))
-        plt.close()
-        
-        # 2. Rose Diagram (Azimuth)
-        plt.figure(figsize=(8, 8))
-        ax = plt.subplot(111, polar=True)
-        
-        # Convert Azimuth (deg, CW from North) to Radians for plotting
-        # Matplotlib polar plot with set_theta_zero_location('N') and set_theta_direction(-1)
-        # expects angles in radians, 0 at North, increasing Clockwise.
-        
-        az_rad = np.radians(azimuths)
-        bins = np.linspace(0.0, 2 * np.pi, 37) # 10 degree bins
-        hist, _ = np.histogram(az_rad, bins=bins)
-        width = 2 * np.pi / 36
-        
-        bars = ax.bar(bins[:-1], hist, width=width, bottom=0.0, color='coral', edgecolor='black')
-        ax.set_theta_zero_location('N')
-        ax.set_theta_direction(-1) # Clockwise
-        plt.title(f'Path Azimuth Distribution - {domain_name}')
-        plt.savefig(os.path.join(stats_dir, f'azimuth_rose_diagram_{safe_domain}.png'))
-        plt.close()
-        
-        # 3. Dip Histogram
-        plt.figure(figsize=(10, 6))
-        plt.hist(dips, bins=36, range=(0, 90), color='lightgreen', edgecolor='black')
-        plt.title(f'Path Dip Distribution - {domain_name}')
-        plt.xlabel('Dip (degrees)')
-        plt.ylabel('Frequency')
-        plt.grid(True, alpha=0.3)
-        plt.savefig(os.path.join(stats_dir, f'dip_histogram_{safe_domain}.png'))
-        plt.close()
 
-        # 4. Connection-count histogram per sample block
-        if sample_connection_rows:
-            connection_counts = [row[2] for row in sample_connection_rows]
-            unique_connection_counts = np.unique(connection_counts)
+        for group in self._build_statistics_groups(domain_name):
+            group_name = group['name']
+            indexed_paths = group['paths']
+            sample_connection_rows = group['sample_rows']
+            safe_domain = self._sanitize_statistics_name(group_name)
+
+            lengths = []
+            azimuths = []
+            dips = []
+
+            for _, (p1, p2, path) in indexed_paths:
+                length = np.linalg.norm(np.array(p2) - np.array(p1))
+                lengths.append(length)
+
+                if hasattr(self, 'block_size') and self.block_size is not None:
+                    bs = np.array(self.block_size)
+                    p1_real = np.array(p1) * bs
+                    p2_real = np.array(p2) * bs
+
+                    if p1_real[2] < p2_real[2]:
+                        p_start = p2_real
+                        p_end = p1_real
+                    else:
+                        p_start = p1_real
+                        p_end = p2_real
+
+                    dx = p_end[0] - p_start[0]
+                    dy = p_end[1] - p_start[1]
+                    dz = p_end[2] - p_start[2]
+                else:
+                    if p1[2] < p2[2]:
+                        p_start = p2
+                        p_end = p1
+                    else:
+                        p_start = p1
+                        p_end = p2
+
+                    dx = p_end[0] - p_start[0]
+                    dy = p_end[1] - p_start[1]
+                    dz = p_end[2] - p_start[2]
+
+                az = np.degrees(np.arctan2(dx, dy))
+                if az < 0:
+                    az += 360
+                azimuths.append(az)
+
+                h_dist = np.sqrt(dx**2 + dy**2)
+                if h_dist == 0:
+                    dip = 90.0
+                else:
+                    dip = np.degrees(np.arctan(abs(dz) / h_dist))
+                dips.append(dip)
+
             plt.figure(figsize=(10, 6))
-            if len(unique_connection_counts) == 1:
-                connection_count = int(unique_connection_counts[0])
-                plt.bar([connection_count], [len(connection_counts)], width=0.8, color='mediumpurple', edgecolor='black')
-            else:
-                min_count = int(np.min(connection_counts))
-                max_count = int(np.max(connection_counts))
-                bins = np.arange(min_count - 0.5, max_count + 1.5, 1.0)
-                plt.hist(connection_counts, bins=bins, color='mediumpurple', edgecolor='black')
-                if max_count - min_count <= 25:
-                    plt.xticks(range(min_count, max_count + 1))
-            plt.title(f'Sample Block Connection Count Distribution - {domain_name}')
-            plt.xlabel('Number of Connections')
-            plt.ylabel('Sample Block Count')
+            plt.hist(lengths, bins=50, color='skyblue', edgecolor='black')
+            plt.title(f'Path Length Distribution - {group_name}')
+            plt.xlabel('Length (blocks)')
+            plt.ylabel('Frequency')
             plt.grid(True, alpha=0.3)
-            plt.savefig(os.path.join(stats_dir, f'connection_count_histogram_{safe_domain}.png'))
+            plt.savefig(os.path.join(stats_dir, f'path_length_histogram_{safe_domain}.png'))
             plt.close()
 
-            with open(os.path.join(stats_dir, f'sample_connection_stats_{safe_domain}.csv'), 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['sample_x', 'sample_y', 'sample_z', 'sample_value', 'connection_count'])
-                for pos, sample_value, connection_count in sample_connection_rows:
-                    writer.writerow([pos[0], pos[1], pos[2], sample_value, connection_count])
-        
-        # Save raw stats to CSV
-        with open(os.path.join(stats_dir, f'path_stats_{safe_domain}.csv'), 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Length', 'Azimuth', 'Dip', 'mid_x', 'mid_y', 'mid_z', 'Polarity', 'Category', 'Accepted'])
-            
-            for i, (l, a, d) in enumerate(zip(lengths, azimuths, dips)):
-                p1, p2, _ = self.paths[i]
-                
-                # Determine acceptance status
-                is_accepted = True
-                if self.filter_by_frequency and self.kept_paths_indices is not None:
-                    is_accepted = i in self.kept_paths_indices
-                
-                # Calculate midpoint
-                p1_arr = np.array(p1)
-                p2_arr = np.array(p2)
-                mid_block = (p1_arr + p2_arr) / 2.0
-                
-                if hasattr(self, 'block_size') and self.block_size is not None and hasattr(self, 'min_bounds') and self.min_bounds is not None:
-                    bs = np.array(self.block_size)
-                    mb = np.array(self.min_bounds)
-                    mid_real = mb + mid_block * bs
-                    mid_x, mid_y, mid_z = mid_real
+            plt.figure(figsize=(8, 8))
+            ax = plt.subplot(111, polar=True)
+            az_rad = np.radians(azimuths)
+            bins = np.linspace(0.0, 2 * np.pi, 37)
+            hist, _ = np.histogram(az_rad, bins=bins)
+            width = 2 * np.pi / 36
+
+            ax.bar(bins[:-1], hist, width=width, bottom=0.0, color='coral', edgecolor='black')
+            ax.set_theta_zero_location('N')
+            ax.set_theta_direction(-1)
+            plt.title(f'Path Azimuth Distribution - {group_name}')
+            plt.savefig(os.path.join(stats_dir, f'azimuth_rose_diagram_{safe_domain}.png'))
+            plt.close()
+
+            plt.figure(figsize=(10, 6))
+            plt.hist(dips, bins=36, range=(0, 90), color='lightgreen', edgecolor='black')
+            plt.title(f'Path Dip Distribution - {group_name}')
+            plt.xlabel('Dip (degrees)')
+            plt.ylabel('Frequency')
+            plt.grid(True, alpha=0.3)
+            plt.savefig(os.path.join(stats_dir, f'dip_histogram_{safe_domain}.png'))
+            plt.close()
+
+            if sample_connection_rows:
+                connection_counts = [row[2] for row in sample_connection_rows]
+                unique_connection_counts = np.unique(connection_counts)
+                plt.figure(figsize=(10, 6))
+                if len(unique_connection_counts) == 1:
+                    connection_count = int(unique_connection_counts[0])
+                    plt.bar([connection_count], [len(connection_counts)], width=0.8, color='mediumpurple', edgecolor='black')
                 else:
-                    mid_x, mid_y, mid_z = mid_block
-                
-                writer.writerow([l, a, d, mid_x, mid_y, mid_z, 1, domain_name, is_accepted])
-                
-        print(f"String Theory statistics for {domain_name} saved to {stats_dir}")
+                    min_count = int(np.min(connection_counts))
+                    max_count = int(np.max(connection_counts))
+                    bins = np.arange(min_count - 0.5, max_count + 1.5, 1.0)
+                    plt.hist(connection_counts, bins=bins, color='mediumpurple', edgecolor='black')
+                    if max_count - min_count <= 25:
+                        plt.xticks(range(min_count, max_count + 1))
+                plt.title(f'Sample Block Connection Count Distribution - {group_name}')
+                plt.xlabel('Number of Connections')
+                plt.ylabel('Sample Block Count')
+                plt.grid(True, alpha=0.3)
+                plt.savefig(os.path.join(stats_dir, f'connection_count_histogram_{safe_domain}.png'))
+                plt.close()
+
+                with open(os.path.join(stats_dir, f'sample_connection_stats_{safe_domain}.csv'), 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['sample_x', 'sample_y', 'sample_z', 'sample_value', 'connection_count'])
+                    for pos, sample_value, connection_count in sample_connection_rows:
+                        writer.writerow([pos[0], pos[1], pos[2], sample_value, connection_count])
+
+            with open(os.path.join(stats_dir, f'path_stats_{safe_domain}.csv'), 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Length', 'Azimuth', 'Dip', 'mid_x', 'mid_y', 'mid_z', 'Polarity', 'Category', 'Accepted'])
+
+                for (path_index, (p1, p2, _)), length, azimuth, dip in zip(indexed_paths, lengths, azimuths, dips):
+                    is_accepted = True
+                    if self.filter_by_frequency and self.kept_paths_indices is not None:
+                        is_accepted = path_index in self.kept_paths_indices
+
+                    p1_arr = np.array(p1)
+                    p2_arr = np.array(p2)
+                    mid_block = (p1_arr + p2_arr) / 2.0
+
+                    if hasattr(self, 'block_size') and self.block_size is not None and hasattr(self, 'min_bounds') and self.min_bounds is not None:
+                        bs = np.array(self.block_size)
+                        mb = np.array(self.min_bounds)
+                        mid_real = mb + mid_block * bs
+                        mid_x, mid_y, mid_z = mid_real
+                    else:
+                        mid_x, mid_y, mid_z = mid_block
+
+                    category = group_name
+                    if group['use_path_domain_category']:
+                        category = self._get_path_domain(p1, p2) or group_name
+
+                    writer.writerow([length, azimuth, dip, mid_x, mid_y, mid_z, 1, category, is_accepted])
+
+            print(f"String Theory statistics for {group_name} saved to {stats_dir}")
     
     def _calculate_path_orientation(self, p1: Tuple[int, int, int], p2: Tuple[int, int, int]) -> Tuple[float, float]:
         """
