@@ -44,8 +44,7 @@ Interpolation is not limited to a single algorithm run.
 ### 7. Operations Panel for Samples, Blocks, and Exports
 Beyond interpolation, Anterpolator includes a dedicated operations workflow for common geological data tasks:
 - **Sample Blocks:** aggregate samples into their containing blocks.
-- **Domain Samples:** assign block-model domains back onto sample rows.
-- **Assign Block Columns To Samples:** transfer selected block attributes onto samples.
+- **Assign Block Columns To Samples:** transfer selected block attributes onto samples. Selecting the domain column here replaces the former dedicated Domain Samples action, and sample-to-block matching now honors sub-block extents when DX/DY/DZ columns are available.
 - **Assign Block Columns To Block Model:** enrich a target block model from overlapping source blocks while preserving target rows; numeric fields use overlap-volume-weighted averages, categorical fields use the dominant overlap category, and a nearest-block fallback can be enabled for targets with no overlap.
 - **Assign Attributes From Table:** join one or more CSV table columns onto a block model by matching one or more shared key columns, preserving all block-model rows while updating or appending the selected attributes.
 - **Block Domain Sample Metrics:** export nearest-distance, k-nearest, residual, and summary metrics by domain.

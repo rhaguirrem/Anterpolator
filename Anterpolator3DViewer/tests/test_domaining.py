@@ -703,7 +703,7 @@ def test_load_block_domain_catalog_uses_path_chunk_reader_for_large_filtered_fil
         assert progress_events[-1][2].startswith("Reading domain column")
 
 
-def test_export_domained_samples_uses_aggregated_subblock_domains():
+def test_export_domained_samples_uses_containing_subblock_domain():
     with tempfile.TemporaryDirectory() as td:
         blocks_path = os.path.join(td, "blocks.csv")
         samples_path = os.path.join(td, "samples.csv")
@@ -792,10 +792,99 @@ def test_export_samples_with_block_values_from_blocks_transfers_multiple_columns
         assert result["matched_samples"] == 2
         assert result["transferred_columns"] == ["grade", "lith"]
         assert result["column_modes"] == {"grade": "numeric", "lith": "categorical"}
-        assert output_df.loc[0, "grade"] == pytest.approx(2.0)
+        assert result["subblock_matched_samples"] == 2
+        # Each sample takes the value of the sub-block that contains it, not the base-block average.
+        assert output_df.loc[0, "grade"] == pytest.approx(3.0)
         assert output_df.loc[0, "lith"] == "ore"
-        assert output_df.loc[1, "grade"] == pytest.approx(6.0)
+        assert output_df.loc[1, "grade"] == pytest.approx(7.0)
         assert output_df.loc[1, "lith"] == "waste"
+
+
+def test_export_samples_with_block_values_uses_explicit_subblock_sizes():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "samples_with_blocks.csv")
+
+        # One 10 m parent block split into a 2.5 m sub-block plus the surrounding 7.5 m remainder.
+        pd.DataFrame(
+            [
+                {"x": 1.25, "y": 1.25, "z": 1.25, "dx": 2.5, "dy": 2.5, "dz": 2.5, "grade": 9.0},
+                {"x": 6.25, "y": 6.25, "z": 6.25, "dx": 7.5, "dy": 7.5, "dz": 7.5, "grade": 1.0},
+            ]
+        ).to_csv(blocks_path, index=False)
+        pd.DataFrame(
+            [
+                {"sx": 1.0, "sy": 1.0, "sz": 1.0},
+                {"sx": 8.0, "sy": 8.0, "sz": 8.0},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_samples_with_block_values_from_blocks(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_value_cols=["grade"],
+            block_size=(10, 10, 10),
+            block_size_cols=["dx", "dy", "dz"],
+        )
+
+        output_df = pd.read_csv(output_path)
+
+        assert result["block_geometry_mode"] == "explicit-size-columns"
+        assert result["subblock_matched_samples"] == 2
+        assert output_df.loc[0, "grade"] == pytest.approx(9.0)
+        assert output_df.loc[1, "grade"] == pytest.approx(1.0)
+
+
+def test_export_samples_with_block_values_applies_domain_semantics():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "samples_with_blocks.csv")
+
+        pd.DataFrame(
+            [
+                {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A"},
+                {"x": 15.0, "y": 5.0, "z": 5.0, "dom": ""},
+            ]
+        ).to_csv(blocks_path, index=False)
+        pd.DataFrame(
+            [
+                {"sx": 5.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 15.0, "sy": 5.0, "sz": 5.0},
+                {"sx": 95.0, "sy": 5.0, "sz": 5.0},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        result = export_samples_with_block_values_from_blocks(
+            samples_path,
+            blocks_path,
+            output_file=output_path,
+            sample_x_col="sx",
+            sample_y_col="sy",
+            sample_z_col="sz",
+            block_x_col="x",
+            block_y_col="y",
+            block_z_col="z",
+            block_value_cols=["dom"],
+            block_domain_col="dom",
+            block_size=(10, 10, 10),
+        )
+
+        output_df = pd.read_csv(output_path, keep_default_na=False)
+
+        assert result["column_modes"] == {"dom": "categorical"}
+        assert result["matched_samples"] == 2
+        assert output_df.loc[0, "dom"] == "A"
+        assert output_df.loc[1, "dom"] == "Undomained"
+        assert output_df.loc[2, "dom"] == ""
 
 
 def test_export_blocks_with_source_values_preserves_target_rows_and_exact_matches():
@@ -3343,7 +3432,7 @@ def test_export_domained_samples_reports_progress():
         assert events
         assert events[-1][0] == 100
         assert any("Reading sample file" in message for _, _, message in events)
-        assert any("Assigning samples to block domains" in message for _, _, message in events)
+        assert any("Matching samples to sub-blocks" in message for _, _, message in events)
 
 
 def test_export_block_domain_sample_metrics_reports_progress():

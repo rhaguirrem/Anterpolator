@@ -1069,209 +1069,57 @@ def _normalize_block_transfer_columns(block_value_cols, block_x_col=None, block_
     return normalized_columns
 
 
-def _detect_block_transfer_column_modes(blocks_file, delimiter, header_line, block_value_cols,
-                                        block_x_col=None, block_y_col=None, block_z_col=None,
-                                        block_filters=None, progress_callback=None):
-    effective_header_line = resolve_effective_csv_header_line(blocks_file, header_line)
-    headers = parse_header_line(blocks_file, delimiter, effective_header_line)
-    final_names = build_unique_column_names(headers)
-    filter_fields = collect_filter_fields(block_filters or [])
-    selected_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
-        final_names,
-        block_x_col=block_x_col,
-        block_y_col=block_y_col,
-        block_z_col=block_z_col,
-        block_domain_col=None,
-        extra_columns=list(block_value_cols) + filter_fields,
-    )
-    base_read_kwargs = dict(
-        delimiter=delimiter,
-        header=None,
-        names=final_names,
-        skiprows=effective_header_line,
-        comment='#',
-        usecols=selected_columns,
-        chunksize=250_000,
-    )
-    if mapping_mode == 'explicit':
-        print(f"Applied user block column mapping for transfer scan: {rename_map}")
-    else:
-        print(f"Applied generic positional mapping for transfer scan: {rename_map}")
-
-    numeric_candidates = {column_name: True for column_name in block_value_cols}
-    saw_values = {column_name: False for column_name in block_value_cols}
-    for chunk in iterate_csv_with_progress(
-        blocks_file,
-        'Scanning block transfer columns',
-        progress_callback=progress_callback,
-        **base_read_kwargs,
-    ):
-        if block_filters:
-            chunk, _ = apply_dataframe_filters(
-                chunk,
-                filters=block_filters,
-                filter_subject='block',
-                source_label='blocks file chunk',
-                emit_logs=False,
-            )
-        chunk, _ = normalize_block_chunk(chunk, rename_map, domain_copy_source, extra_keep_columns=block_value_cols)
-        if len(chunk) == 0:
-            continue
-        for column_name in block_value_cols:
-            if column_name not in chunk.columns or not numeric_candidates[column_name]:
-                continue
-            values = chunk[column_name].fillna('').astype(str).str.strip()
-            nonblank = values[(values != '') & (values.str.lower() != 'nan')]
-            if len(nonblank) == 0:
-                continue
-            saw_values[column_name] = True
-            if pd.to_numeric(nonblank, errors='coerce').isna().any():
-                numeric_candidates[column_name] = False
-
-    return {
-        column_name: 'numeric' if numeric_candidates[column_name] and saw_values[column_name] else 'categorical'
-        for column_name in block_value_cols
-    }
+# Packs a base-block index triple into one int64 so lookups can use sorted-array searches.
+_BLOCK_KEY_OFFSET = 1 << 19
+_BLOCK_KEY_LIMIT = 1 << 20
 
 
-def load_block_value_mappings(blocks_file, delimiter, header_line, block_size, block_value_cols,
-                              block_x_col=None, block_y_col=None, block_z_col=None,
-                              block_filters=None, block_metadata=None, progress_callback=None):
-    if not blocks_file or not os.path.isfile(blocks_file):
-        raise ValueError('Please select a valid blocks file.')
-
-    normalized_columns = _normalize_block_transfer_columns(
-        block_value_cols,
-        block_x_col=block_x_col,
-        block_y_col=block_y_col,
-        block_z_col=block_z_col,
-    )
-    delimiter = delimiter or detect_csv_delimiter(blocks_file)
-    header_line = header_line or 1
-
-    block_metadata = block_metadata or load_large_blocks_metadata(
-        blocks_file,
-        delimiter,
-        header_line,
-        block_size,
-        None,
-        block_x_col=block_x_col,
-        block_y_col=block_y_col,
-        block_z_col=block_z_col,
-        block_domain_col=None,
-        block_filters=block_filters,
-        config=None,
-        progress_callback=progress_callback,
-    )
-
-    column_modes = _detect_block_transfer_column_modes(
-        blocks_file,
-        delimiter,
-        header_line,
-        normalized_columns,
-        block_x_col=block_x_col,
-        block_y_col=block_y_col,
-        block_z_col=block_z_col,
-        block_filters=block_filters,
-        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 100, 'Scanning block transfer columns...'),
-    )
-
-    effective_header_line = resolve_effective_csv_header_line(blocks_file, header_line)
-    headers = parse_header_line(blocks_file, delimiter, effective_header_line)
-    final_names = build_unique_column_names(headers)
-    filter_fields = collect_filter_fields(block_filters or [])
-    selected_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
-        final_names,
-        block_x_col=block_x_col,
-        block_y_col=block_y_col,
-        block_z_col=block_z_col,
-        block_domain_col=None,
-        extra_columns=normalized_columns + filter_fields,
-    )
-    base_read_kwargs = dict(
-        delimiter=delimiter,
-        header=None,
-        names=final_names,
-        skiprows=effective_header_line,
-        comment='#',
-        usecols=selected_columns,
-        chunksize=250_000,
-    )
-    if mapping_mode == 'explicit':
-        print(f"Applied user block column mapping for transfer aggregation: {rename_map}")
-    else:
-        print(f"Applied generic positional mapping for transfer aggregation: {rename_map}")
-
-    numeric_summaries = {column_name: {} for column_name, mode in column_modes.items() if mode == 'numeric'}
-    categorical_counts = {column_name: {} for column_name, mode in column_modes.items() if mode != 'numeric'}
-
-    for chunk in iterate_csv_with_progress(
-        blocks_file,
-        'Reading grid file (block transfer mapping)',
-        progress_callback=progress_callback,
-        **base_read_kwargs,
-    ):
-        if block_filters:
-            chunk, _ = apply_dataframe_filters(
-                chunk,
-                filters=block_filters,
-                filter_subject='block',
-                source_label='blocks file chunk',
-                emit_logs=False,
-            )
-        chunk, _ = normalize_block_chunk(chunk, rename_map, domain_copy_source, extra_keep_columns=normalized_columns)
-        if len(chunk) == 0:
-            continue
-
-        block_indices = _compute_sample_block_indices_from_metadata(
-            chunk[['x', 'y', 'z']].to_numpy(copy=False),
-            block_metadata,
+def _encode_block_index_keys(indices):
+    array = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+    keys = np.full(len(array), -1, dtype=np.int64)
+    if len(array) == 0:
+        return keys, np.zeros(0, dtype=bool)
+    shifted = array + _BLOCK_KEY_OFFSET
+    in_range = np.all((shifted >= 0) & (shifted < _BLOCK_KEY_LIMIT), axis=1)
+    if in_range.any():
+        valid = shifted[in_range]
+        keys[in_range] = (
+            valid[:, 0] * np.int64(1 << 40) + valid[:, 1] * np.int64(1 << 20) + valid[:, 2]
         )
+    return keys, in_range
 
-        for column_name, summaries in numeric_summaries.items():
-            if column_name not in chunk.columns:
-                continue
-            numeric_values = pd.to_numeric(chunk[column_name], errors='coerce')
-            valid_mask = numeric_values.notna().to_numpy()
-            if not valid_mask.any():
-                continue
-            for idx, value in zip(block_indices[valid_mask], numeric_values.loc[valid_mask].to_numpy(copy=False)):
-                block_idx = (int(idx[0]), int(idx[1]), int(idx[2]))
-                current_sum, current_count = summaries.get(block_idx, (0.0, 0))
-                summaries[block_idx] = (current_sum + float(value), current_count + 1)
 
-        for column_name, counts_by_block in categorical_counts.items():
-            if column_name not in chunk.columns:
-                continue
-            values = chunk[column_name].fillna('').astype(str).str.strip()
-            valid_mask = ((values != '') & (values.str.lower() != 'nan')).to_numpy()
-            if not valid_mask.any():
-                continue
-            for idx, value in zip(block_indices[valid_mask], values.loc[valid_mask].to_numpy(copy=False)):
-                block_idx = (int(idx[0]), int(idx[1]), int(idx[2]))
-                counts = counts_by_block.setdefault(block_idx, Counter())
-                counts[str(value)] += 1
+def _resolve_subblock_bounds(coords, parent_indices, grid_origin, parent_dims, sizes=None):
+    """Return per-row sub-block lower/upper bounds within each base block."""
+    coords = np.asarray(coords, dtype=float)
+    if len(coords) == 0:
+        empty = np.empty((0, 3), dtype=float)
+        return empty, empty.copy()
+    if sizes is not None:
+        half_sizes = np.asarray(sizes, dtype=float) / 2.0
+        return coords - half_sizes, coords + half_sizes
 
-    value_mappings = {}
-    for column_name, summaries in numeric_summaries.items():
-        for block_idx, (total_value, count) in summaries.items():
-            if count <= 0:
-                continue
-            value_mappings.setdefault(block_idx, {})[column_name] = total_value / count
+    grid_origin = np.asarray(grid_origin, dtype=float)
+    parent_dims = np.asarray(parent_dims, dtype=float)
+    parent_origins = grid_origin + np.asarray(parent_indices, dtype=float) * parent_dims
+    lower_bounds = np.empty_like(coords)
+    upper_bounds = np.empty_like(coords)
 
-    for column_name, counts_by_block in categorical_counts.items():
-        for block_idx, counts in counts_by_block.items():
-            if not counts:
-                continue
-            winner = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
-            value_mappings.setdefault(block_idx, {})[column_name] = winner
+    _, inverse, counts = np.unique(parent_indices, axis=0, return_inverse=True, return_counts=True)
+    single_row_mask = counts[np.asarray(inverse).reshape(-1)] == 1
+    lower_bounds[single_row_mask] = parent_origins[single_row_mask]
+    upper_bounds[single_row_mask] = parent_origins[single_row_mask] + parent_dims
 
-    return {
-        'value_mappings': value_mappings,
-        'column_modes': column_modes,
-        'block_metadata': block_metadata,
-        'columns': normalized_columns,
-    }
+    subblocked_mask = ~single_row_mask
+    if subblocked_mask.any():
+        inferred_lower, inferred_upper, _ = _infer_block_row_bounds(
+            coords[subblocked_mask],
+            parent_dims,
+            grid_origin=grid_origin,
+        )
+        lower_bounds[subblocked_mask] = inferred_lower
+        upper_bounds[subblocked_mask] = inferred_upper
+    return lower_bounds, upper_bounds
 
 
 def apply_blank_sample_domain_behavior(df, blank_domain_behavior='skip', domain_col='Domain',
@@ -7370,8 +7218,10 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
                                         sample_domain_col=None,
                                         block_x_col=None, block_y_col=None, block_z_col=None,
                                         block_domain_col=None, block_size=None,
+                                        block_size_cols=None,
                                         sample_filters=None, block_filters=None,
                                         progress_callback=None):
+    """Sample domaining is the single-column case of the generic block-to-sample transfer."""
     if not samples_file or not os.path.isfile(samples_file):
         raise ValueError('Please select a valid samples file.')
     if not blocks_file or not os.path.isfile(blocks_file):
@@ -7381,131 +7231,33 @@ def export_domained_samples_from_blocks(samples_file, blocks_file, output_file=N
     if not domain_column_name or domain_column_name == '(None)':
         raise ValueError('Please select a domain column in "Blocks Columns" first.')
 
-    if block_size is None:
-        raise ValueError('Block size must be specified for sample domaining.')
-
-    blocks_delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
-    output_file = resolve_domain_samples_export_path(
-        output_file,
-        samples_file=samples_file,
-        domain_col=domain_column_name,
-    )
-    _emit_progress(progress_callback, 0, 100, 'Preparing sample domaining export...')
-
-    print(f"Loading block domain mapping from {blocks_file}...")
-    block_metadata = load_large_blocks_metadata(
-        blocks_file,
-        blocks_delimiter,
-        blocks_header_line or 1,
-        block_size,
-        None,
-        block_x_col=block_x_col,
-        block_y_col=block_y_col,
-        block_z_col=block_z_col,
-        block_domain_col=domain_column_name,
-        block_filters=block_filters,
-        config=None,
-        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 45, 'Loading block domain mapping...'),
-    )
-
-    print(f"Loading samples from {samples_file}...")
-    df_samples, sample_delimiter = load_full_samples_dataframe(
+    result = export_samples_with_block_values_from_blocks(
         samples_file,
+        blocks_file,
+        output_file=resolve_domain_samples_export_path(
+            output_file,
+            samples_file=samples_file,
+            domain_col=domain_column_name,
+        ),
         samples_delimiter=samples_delimiter,
+        blocks_delimiter=blocks_delimiter,
         samples_header_line=samples_header_line,
-        sample_filters=sample_filters,
-        progress_label='Reading sample file',
-        progress_callback=_make_scaled_progress_callback(progress_callback, 45, 80, 'Reading sample file...'),
-        preserve_empty_columns=True,
-    )
-
-    sample_coordinate_columns = list(df_samples.columns)
-    if not (sample_x_col and sample_y_col and sample_z_col):
-        empty_sample_columns = set(_list_all_empty_columns(df_samples))
-        sample_coordinate_columns = [
-            column_name for column_name in sample_coordinate_columns
-            if column_name not in empty_sample_columns
-        ]
-
-    sample_x_col, sample_y_col, sample_z_col = resolve_sample_coordinate_columns(
-        sample_coordinate_columns,
+        blocks_header_line=blocks_header_line,
         sample_x_col=sample_x_col,
         sample_y_col=sample_y_col,
         sample_z_col=sample_z_col,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_value_cols=[domain_column_name],
+        block_size=block_size,
+        block_size_cols=block_size_cols,
+        block_domain_col=domain_column_name,
+        sample_filters=sample_filters,
+        block_filters=block_filters,
+        progress_callback=progress_callback,
     )
-
-    coord_frame = df_samples[[sample_x_col, sample_y_col, sample_z_col]].apply(pd.to_numeric, errors='coerce')
-    valid_mask = coord_frame.notna().all(axis=1)
-    valid_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
-
-    if block_metadata.get('is_rotated') and len(valid_coords) > 0:
-        rotation_center = block_metadata['rotation_center']
-        rotation_matrix = block_metadata['rotation_matrix']
-        valid_coords = (valid_coords - rotation_center) @ rotation_matrix.T
-
-    all_min_bounds = np.asarray(block_metadata.get('grid_index_origin', block_metadata['all_min_bounds']), dtype=float)
-    unified_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
-    block_indices = np.floor((valid_coords - all_min_bounds) / unified_dims + 1e-6).astype(int)
-    domain_mapping = block_metadata['domain_mapping']
-
-    assigned_domains = []
-    matched_count = 0
-    total_indices = len(block_indices)
-    assign_started_at = time.perf_counter()
-    next_terminal_report_at = assign_started_at
-    _emit_progress(progress_callback, 80, 100, 'Assigning samples to block domains...')
-    for index, idx in enumerate(block_indices, start=1):
-        block_idx = (int(idx[0]), int(idx[1]), int(idx[2]))
-        domain_value = domain_mapping.get(block_idx, '')
-        if domain_value != '':
-            matched_count += 1
-        assigned_domains.append(domain_value)
-        if progress_callback and (index == total_indices or index % 50_000 == 0):
-            progress_value = 80 + int(round((index / max(total_indices, 1)) * 15))
-            _emit_progress(progress_callback, progress_value, 100, 'Assigning samples to block domains...')
-        now = time.perf_counter()
-        if now >= next_terminal_report_at:
-            elapsed_seconds = max(int(now - assign_started_at), 0)
-            percent = int(round((index / max(total_indices, 1)) * 100)) if total_indices > 0 else 100
-            print(
-                f"Sample domaining progress: {index:,}/{total_indices:,} valid samples ({percent}%) assigned; "
-                f"matched={matched_count:,}; elapsed~{elapsed_seconds}s"
-            )
-            next_terminal_report_at = now + 5.0
-
-    elapsed_seconds = max(int(time.perf_counter() - assign_started_at), 0)
-    print(
-        f"Sample domaining complete: {total_indices:,} valid samples processed; "
-        f"matched={matched_count:,}; elapsed~{elapsed_seconds}s"
-    )
-
-    output_dir = os.path.dirname(output_file) or '.'
-    os.makedirs(output_dir, exist_ok=True)
-
-    output_df = df_samples.copy()
-    domain_series = pd.Series([''] * len(output_df), index=output_df.index, dtype=object)
-    domain_series.loc[valid_mask] = assigned_domains
-    output_df[domain_column_name] = domain_series
-    _emit_progress(progress_callback, 98, 100, 'Writing domained samples export...')
-    output_df.to_csv(output_file, index=False, sep=sample_delimiter)
-    _emit_progress(progress_callback, 100, 100, 'Sample domaining export complete.')
-
-    invalid_coordinate_count = int((~valid_mask).sum())
-    unmatched_count = int(len(output_df) - matched_count)
-    print(f"Exported {len(output_df):,} domained samples to {output_file}")
-    print(
-        f"Matched {matched_count:,} samples to block domains; "
-        f"{unmatched_count:,} unmatched ({invalid_coordinate_count:,} invalid coordinates)."
-    )
-
-    return {
-        'output_file': output_file,
-        'total_samples': int(len(output_df)),
-        'matched_samples': int(matched_count),
-        'unmatched_samples': int(unmatched_count),
-        'invalid_coordinate_samples': int(invalid_coordinate_count),
-        'domain_column': domain_column_name,
-    }
+    return {**result, 'domain_column': domain_column_name}
 
 
 def export_samples_with_block_values_from_blocks(samples_file, blocks_file, output_file=None,
@@ -7514,6 +7266,7 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
                                                  sample_x_col=None, sample_y_col=None, sample_z_col=None,
                                                  block_x_col=None, block_y_col=None, block_z_col=None,
                                                  block_value_cols=None, block_size=None,
+                                                 block_size_cols=None, block_domain_col=None,
                                                  sample_filters=None, block_filters=None,
                                                  progress_callback=None):
     if not samples_file or not os.path.isfile(samples_file):
@@ -7529,6 +7282,10 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
         block_y_col=block_y_col,
         block_z_col=block_z_col,
     )
+    domain_column_name = str(block_domain_col or '').strip()
+    if domain_column_name in ('', '(None)') or domain_column_name not in selected_columns:
+        domain_column_name = None
+
     blocks_delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
     output_file = resolve_block_value_transfer_export_path(
         output_file,
@@ -7550,24 +7307,8 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
         block_domain_col=None,
         block_filters=block_filters,
         config=None,
-        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 45, 'Loading block geometry...'),
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 35, 'Loading block geometry...'),
     )
-
-    print(f"Building block value mapping from {blocks_file}...")
-    block_value_mapping_data = load_block_value_mappings(
-        blocks_file,
-        blocks_delimiter,
-        blocks_header_line or 1,
-        block_size,
-        selected_columns,
-        block_x_col=block_x_col,
-        block_y_col=block_y_col,
-        block_z_col=block_z_col,
-        block_filters=block_filters,
-        block_metadata=block_metadata,
-        progress_callback=_make_scaled_progress_callback(progress_callback, 45, 75, 'Building block value mapping...'),
-    )
-    value_mappings = block_value_mapping_data['value_mappings']
 
     print(f"Loading samples from {samples_file}...")
     df_samples, sample_delimiter = load_full_samples_dataframe(
@@ -7576,11 +7317,20 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
         samples_header_line=samples_header_line,
         sample_filters=sample_filters,
         progress_label='Reading sample file',
-        progress_callback=_make_scaled_progress_callback(progress_callback, 75, 90, 'Reading sample file...'),
+        progress_callback=_make_scaled_progress_callback(progress_callback, 35, 55, 'Reading sample file...'),
+        preserve_empty_columns=True,
     )
 
+    sample_coordinate_columns = list(df_samples.columns)
+    if not (sample_x_col and sample_y_col and sample_z_col):
+        empty_sample_columns = set(_list_all_empty_columns(df_samples))
+        sample_coordinate_columns = [
+            column_name for column_name in sample_coordinate_columns
+            if column_name not in empty_sample_columns
+        ]
+
     sample_x_col, sample_y_col, sample_z_col = resolve_sample_coordinate_columns(
-        list(df_samples.columns),
+        sample_coordinate_columns,
         sample_x_col=sample_x_col,
         sample_y_col=sample_y_col,
         sample_z_col=sample_z_col,
@@ -7588,50 +7338,238 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
 
     coord_frame = df_samples[[sample_x_col, sample_y_col, sample_z_col]].apply(pd.to_numeric, errors='coerce')
     valid_mask = coord_frame.notna().all(axis=1)
-    valid_coords = coord_frame.loc[valid_mask].to_numpy(copy=False)
-    block_indices = _compute_sample_block_indices_from_metadata(valid_coords, block_metadata)
+    sample_coords = coord_frame.loc[valid_mask].to_numpy(dtype=float, copy=True)
+    if block_metadata.get('is_rotated') and len(sample_coords) > 0:
+        sample_coords = (sample_coords - block_metadata['rotation_center']) @ block_metadata['rotation_matrix'].T
 
-    assigned_values = {column_name: [] for column_name in selected_columns}
-    matched_count = 0
-    total_indices = len(block_indices)
-    assign_started_at = time.perf_counter()
-    next_terminal_report_at = assign_started_at
-    _emit_progress(progress_callback, 90, 100, 'Assigning block values to samples...')
-    for index, idx in enumerate(block_indices, start=1):
-        block_idx = (int(idx[0]), int(idx[1]), int(idx[2]))
-        block_values = value_mappings.get(block_idx)
-        if block_values:
-            matched_count += 1
-        for column_name in selected_columns:
-            assigned_values[column_name].append(block_values.get(column_name, '') if block_values else '')
-        if progress_callback and (index == total_indices or index % 50_000 == 0):
-            progress_value = 90 + int(round((index / max(total_indices, 1)) * 8))
-            _emit_progress(progress_callback, progress_value, 100, 'Assigning block values to samples...')
-        now = time.perf_counter()
-        if now >= next_terminal_report_at:
-            elapsed_seconds = max(int(now - assign_started_at), 0)
-            percent = int(round((index / max(total_indices, 1)) * 100)) if total_indices > 0 else 100
-            print(
-                f"Block transfer progress: {index:,}/{total_indices:,} valid samples ({percent}%) assigned; "
-                f"matched={matched_count:,}; elapsed~{elapsed_seconds}s"
-            )
-            next_terminal_report_at = now + 5.0
+    grid_origin = np.asarray(block_metadata.get('grid_index_origin', block_metadata['all_min_bounds']), dtype=float)
+    parent_dims = np.asarray(block_metadata['unified_dims'], dtype=float)
+    sample_count = len(sample_coords)
+    sample_parent_indices = (
+        np.floor((sample_coords - grid_origin) / parent_dims + 1e-6).astype(np.int64)
+        if sample_count else np.empty((0, 3), dtype=np.int64)
+    )
+    sample_keys, sample_keys_in_range = _encode_block_index_keys(sample_parent_indices)
 
-    elapsed_seconds = max(int(time.perf_counter() - assign_started_at), 0)
+    lookup_positions = np.flatnonzero(sample_keys_in_range)
+    key_order = np.argsort(sample_keys[lookup_positions], kind='stable')
+    sorted_sample_keys = sample_keys[lookup_positions][key_order]
+    sorted_sample_positions = lookup_positions[key_order]
+    wanted_keys = np.unique(sorted_sample_keys)
+
+    assigned_values = {column_name: np.full(sample_count, None, dtype=object) for column_name in selected_columns}
+    contained_mask = np.zeros(sample_count, dtype=bool)
+    nearest_mask = np.zeros(sample_count, dtype=bool)
+    nearest_distance = np.full(sample_count, np.inf, dtype=float)
+    numeric_candidates = {column_name: True for column_name in selected_columns}
+    saw_values = {column_name: False for column_name in selected_columns}
+
+    explicit_size_columns = _normalize_optional_size_columns(block_size_cols)
+    extra_block_columns = list(selected_columns) + list(explicit_size_columns or ())
+
+    effective_header_line = resolve_effective_csv_header_line(blocks_file, blocks_header_line or 1)
+    headers = parse_header_line(blocks_file, blocks_delimiter, effective_header_line)
+    final_names = build_unique_column_names(headers)
+    filter_fields = collect_filter_fields(block_filters or [])
+    read_columns, rename_map, domain_copy_source, mapping_mode = plan_block_file_columns(
+        final_names,
+        block_x_col=block_x_col,
+        block_y_col=block_y_col,
+        block_z_col=block_z_col,
+        block_domain_col=None,
+        extra_columns=extra_block_columns + filter_fields,
+    )
+    mapping_label = 'user' if mapping_mode == 'explicit' else 'generic positional'
+    print(f"Applied {mapping_label} block column mapping for sample transfer: {rename_map}")
     print(
-        f"Block transfer complete: {total_indices:,} valid samples processed; "
-        f"matched={matched_count:,}; elapsed~{elapsed_seconds}s"
+        'Sub-block geometry: '
+        + ('explicit size columns ' + ', '.join(explicit_size_columns) if explicit_size_columns
+           else 'inferred from the base block grid')
     )
 
-    output_dir = os.path.dirname(output_file) or '.'
-    os.makedirs(output_dir, exist_ok=True)
+    epsilon = 1e-6
+    scanned_block_rows = 0
+    candidate_block_rows = 0
+
+    def match_block_rows(buffer_df):
+        nonlocal candidate_block_rows
+        if len(buffer_df) == 0:
+            return
+        candidate_block_rows += len(buffer_df)
+        coords = buffer_df[['x', 'y', 'z']].to_numpy(dtype=float, copy=False)
+        parent_indices = np.floor((coords - grid_origin) / parent_dims + 1e-6).astype(np.int64)
+        row_sizes = (
+            buffer_df[list(explicit_size_columns)].to_numpy(dtype=float, copy=False)
+            if explicit_size_columns else None
+        )
+        lower_bounds, upper_bounds = _resolve_subblock_bounds(
+            coords, parent_indices, grid_origin, parent_dims, row_sizes,
+        )
+        block_keys, _ = _encode_block_index_keys(parent_indices)
+        column_values = {column_name: buffer_df[column_name].to_numpy(copy=False) for column_name in selected_columns}
+
+        for column_name in selected_columns:
+            if not numeric_candidates[column_name]:
+                continue
+            series = buffer_df[column_name]
+            if pd.api.types.is_numeric_dtype(series):
+                saw_values[column_name] = saw_values[column_name] or bool(series.notna().any())
+                continue
+            text_values = series.fillna('').astype(str).str.strip()
+            nonblank = text_values[(text_values != '') & (text_values.str.lower() != 'nan')]
+            if len(nonblank) == 0:
+                continue
+            saw_values[column_name] = True
+            if pd.to_numeric(nonblank, errors='coerce').isna().any():
+                numeric_candidates[column_name] = False
+
+        row_order = np.argsort(block_keys, kind='stable')
+        ordered_keys = block_keys[row_order]
+        group_starts = np.flatnonzero(np.r_[True, ordered_keys[1:] != ordered_keys[:-1]])
+        group_ends = np.r_[group_starts[1:], len(row_order)]
+        for start, end in zip(group_starts, group_ends):
+            group_key = ordered_keys[start]
+            left = np.searchsorted(sorted_sample_keys, group_key, side='left')
+            right = np.searchsorted(sorted_sample_keys, group_key, side='right')
+            if left == right:
+                continue
+            sample_positions = sorted_sample_positions[left:right]
+            rows = row_order[start:end]
+            points = sample_coords[sample_positions]
+            shifted_points = points[:, None, :] + epsilon
+            inside = np.all(
+                (shifted_points >= lower_bounds[rows][None, :, :])
+                & (shifted_points < upper_bounds[rows][None, :, :]),
+                axis=2,
+            )
+            hit_mask = inside.any(axis=1)
+            new_hits = hit_mask & ~contained_mask[sample_positions]
+            if new_hits.any():
+                hit_positions = sample_positions[new_hits]
+                hit_rows = rows[inside.argmax(axis=1)[new_hits]]
+                for column_name in selected_columns:
+                    assigned_values[column_name][hit_positions] = column_values[column_name][hit_rows]
+                contained_mask[hit_positions] = True
+
+            fallback_mask = ~hit_mask & ~contained_mask[sample_positions]
+            if not fallback_mask.any():
+                continue
+            fallback_positions = sample_positions[fallback_mask]
+            distances = np.linalg.norm(points[fallback_mask][:, None, :] - coords[rows][None, :, :], axis=2)
+            best_rows = distances.argmin(axis=1)
+            best_distances = distances[np.arange(len(best_rows)), best_rows]
+            improved = best_distances < nearest_distance[fallback_positions]
+            if not improved.any():
+                continue
+            improved_positions = fallback_positions[improved]
+            improved_rows = rows[best_rows[improved]]
+            for column_name in selected_columns:
+                assigned_values[column_name][improved_positions] = column_values[column_name][improved_rows]
+            nearest_distance[improved_positions] = best_distances[improved]
+            nearest_mask[improved_positions] = True
+
+    buffered_frames = []
+    buffered_rows = 0
+    pending_frame = None
+    max_buffered_rows = 1_000_000
+
+    def drain_buffer(final=False):
+        nonlocal buffered_frames, buffered_rows, pending_frame
+        frames = ([pending_frame] if pending_frame is not None else []) + buffered_frames
+        buffered_frames = []
+        buffered_rows = 0
+        pending_frame = None
+        if not frames:
+            return
+        buffer_df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+        if not final and len(buffer_df) > 0:
+            # Hold back the last base block so sub-blocks split across reads are resolved together.
+            coords = buffer_df[['x', 'y', 'z']].to_numpy(dtype=float, copy=False)
+            keys, _ = _encode_block_index_keys(
+                np.floor((coords - grid_origin) / parent_dims + 1e-6).astype(np.int64)
+            )
+            differing = np.flatnonzero(keys != keys[-1])
+            split_at = int(differing[-1]) + 1 if len(differing) else 0
+            pending_frame = buffer_df.iloc[split_at:].reset_index(drop=True)
+            buffer_df = buffer_df.iloc[:split_at]
+        match_block_rows(buffer_df)
+
+    print(f"Matching samples against block geometry in {blocks_file}...")
+    match_started_at = time.perf_counter()
+    for chunk in iterate_csv_with_progress(
+        blocks_file,
+        'Reading grid file (sub-block sample matching)',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 55, 95, 'Matching samples to sub-blocks...'),
+        delimiter=blocks_delimiter,
+        header=None,
+        names=final_names,
+        skiprows=effective_header_line,
+        comment='#',
+        usecols=read_columns,
+        chunksize=250_000,
+    ):
+        scanned_block_rows += int(len(chunk))
+        if block_filters:
+            chunk, _ = apply_dataframe_filters(
+                chunk,
+                filters=block_filters,
+                filter_subject='block',
+                source_label='blocks file chunk',
+                emit_logs=False,
+            )
+        chunk, _ = normalize_block_chunk(chunk, rename_map, domain_copy_source, extra_keep_columns=extra_block_columns)
+        if len(chunk) == 0:
+            continue
+        coords = chunk[['x', 'y', 'z']].to_numpy(dtype=float, copy=False)
+        if block_metadata.get('is_rotated'):
+            coords = (coords - block_metadata['rotation_center']) @ block_metadata['rotation_matrix'].T
+            chunk.loc[:, ['x', 'y', 'z']] = coords
+        chunk_keys, _ = _encode_block_index_keys(
+            np.floor((coords - grid_origin) / parent_dims + 1e-6).astype(np.int64)
+        )
+        keep_positions = np.flatnonzero(np.isin(chunk_keys, wanted_keys))
+        if len(keep_positions) == 0:
+            continue
+        buffered_frames.append(chunk.iloc[keep_positions].reset_index(drop=True))
+        buffered_rows += len(keep_positions)
+        if buffered_rows >= max_buffered_rows:
+            drain_buffer()
+    drain_buffer(final=True)
+
+    column_modes = {
+        column_name: 'numeric' if numeric_candidates[column_name] and saw_values[column_name] else 'categorical'
+        for column_name in selected_columns
+    }
+    if domain_column_name:
+        column_modes[domain_column_name] = 'categorical'
+
+    matched_mask = contained_mask | nearest_mask
+    matched_count = int(matched_mask.sum())
+    print(
+        f"Sample matching complete: {scanned_block_rows:,} block rows scanned, "
+        f"{candidate_block_rows:,} evaluated against samples; "
+        f"{int(contained_mask.sum()):,} samples matched inside a block, "
+        f"{int(nearest_mask.sum()):,} via nearest block in the same base cell; "
+        f"elapsed~{max(int(time.perf_counter() - match_started_at), 0)}s"
+    )
 
     output_df = df_samples.copy()
     for column_name in selected_columns:
+        raw_series = pd.Series(assigned_values[column_name], dtype=object)
+        if column_modes[column_name] == 'numeric':
+            numeric_series = pd.to_numeric(raw_series, errors='coerce')
+            resolved = numeric_series.astype(object).where(numeric_series.notna(), '')
+        else:
+            resolved = raw_series.where(raw_series.notna(), '').astype(str).str.strip()
+            resolved = resolved.mask(resolved.str.lower() == 'nan', '')
+            if column_name == domain_column_name:
+                resolved = resolved.mask(matched_mask & (resolved == ''), 'Undomained')
         output_series = pd.Series([''] * len(output_df), index=output_df.index, dtype=object)
-        output_series.loc[valid_mask] = assigned_values[column_name]
+        output_series.loc[valid_mask] = resolved.to_numpy()
         output_df[column_name] = output_series
+
     _emit_progress(progress_callback, 99, 100, 'Writing block value transfer export...')
+    os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
     output_df.to_csv(output_file, index=False, sep=sample_delimiter)
     _emit_progress(progress_callback, 100, 100, 'Block value transfer export complete.')
 
@@ -7646,11 +7584,14 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
     return {
         'output_file': output_file,
         'total_samples': int(len(output_df)),
-        'matched_samples': int(matched_count),
-        'unmatched_samples': int(unmatched_count),
-        'invalid_coordinate_samples': int(invalid_coordinate_count),
+        'matched_samples': matched_count,
+        'unmatched_samples': unmatched_count,
+        'invalid_coordinate_samples': invalid_coordinate_count,
+        'subblock_matched_samples': int(contained_mask.sum()),
+        'nearest_block_matched_samples': int(nearest_mask.sum()),
         'transferred_columns': list(selected_columns),
-        'column_modes': dict(block_value_mapping_data['column_modes']),
+        'column_modes': column_modes,
+        'block_geometry_mode': 'explicit-size-columns' if explicit_size_columns else 'inferred-from-base-grid',
     }
 
 
@@ -7661,7 +7602,8 @@ def _normalize_optional_size_columns(size_columns):
     return tuple(values)
 
 
-def _infer_block_row_bounds(coords, base_block_size, progress_callback=None, progress_label='Resolving block geometry'):
+def _infer_block_row_bounds(coords, base_block_size, progress_callback=None, progress_label='Resolving block geometry',
+                            grid_origin=None):
     coords = np.asarray(coords, dtype=float)
     base_dims = np.asarray(base_block_size, dtype=float)
     if coords.ndim != 2 or coords.shape[1] != 3:
@@ -7672,7 +7614,10 @@ def _infer_block_row_bounds(coords, base_block_size, progress_callback=None, pro
         empty = np.empty((0, 3), dtype=float)
         return empty, empty.copy(), empty.copy()
 
-    grid_origin = np.floor(coords.min(axis=0) / base_dims) * base_dims
+    if grid_origin is None:
+        grid_origin = np.floor(coords.min(axis=0) / base_dims) * base_dims
+    else:
+        grid_origin = np.asarray(grid_origin, dtype=float)
     parent_indices = np.floor((coords - grid_origin) / base_dims + 1e-6).astype(np.int64)
     parent_origins = grid_origin + parent_indices * base_dims
     local_coords = np.clip(coords - parent_origins, 0.0, base_dims)
@@ -11680,15 +11625,6 @@ if __name__ == "__main__":
             refresh_sample_columns()
             refresh_block_columns()
 
-            def suggested_domain_samples_path():
-                sample_path = self.samples_edit.text().strip()
-                base_name = os.path.splitext(os.path.basename(sample_path))[0] if sample_path else ''
-                output_dir = os.path.dirname(sample_path) if sample_path else '.'
-                domain_name = self.block_domain_col.currentText() if hasattr(self, 'block_domain_col') else 'Domain'
-                domain_suffix = _sanitize_filename_fragment(domain_name, fallback='Domain')
-                filename = f"{base_name}+{domain_suffix}.csv" if base_name else f"samples+{domain_suffix}.csv"
-                return os.path.join(output_dir or '.', filename)
-
             def suggested_sample_blocks_path():
                 return resolve_sample_blocks_export_path(
                     None,
@@ -11764,9 +11700,6 @@ if __name__ == "__main__":
             self.sample_blocks_output_edit = QtWidgets.QLineEdit('')
             self.sample_blocks_browse = QtWidgets.QPushButton('Browse')
             self.start_sample_blocks_btn = QtWidgets.QPushButton('Export Sample Blocks')
-            self.domain_samples_output_edit = QtWidgets.QLineEdit('')
-            self.domain_samples_browse = QtWidgets.QPushButton('Browse')
-            self.start_domaining_btn = QtWidgets.QPushButton('Start Domaining')
             self.block_value_transfer_output_edit = QtWidgets.QLineEdit('')
             self.block_value_transfer_browse = QtWidgets.QPushButton('Browse')
             self.start_block_value_transfer_btn = QtWidgets.QPushButton('Transfer Columns')
@@ -11912,7 +11845,6 @@ if __name__ == "__main__":
             self.equation_finder_browse = QtWidgets.QPushButton('Browse')
             self.start_equation_finder_btn = QtWidgets.QPushButton('Find Equations')
             self._sample_blocks_auto_path = ''
-            self._domain_samples_auto_path = ''
             self._block_value_transfer_auto_path = ''
             self._block_model_transfer_auto_path = ''
             self._table_attribute_auto_path = ''
@@ -11937,13 +11869,6 @@ if __name__ == "__main__":
                 if force or not current or current == self._sample_blocks_auto_path:
                     self.sample_blocks_output_edit.setText(suggested)
                 self._sample_blocks_auto_path = suggested
-
-            def refresh_domain_samples_output_path(force=False):
-                suggested = suggested_domain_samples_path()
-                current = self.domain_samples_output_edit.text().strip()
-                if force or not current or current == self._domain_samples_auto_path:
-                    self.domain_samples_output_edit.setText(suggested)
-                self._domain_samples_auto_path = suggested
 
             def refresh_block_value_transfer_output_path(force=False):
                 suggested = suggested_block_value_transfer_path()
@@ -12032,17 +11957,6 @@ if __name__ == "__main__":
                 )
                 if path:
                     self.sample_blocks_output_edit.setText(path)
-
-            def browse_domain_samples_output():
-                initial_path = self.domain_samples_output_edit.text().strip() or suggested_domain_samples_path()
-                path, _ = QtWidgets.QFileDialog.getSaveFileName(
-                    self,
-                    'Domain Samples Output File',
-                    initial_path,
-                    'CSV Files (*.csv)'
-                )
-                if path:
-                    self.domain_samples_output_edit.setText(path)
 
             def browse_block_value_transfer_output():
                 initial_path = self.block_value_transfer_output_edit.text().strip() or suggested_block_value_transfer_path()
@@ -12240,23 +12154,10 @@ if __name__ == "__main__":
             sample_blocks_form.addRow('', self.start_sample_blocks_btn)
             operations_form.addRow(sample_blocks_group)
 
-            domain_samples_group, domain_samples_form = create_collapsible_operation_section(
-                'Domain Samples',
-                'Assign a domain to each sample row from the blocks model and export the domained samples to a new CSV.',
-            )
-            domain_output_layout = QtWidgets.QHBoxLayout()
-            domain_output_layout.addWidget(self.domain_samples_output_edit)
-            domain_output_layout.addWidget(self.domain_samples_browse)
-            domain_samples_form.addRow('Output File', domain_output_layout)
-            self.start_domaining_btn.setToolTip(
-                'Export a copy of the samples file with one domain assigned to each sample from the configured blocks and block size.'
-            )
-            domain_samples_form.addRow('', self.start_domaining_btn)
-            operations_form.addRow(domain_samples_group)
-
             block_value_transfer_group, block_value_transfer_form = create_collapsible_operation_section(
-                'Assign Block Columns To Samples',
-                'Copy selected block columns onto sample rows by matching each sample to its containing block.',
+                'Assign Block Columns To Samples (Domaining)',
+                'Copy selected block columns onto sample rows by matching each sample to the sub-block that contains it. '
+                'Select the configured domain column here to domain the samples file.',
             )
             block_value_transfer_output_layout = QtWidgets.QHBoxLayout()
             block_value_transfer_output_layout.addWidget(self.block_value_transfer_output_edit)
@@ -12269,7 +12170,9 @@ if __name__ == "__main__":
             block_value_transfer_form.addRow('', block_value_transfer_buttons)
             block_value_transfer_form.addRow('', self.block_value_transfer_summary)
             self.start_block_value_transfer_btn.setToolTip(
-                'Export the samples file with the selected block columns transferred onto each matched sample row.'
+                'Export the samples file with the selected block columns transferred onto each matched sample row. '
+                'Each sample takes the value of the sub-block that contains it; sub-block extents come from the '
+                'Source DX / DY / DZ columns below when set, otherwise they are inferred from the base block grid.'
             )
             block_value_transfer_form.addRow('', self.start_block_value_transfer_btn)
             operations_form.addRow(block_value_transfer_group)
@@ -12609,8 +12512,6 @@ if __name__ == "__main__":
             self.sample_blocks_browse.clicked.connect(browse_sample_blocks_output)
             self.start_sample_blocks_btn.clicked.connect(self.run_sample_blocks_only)
             self.sample_blocks_include_ids.toggled.connect(lambda _: self._update_sample_blocks_id_controls())
-            self.domain_samples_browse.clicked.connect(browse_domain_samples_output)
-            self.start_domaining_btn.clicked.connect(self.run_domain_samples_only)
             self.block_value_transfer_browse.clicked.connect(browse_block_value_transfer_output)
             self.start_block_value_transfer_btn.clicked.connect(self.run_block_value_transfer_only)
             self.block_value_transfer_select_all_btn.clicked.connect(self.block_value_transfer_cols.selectAll)
@@ -12703,7 +12604,6 @@ if __name__ == "__main__":
             self.equation_predictor_list.itemSelectionChanged.connect(self._update_equation_finder_predictor_summary)
             self.equation_include_coords.toggled.connect(lambda _: self._refresh_equation_finder_predictor_columns())
             self.samples_edit.textChanged.connect(lambda _: refresh_sample_blocks_output_path())
-            self.samples_edit.textChanged.connect(lambda _: refresh_domain_samples_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_domain_interpolation_confidence_output_path())
             self.blocks_edit.textChanged.connect(lambda _: refresh_block_volume_weighted_output_path())
@@ -12718,7 +12618,6 @@ if __name__ == "__main__":
             self.bmf_export_y_col.currentTextChanged.connect(lambda _: self._refresh_bmf_export_columns())
             self.bmf_export_z_col.currentTextChanged.connect(lambda _: self._refresh_bmf_export_columns())
             self.samples_edit.textChanged.connect(lambda _: refresh_equation_finder_output_path())
-            self.block_domain_col.currentTextChanged.connect(lambda _: refresh_domain_samples_output_path())
             self.block_domain_col.currentTextChanged.connect(lambda _: refresh_block_domain_metrics_output_path())
             self.block_domain_col.currentTextChanged.connect(lambda _: refresh_domain_interpolation_confidence_output_path())
             self.block_volume_weighted_value_col.currentTextChanged.connect(lambda _: refresh_block_volume_weighted_output_path())
@@ -12736,7 +12635,6 @@ if __name__ == "__main__":
             self.sample_value_col.currentTextChanged.connect(lambda _: self._update_block_domain_metrics_metric_summary())
             refresh_sample_blocks_output_path(force=True)
             self._update_sample_blocks_id_controls()
-            refresh_domain_samples_output_path(force=True)
             self._refresh_block_value_transfer_columns()
             refresh_block_value_transfer_output_path(force=True)
             self._refresh_block_model_transfer_source_columns()
@@ -13348,7 +13246,6 @@ if __name__ == "__main__":
                 'sample_blocks_file': self.sample_blocks_output_edit.text(),
                 'sample_blocks_include_ids': self.sample_blocks_include_ids.isChecked(),
                 'sample_blocks_id_cols': [cb.currentText() for cb in self.sample_blocks_id_cols],
-                'domain_samples_file': self.domain_samples_output_edit.text(),
                 'block_value_transfer_file': self.block_value_transfer_output_edit.text(),
                 'block_value_transfer_cols': self._get_selected_block_value_transfer_columns(),
                 'block_model_target_file': self.block_model_target_edit.text(),
@@ -13559,8 +13456,10 @@ if __name__ == "__main__":
                 if 'block_y_col' in config: self.block_y_col.setCurrentText(config['block_y_col'])
                 if 'block_z_col' in config: self.block_z_col.setCurrentText(config['block_z_col'])
                 if 'block_domain_col' in config: self.block_domain_col.setCurrentText(config['block_domain_col'])
-                if 'domain_samples_file' in config: self.domain_samples_output_edit.setText(config['domain_samples_file'])
-                if 'block_value_transfer_file' in config: self.block_value_transfer_output_edit.setText(config['block_value_transfer_file'])
+                if 'block_value_transfer_file' in config:
+                    self.block_value_transfer_output_edit.setText(config['block_value_transfer_file'])
+                elif 'domain_samples_file' in config:
+                    self.block_value_transfer_output_edit.setText(config['domain_samples_file'])
                 if 'block_model_target_file' in config: self.block_model_target_edit.setText(config['block_model_target_file'])
                 if 'block_model_target_delimiter' in config: self.block_model_target_delim.setCurrentText(config['block_model_target_delimiter'])
                 if 'block_model_target_header_line' in config: self.block_model_target_header_line.setValue(int(config['block_model_target_header_line']))
@@ -15290,7 +15189,6 @@ if __name__ == "__main__":
             self._pending_equation_predictor_selection = []
 
         def _set_operation_buttons_enabled(self, enabled):
-            self.start_domaining_btn.setEnabled(enabled)
             self.start_block_value_transfer_btn.setEnabled(enabled)
             self.start_table_attribute_assign_btn.setEnabled(enabled)
             self.start_block_domain_metrics_btn.setEnabled(enabled)
@@ -15544,67 +15442,6 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during sample-block export:\n{str(e)}')
 
-        def run_domain_samples_only(self):
-            """Assign block domains directly to the samples file and export the result."""
-            try:
-                cfg = self.to_dict()
-                output_file = resolve_domain_samples_export_path(
-                    cfg.get('domain_samples_file'),
-                    samples_file=cfg.get('samples_file'),
-                    domain_col=cfg.get('block_domain_col'),
-                )
-                self.domain_samples_output_edit.setText(output_file)
-
-                print("=" * 60)
-                print("Assigning sample domains from blocks...")
-                print("=" * 60)
-
-                def handle_success(result):
-                    print("=" * 60)
-                    QtWidgets.QMessageBox.information(
-                        self,
-                        'Success',
-                        (
-                            f"Domaining complete!\nResults saved to:\n{result['output_file']}\n\n"
-                            f"Domain column: {result['domain_column']}\n"
-                            f"Matched samples: {result['matched_samples']:,}\n"
-                            f"Unmatched samples: {result['unmatched_samples']:,}\n"
-                            f"Invalid coordinates: {result['invalid_coordinate_samples']:,}"
-                        ),
-                    )
-
-                self._run_operation_with_progress(
-                    'Sample Domaining',
-                    'Preparing sample domaining export...',
-                    export_domained_samples_from_blocks,
-                    {
-                        'samples_file': cfg.get('samples_file'),
-                        'blocks_file': cfg.get('blocks_file'),
-                        'output_file': output_file,
-                        'samples_delimiter': cfg.get('samples_delimiter'),
-                        'blocks_delimiter': cfg.get('blocks_delimiter'),
-                        'samples_header_line': cfg.get('samples_header_line', 1),
-                        'blocks_header_line': cfg.get('blocks_header_line', 1),
-                        'sample_x_col': cfg.get('sample_x_col'),
-                        'sample_y_col': cfg.get('sample_y_col'),
-                        'sample_z_col': cfg.get('sample_z_col'),
-                        'sample_domain_col': cfg.get('sample_domain_col'),
-                        'block_x_col': cfg.get('block_x_col'),
-                        'block_y_col': cfg.get('block_y_col'),
-                        'block_z_col': cfg.get('block_z_col'),
-                        'block_domain_col': cfg.get('block_domain_col'),
-                        'block_size': cfg.get('block_size'),
-                        'sample_filters': cfg.get('block_domain_sample_filters'),
-                        'block_filters': cfg.get('block_volume_weighted_filters'),
-                    },
-                    handle_success,
-                    'An error occurred during sample domaining',
-                )
-            except Exception as e:
-                print(f"Error during sample domaining: {e}")
-                traceback.print_exc()
-                QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during sample domaining:\n{str(e)}')
-
         def run_block_value_transfer_only(self):
             """Assign selected block columns directly to the samples file and export the result."""
             try:
@@ -15630,6 +15467,8 @@ if __name__ == "__main__":
                             f"Block value transfer complete!\nResults saved to:\n{result['output_file']}\n\n"
                             f"Transferred columns: {', '.join(result['transferred_columns'])}\n"
                             f"Matched samples: {result['matched_samples']:,}\n"
+                            f"  inside a sub-block: {result['subblock_matched_samples']:,}\n"
+                            f"  nearest block in the same base cell: {result['nearest_block_matched_samples']:,}\n"
                             f"Unmatched samples: {result['unmatched_samples']:,}\n"
                             f"Invalid coordinates: {result['invalid_coordinate_samples']:,}"
                         ),
@@ -15655,6 +15494,10 @@ if __name__ == "__main__":
                         'block_z_col': cfg.get('block_z_col'),
                         'block_value_cols': selected_columns,
                         'block_size': cfg.get('block_size'),
+                        'block_size_cols': cfg.get('block_model_source_size_cols'),
+                        'block_domain_col': cfg.get('block_domain_col'),
+                        'sample_filters': cfg.get('block_domain_sample_filters'),
+                        'block_filters': cfg.get('block_volume_weighted_filters'),
                     },
                     handle_success,
                     'An error occurred during block value transfer',
