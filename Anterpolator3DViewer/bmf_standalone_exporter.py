@@ -46,6 +46,8 @@ _LOGGED_LEAPFROG_METADATA_SIGNATURES: set[tuple[str, str, tuple[str, ...]]] = se
 GRID_INDEX_COLUMNS = ("grid_i", "grid_j", "grid_k")
 GEOMETRY_EXTENT_COLUMNS = ("__lower_x", "__upper_x", "__lower_y", "__upper_y", "__lower_z", "__upper_z")
 GEOMETRY_SIZE_COLUMN_ROLES = ("dx", "dy", "dz")
+BMF_COMPAT_GEOMETRY_COLUMNS = ("block_id", "centroid_x", "centroid_y", "centroid_z", "dim_x", "dim_y", "dim_z", "volume")
+TBMS_INTERNAL_EXPORT_COLUMNS = {"__voxel", "__voxel_table"}
 MAX_REPORTED_VALUE_EXCEPTION_TOKENS = 100
 BMF_NUMERIC_TYPE_ERRORS_MARKER = "BMF_NUMERIC_TYPE_ERRORS_JSON:"
 
@@ -3589,8 +3591,12 @@ class _TbmsConfigParser:
         return value
 
     def _skip_ws(self) -> None:
-        while self.pos < self.length and ord(self.text[self.pos]) <= 32:
-            self.pos += 1
+        while self.pos < self.length:
+            code = ord(self.text[self.pos])
+            if code <= 32 or code >= 127:
+                self.pos += 1
+                continue
+            break
 
     def _peek(self) -> str:
         if self.pos >= self.length:
@@ -3761,7 +3767,7 @@ def _looks_like_tbms_config(parsed: object) -> bool:
     )
 
 
-def _score_tbms_config_result(result: Dict[str, object] | None) -> int:
+def _score_tbms_config_result(result: Dict[str, object] | None, file_size: int | None = None) -> int:
     if result is None:
         return -1
     parsed = result.get("parsed")
@@ -3778,6 +3784,9 @@ def _score_tbms_config_result(result: Dict[str, object] | None) -> int:
         if "location" in fields.columns:
             locations = pd.to_numeric(fields["location"], errors="coerce").fillna(0)
             score += int((locations > 0).sum()) * 10
+            if file_size is not None and file_size > 0:
+                score += int(((locations > 0) & (locations < file_size)).sum()) * 20
+                score -= int((locations >= file_size).sum()) * 200
     except Exception:
         pass
     return score
@@ -3979,26 +3988,38 @@ def _extract_tbms_text_tree_config_block(path: Path, root_offset: int, max_depth
 
 def _find_tbms_config_block(path: Path, search_start: int = 0x5000, max_scan: int = 2 * 1024 * 1024) -> Dict[str, object] | None:
     candidates: List[Dict[str, object]] = []
+    seen_spans: set[tuple[int, int]] = set()
+    file_size = path.stat().st_size
+
+    def add_candidate(result: Dict[str, object] | None) -> None:
+        if result is None:
+            return
+        start = int(result.get("start", -1))
+        end = int(result.get("end", -1))
+        span = (start, end)
+        if span in seen_spans:
+            return
+        seen_spans.add(span)
+        candidates.append(result)
+
     with path.open("rb") as fh:
         header = fh.read(64)
     if len(header) >= 56 and header.startswith(TBMS_SIGNATURE):
         header_offsets = struct.unpack("<8Q", header)
         for pointer in (header_offsets[3], header_offsets[5]):
-            if pointer <= 0 or pointer >= path.stat().st_size:
+            if pointer <= 0 or pointer >= file_size:
                 continue
             try:
                 result = _extract_tbms_text_tree_config_block(path, int(pointer))
             except Exception:
                 result = None
-            if result is not None:
-                candidates.append(result)
+            add_candidate(result)
 
             try:
                 result = _extract_tbms_segmented_config_block(path, int(pointer))
             except Exception:
                 result = None
-            if result is not None:
-                candidates.append(result)
+            add_candidate(result)
 
             for delta in (0, 8):
                 candidate_start = int(pointer) + delta
@@ -4011,45 +4032,50 @@ def _find_tbms_config_block(path: Path, search_start: int = 0x5000, max_scan: in
                     result = _extract_balanced_brace_block(path, candidate_start, max_scan=max_scan)
                 except Exception:
                     result = None
-                if result is not None:
-                    candidates.append(result)
-
-        if candidates:
-            return max(candidates, key=_score_tbms_config_result)
+                add_candidate(result)
 
     anchors = [b"created", b"n_blocks", b"origin_x", b"lower_x", b"schema_0"]
     back_window = 256 * 1024
 
     for anchor in anchors:
-        anchor_offset = _find_bytes(path, anchor, start=search_start)
-        if anchor_offset < 0:
-            continue
+        anchor_search_start = search_start
+        for _ in range(16):
+            anchor_offset = _find_bytes(path, anchor, start=anchor_search_start)
+            if anchor_offset < 0:
+                break
 
-        with path.open("rb") as fh:
-            back_start = max(search_start, anchor_offset - back_window)
-            fh.seek(back_start)
-            back_data = fh.read(anchor_offset - back_start + len(anchor))
+            with path.open("rb") as fh:
+                back_start = max(search_start, anchor_offset - back_window)
+                fh.seek(back_start)
+                back_data = fh.read(anchor_offset - back_start + len(anchor))
 
-        brace_positions = [
-            back_start + idx
-            for idx, byte in enumerate(back_data)
-            if byte == 0x7B
-        ]
-        for candidate_start in brace_positions:
-            try:
-                result = _extract_balanced_brace_block(path, candidate_start, max_scan=max_scan)
-            except Exception:
-                result = None
-            if result is not None:
-                return result
+            brace_positions = [
+                back_start + idx
+                for idx, byte in enumerate(back_data)
+                if byte == 0x7B
+            ]
+            for candidate_start in brace_positions:
+                try:
+                    result = _extract_balanced_brace_block(path, candidate_start, max_scan=max_scan)
+                except Exception:
+                    result = None
+                add_candidate(result)
+
+            anchor_search_start = anchor_offset + 1
 
     first_brace = _find_bytes(path, b"{", start=search_start)
-    if first_brace < 0:
+    if first_brace >= 0:
+        try:
+            add_candidate(_extract_balanced_brace_block(path, first_brace, max_scan=max_scan))
+        except Exception:
+            pass
+
+    if not candidates:
         return None
-    try:
-        return _extract_balanced_brace_block(path, first_brace, max_scan=max_scan)
-    except Exception:
-        return None
+    return max(
+        candidates,
+        key=lambda candidate: (_score_tbms_config_result(candidate, file_size=file_size), int(candidate.get("start", 0))),
+    )
 
 
 def _sanitize_tbms_key(key: str) -> str:
@@ -4195,6 +4221,45 @@ def _decode_tbms_field_values(
     return values[:row_limit]
 
 
+def _tbms_constant_field_values(field: Mapping[str, object], field_type: object, row_limit: int) -> np.ndarray | None:
+    if row_limit <= 0:
+        return None
+
+    default_value = None
+    for key in ("default", "global"):
+        candidate = field.get(key)
+        if candidate in (None, ""):
+            continue
+        if isinstance(candidate, float) and pd.isna(candidate):
+            continue
+        default_value = candidate
+        break
+    if default_value is None:
+        return None
+
+    normalized_type = str(field_type or "").strip().lower()
+    dtype = _tbms_numeric_dtype(field_type)
+
+    try:
+        if normalized_type == "boolean":
+            text = str(default_value).strip().lower()
+            value = text in {"1", "true", "t", "yes", "y"}
+            return np.full(row_limit, value, dtype=bool)
+        if dtype is not None:
+            if np.issubdtype(dtype, np.integer):
+                value = int(float(default_value))
+            elif np.issubdtype(dtype, np.floating):
+                value = float(default_value)
+            else:
+                value = default_value
+            return np.full(row_limit, value, dtype=dtype)
+    except Exception:
+        return None
+
+    text_value = "" if default_value is None else str(default_value)
+    return np.full(row_limit, text_value, dtype=object)
+
+
 def _tbms_grid_spec(metadata: Dict[str, object]) -> Dict[str, np.ndarray] | None:
     dims = np.asarray([
         int(metadata.get("schema_0.dim_x", metadata.get("dim_x", metadata.get("voxel_dim_x", 0))) or 0),
@@ -4263,6 +4328,107 @@ def _build_tbms_grid_frame(metadata: Dict[str, object], rows_to_load: int) -> pd
         "z": origin[2] + local_lower_z + 0.5 * cell[2],
     })
     return frame
+
+
+def _ordered_bmf_export_value_columns(frame: pd.DataFrame, fields: Sequence[Mapping[str, object]] | None = None) -> list[str]:
+    excluded = set(GRID_INDEX_COLUMNS) | set(GEOMETRY_EXTENT_COLUMNS) | set(BMF_COMPAT_GEOMETRY_COLUMNS) | TBMS_INTERNAL_EXPORT_COLUMNS | {"x", "y", "z"}
+    ordered: list[str] = []
+    seen: set[str] = set()
+    sortable: list[tuple[tuple[int, int], str]] = []
+
+    for index, field in enumerate(fields or []):
+        name = str(field.get("name") or "").strip()
+        if not name or name in seen or name not in frame.columns or name in excluded:
+            continue
+        entry_key = str(field.get("entry_key") or "").strip()
+        match = re.fullmatch(r"var_(\d+)", entry_key)
+        if match:
+            sortable.append(((0, int(match.group(1))), name))
+        else:
+            sortable.append(((1, index), name))
+        seen.add(name)
+
+    ordered.extend(name for _sort_key, name in sorted(sortable, key=lambda item: item[0]))
+    ordered.extend(
+        str(column)
+        for column in frame.columns
+        if str(column) not in seen and str(column) not in excluded
+    )
+    return ordered
+
+
+def build_bmf_csv_export_frame(result: Mapping[str, object] | pd.DataFrame) -> pd.DataFrame:
+    if isinstance(result, pd.DataFrame):
+        frame = result.copy()
+        metadata: Dict[str, object] = {}
+        fields: Sequence[Mapping[str, object]] = []
+    else:
+        rows_frame = result.get("dataframe")
+        frame = rows_frame.copy() if isinstance(rows_frame, pd.DataFrame) else pd.DataFrame()
+        metadata = dict(result.get("metadata") or {})
+        raw_fields = result.get("fields") or []
+        fields = [field for field in raw_fields if isinstance(field, Mapping)]
+
+    if frame.empty:
+        return frame
+
+    export_frame = frame.copy()
+    row_count = len(export_frame)
+    export_frame["block_id"] = np.arange(1, row_count + 1, dtype=np.int64)
+
+    compatible_centroids = False
+    compatible_sizes = False
+
+    if all(column in export_frame.columns for column in GEOMETRY_EXTENT_COLUMNS):
+        lower_x = pd.to_numeric(export_frame["__lower_x"], errors="coerce")
+        upper_x = pd.to_numeric(export_frame["__upper_x"], errors="coerce")
+        lower_y = pd.to_numeric(export_frame["__lower_y"], errors="coerce")
+        upper_y = pd.to_numeric(export_frame["__upper_y"], errors="coerce")
+        lower_z = pd.to_numeric(export_frame["__lower_z"], errors="coerce")
+        upper_z = pd.to_numeric(export_frame["__upper_z"], errors="coerce")
+        dim_x = upper_x - lower_x
+        dim_y = upper_y - lower_y
+        dim_z = upper_z - lower_z
+        export_frame["centroid_x"] = (lower_x + upper_x) * 0.5
+        export_frame["centroid_y"] = (lower_y + upper_y) * 0.5
+        export_frame["centroid_z"] = (lower_z + upper_z) * 0.5
+        export_frame["dim_x"] = dim_x
+        export_frame["dim_y"] = dim_y
+        export_frame["dim_z"] = dim_z
+        export_frame["volume"] = dim_x * dim_y * dim_z
+        compatible_centroids = True
+        compatible_sizes = True
+    else:
+        if all(column in export_frame.columns for column in ("x", "y", "z")):
+            export_frame["centroid_x"] = pd.to_numeric(export_frame["x"], errors="coerce")
+            export_frame["centroid_y"] = pd.to_numeric(export_frame["y"], errors="coerce")
+            export_frame["centroid_z"] = pd.to_numeric(export_frame["z"], errors="coerce")
+            compatible_centroids = True
+        spec = _tbms_grid_spec(metadata)
+        if spec is not None:
+            cell = np.asarray(spec["cell"], dtype=float)
+            export_frame["dim_x"] = np.full(row_count, float(cell[0]), dtype=float)
+            export_frame["dim_y"] = np.full(row_count, float(cell[1]), dtype=float)
+            export_frame["dim_z"] = np.full(row_count, float(cell[2]), dtype=float)
+            export_frame["volume"] = float(cell[0] * cell[1] * cell[2])
+            compatible_sizes = True
+
+    hidden_geometry_columns: set[str] = set()
+    if compatible_centroids:
+        hidden_geometry_columns.update({"x", "y", "z"})
+    if compatible_sizes:
+        hidden_geometry_columns.update(GRID_INDEX_COLUMNS)
+        hidden_geometry_columns.update(GEOMETRY_EXTENT_COLUMNS)
+    hidden_geometry_columns.update(TBMS_INTERNAL_EXPORT_COLUMNS)
+
+    ordered_columns = [column for column in BMF_COMPAT_GEOMETRY_COLUMNS if column in export_frame.columns]
+    ordered_columns.extend(_ordered_bmf_export_value_columns(export_frame, fields=fields))
+    ordered_columns.extend(
+        str(column)
+        for column in export_frame.columns
+        if str(column) not in ordered_columns and str(column) not in hidden_geometry_columns
+    )
+    return export_frame.loc[:, ordered_columns].copy()
 
 
 def _probe_tbms_first_page(path: Path, first_offset: int | None = None) -> Dict[str, object]:
@@ -4579,6 +4745,8 @@ def _load_tbms_config_variant(
                 field_type=field_type,
                 row_limit=rows_to_load,
             )
+            if (values is None or len(values) < rows_to_load) and loc <= 0:
+                values = _tbms_constant_field_values(field, field_type, rows_to_load)
             if values is None or len(values) < rows_to_load:
                 skipped_fields.append(name)
                 continue

@@ -29,6 +29,13 @@ def _display_value(value: Any) -> str:
     return str(value)
 
 
+def _normalize_path_text(value: object) -> str:
+    text = str(value or "").strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text
+
+
 def _metadata_frame(result: dict[str, Any]) -> pd.DataFrame:
     report = dict(result.get("report") or {})
     metadata = dict(result.get("metadata") or {})
@@ -870,6 +877,7 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         self.save_bmf_csv_button.clicked.connect(self._save_bmf_csv)
         self.save_bmf_csv_button.setEnabled(False)
         self.reader_mode_label = QtWidgets.QLabel("Reader mode: n/a")
+        self.browse_input_edit.textChanged.connect(lambda _: self._sync_browse_output_path())
         button_row.addWidget(self.load_bmf_button)
         button_row.addWidget(self.save_bmf_csv_button)
         button_row.addWidget(self.reader_mode_label)
@@ -1202,9 +1210,20 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         )
 
     def _sync_export_output_path(self) -> None:
-        input_path = self.export_input_edit.text().strip()
-        if input_path and not self.export_output_edit.text().strip():
+        input_path = _normalize_path_text(self.export_input_edit.text())
+        if input_path and not _normalize_path_text(self.export_output_edit.text()):
             self.export_output_edit.setText(str(Path(input_path).with_suffix(".bmf")))
+
+    def _sync_browse_output_path(self) -> None:
+        input_path = _normalize_path_text(self.browse_input_edit.text())
+        if input_path and not _normalize_path_text(self.browse_output_edit.text()):
+            self.browse_output_edit.setText(str(Path(input_path).with_suffix(".csv")))
+
+    def _normalize_line_edit_path(self, line_edit: QtWidgets.QLineEdit) -> str:
+        normalized = _normalize_path_text(line_edit.text())
+        if normalized != line_edit.text():
+            line_edit.setText(normalized)
+        return normalized
 
     def _get_cell_size(self) -> list[float] | None:
         values = [float(self.cell_x_spin.value()), float(self.cell_y_spin.value()), float(self.cell_z_spin.value())]
@@ -2133,12 +2152,12 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         thread.start()
 
     def _save_bmf_csv(self) -> None:
-        input_path = self.browse_input_edit.text().strip()
+        input_path = self._normalize_line_edit_path(self.browse_input_edit)
         if not input_path:
             QtWidgets.QMessageBox.warning(self, "Missing File", "Select a BMF file first.")
             return
 
-        output_path = self.browse_output_edit.text().strip()
+        output_path = self._normalize_line_edit_path(self.browse_output_edit)
         if not output_path:
             output_path = str(Path(input_path).with_suffix(".csv")) if input_path else ""
             if output_path:
@@ -2163,9 +2182,10 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
 
         try:
             result = bmf_tools.load_bmf_table(input_path, row_limit=None)
-            rows_frame = result.get("dataframe")
-            if not isinstance(rows_frame, pd.DataFrame):
+            raw_rows_frame = result.get("dataframe")
+            if not isinstance(raw_rows_frame, pd.DataFrame):
                 raise ValueError("This BMF reader mode did not produce tabular row data to save as CSV.")
+            rows_frame = bmf_tools.build_bmf_csv_export_frame(result)
             progress.setLabelText("Writing CSV file...")
             QtWidgets.QApplication.processEvents()
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -2183,7 +2203,7 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, "CSV Saved", f"Saved {len(rows_frame):,} rows to:\n{output_path}")
 
     def _load_bmf(self) -> None:
-        path = self.browse_input_edit.text().strip()
+        path = self._normalize_line_edit_path(self.browse_input_edit)
         if not path:
             QtWidgets.QMessageBox.warning(self, "Missing File", "Select a BMF file first.")
             return
