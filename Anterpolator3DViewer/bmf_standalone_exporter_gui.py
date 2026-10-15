@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Standalone GUI for BMF export and browsing."""
 
 from __future__ import annotations
@@ -818,12 +818,12 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
         self.upper_y_col_combo.currentTextChanged.connect(lambda _: self._refresh_export_columns())
         self.lower_z_col_combo.currentTextChanged.connect(lambda _: self._refresh_export_columns())
         self.upper_z_col_combo.currentTextChanged.connect(lambda _: self._refresh_export_columns())
-        self.value_cols_table.itemChanged.connect(lambda _item: self._update_value_summary())
+        self.value_cols_table.itemChanged.connect(lambda _: self._update_value_summary())
         self.select_all_value_cols_button.clicked.connect(lambda: self._set_all_value_columns_checked(True))
         self.clear_value_cols_button.clicked.connect(lambda: self._set_all_value_columns_checked(False))
         self.add_exception_button.clicked.connect(self._add_exception_row)
         self.remove_exception_button.clicked.connect(self._remove_selected_exception_rows)
-        self.exception_table.itemChanged.connect(lambda _item: self._update_exception_summary())
+        self.exception_table.itemChanged.connect(lambda _: self._update_exception_summary())
         self.regularize_base_blocks_check.toggled.connect(self._update_regularize_warning)
         self.regularize_base_blocks_check.toggled.connect(lambda _: self._refresh_metadata_cell_size())
         self._update_regularize_warning()
@@ -1576,7 +1576,7 @@ class BmfStandaloneWindow(QtWidgets.QMainWindow):
                 combo.setCurrentIndex(max(combo.findData(default_type), 0))
                 combo.setProperty("bmf_inferred_type", inferred_type if not has_explicit_type else "")
                 combo.setProperty("bmf_type_is_explicit", has_explicit_type)
-                combo.activated.connect(lambda _index, cb=combo: cb.setProperty("bmf_type_is_explicit", True))
+                combo.activated.connect(lambda _, cb=combo: cb.setProperty("bmf_type_is_explicit", True))
                 self.value_cols_table.setCellWidget(row_index, 1, combo)
 
             self._pending_export_value_cols = None

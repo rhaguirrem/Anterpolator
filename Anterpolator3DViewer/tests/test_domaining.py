@@ -66,6 +66,182 @@ def _capture_progress_events():
     return events, callback
 
 
+def _write_regular_subblock_csv(path, rows, factors=(3, 3, 3)):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("# rotation type: Leapfrog\n")
+        handle.write("# azimuth: 0 degrees\n# dip: 0 degrees\n# pitch: 0 degrees\n")
+        handle.write("# minimum corner: 0, 0, 0\n")
+        handle.write("# parent block size: 15, 15, 15\n")
+        handle.write("# sub-blocks: regular " + ", ".join(str(value) for value in factors) + "\n")
+        pd.DataFrame(rows).to_csv(handle, index=False)
+
+
+@pytest.mark.parametrize("explicit_sizes", [False, True])
+def test_regular_metadata_geometry_precedes_centroid_inference(explicit_sizes):
+    df = pd.DataFrame([{"x": 2.5, "y": 2.5, "z": 2.5, "dx": 2, "dy": 3, "dz": 4}])
+    metadata = {
+        "parent_block_size": [15, 15, 15],
+        "subblock_scheme": "regular",
+        "subblock_factors": [3, 3, 3],
+    }
+    geometry = viewer_module._resolve_block_row_geometry(
+        df, ("x", "y", "z"), (15, 15, 15),
+        ("dx", "dy", "dz") if explicit_sizes else None,
+        metadata=metadata,
+    )
+    expected = [[2, 3, 4]] if explicit_sizes else [[5, 5, 5]]
+    np.testing.assert_allclose(geometry["sizes"], expected)
+    assert geometry["mode"] == ("explicit-size-columns" if explicit_sizes else "regular-subblock-metadata")
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_sample_transfer_uses_regular_metadata_for_incomplete_parent(filtered):
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        samples_path = os.path.join(td, "samples.csv")
+        output_path = os.path.join(td, "output.csv")
+        rows = [
+            {"x": 2.5, "y": 2.5, "z": 2.5, "grade": 10},
+            {"x": 12.5, "y": 2.5, "z": 2.5, "grade": 30},
+        ]
+        if filtered:
+            rows.append({"x": 7.5, "y": 2.5, "z": 2.5, "grade": 20})
+        _write_regular_subblock_csv(blocks_path, rows)
+        pd.DataFrame([
+            {"x": 4.9, "y": 2.5, "z": 2.5},
+            {"x": 6.0, "y": 2.5, "z": 2.5},
+            {"x": 10.1, "y": 2.5, "z": 2.5},
+        ]).to_csv(samples_path, index=False)
+        result = export_samples_with_block_values_from_blocks(
+            samples_path, blocks_path, output_file=output_path,
+            sample_x_col="x", sample_y_col="y", sample_z_col="z",
+            block_x_col="x", block_y_col="y", block_z_col="z",
+            block_value_cols=["grade"], block_size=(15, 15, 15),
+            block_filters=[{"field": "grade", "type": "categorical", "values": ["10", "30"]}] if filtered else None,
+        )
+        assert result["block_geometry_mode"] == "regular-subblock-metadata"
+        assert result["subblock_matched_samples"] == 2
+        assert result["nearest_block_matched_samples"] == 1
+        assert pd.read_csv(output_path)["grade"].tolist() == [10, 10, 30]
+
+
+def test_regular_metadata_volume_of_incomplete_parent():
+    with tempfile.TemporaryDirectory() as td:
+        blocks_path = os.path.join(td, "blocks.csv")
+        _write_regular_subblock_csv(blocks_path, [
+            {"x": 2.5, "y": 2.5, "z": 2.5, "grade": 10},
+        ])
+        result = export_block_volume_weighted_average(
+            blocks_path, "grade", output_file=os.path.join(td, "summary.csv"),
+            block_x_col="x", block_y_col="y", block_z_col="z", block_size=(15, 15, 15),
+        )
+        assert result["total_volume"] == 125
+
+
+@pytest.mark.parametrize("scheme", ["octree", "", "unknown"])
+def test_nonregular_metadata_preserves_centroid_inference(scheme):
+    metadata = {
+        "parent_block_size": [15, 15, 15], "subblock_scheme": scheme, "subblock_factors": [3, 3, 3],
+    }
+    df = pd.DataFrame([{"x": 7.5, "y": 7.5, "z": 7.5}])
+    geometry = viewer_module._resolve_block_row_geometry(
+        df, ("x", "y", "z"), (15, 15, 15), metadata=metadata,
+    )
+    np.testing.assert_allclose(geometry["sizes"], [[15, 15, 15]])
+    assert geometry["mode"] == "inferred-from-base-grid"
+
+
+@pytest.mark.parametrize("factors", [[0, 3, 3], [-1, 3, 3], [1.5, 3, 3], [3, 3], [np.nan, 3, 3]])
+def test_invalid_regular_subblock_metadata_is_rejected(factors):
+    with pytest.raises(ValueError, match="Invalid regular sub-block metadata"):
+        viewer_module._regular_subblock_size_from_metadata({
+            "parent_block_size": [15, 15, 15], "subblock_scheme": "regular", "subblock_factors": factors,
+        })
+
+
+def test_regular_metadata_supports_anisotropic_subdivision():
+    np.testing.assert_allclose(viewer_module._regular_subblock_size_from_metadata({
+        "parent_block_size": [15, 20, 12], "subblock_scheme": "regular", "subblock_factors": [3, 4, 2],
+    }), [5, 5, 6])
+
+
+def test_regular_metadata_complete_three_by_three_by_three_parent():
+    coords = np.array([
+        (x, y, z) for x in (2.5, 7.5, 12.5) for y in (2.5, 7.5, 12.5) for z in (2.5, 7.5, 12.5)
+    ]) + np.array([649800, 4766250, -700])
+    metadata = {
+        "parent_block_size": [15, 15, 15], "subblock_scheme": "regular", "subblock_factors": [3, 3, 3],
+        "minimum_corner": [649800, 4766250, -700],
+    }
+    lower, upper = viewer_module._resolve_subblock_bounds(
+        coords, np.zeros((27, 3), dtype=int), metadata["minimum_corner"], (15, 15, 15), metadata=metadata,
+    )
+    np.testing.assert_allclose(upper - lower, np.full((27, 3), 5))
+    volumes, indices = viewer_module.infer_block_row_volumes(coords, (15, 15, 15), metadata=metadata)
+    np.testing.assert_allclose(volumes, np.full(27, 125))
+    np.testing.assert_array_equal(indices, np.zeros((27, 3), dtype=int))
+    assert volumes.sum() == 3375
+
+
+def test_block_transfer_exact_prematch_respects_metadata_row_sizes():
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        output_path = os.path.join(td, "output.csv")
+        _write_regular_subblock_csv(source_path, [
+            {"x": 2.5, "y": 2.5, "z": 2.5, "grade": 10},
+            {"x": 7.5, "y": 2.5, "z": 2.5, "grade": 30},
+        ])
+        _write_regular_subblock_csv(target_path, [
+            {"x": 7.5, "y": 7.5, "z": 7.5},
+        ], factors=(1, 1, 1))
+        result = export_blocks_with_source_block_values(
+            source_path, target_path, output_file=output_path,
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="x", target_y_col="y", target_z_col="z",
+            source_value_cols=["grade"], source_block_size=(15, 15, 15),
+            target_block_size=(15, 15, 15), nearest_fallback=False,
+        )
+        assert result["overlap_matched_blocks"] == 1
+        assert pd.read_csv(output_path)["grade"].tolist() == [20]
+
+
+@pytest.mark.parametrize("metadata_model", ["source", "target"])
+def test_block_transfer_regular_metadata_does_not_fill_missing_subblocks(metadata_model, monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        output_path = os.path.join(td, "output.csv")
+        if metadata_model == "source":
+            _write_regular_subblock_csv(source_path, [
+                {"x": 2.5, "y": 2.5, "z": 2.5, "grade": 10},
+            ])
+            pd.DataFrame([
+                {"x": 6, "y": 2.5, "z": 2.5, "dx": 1, "dy": 1, "dz": 1},
+            ]).to_csv(target_path, index=False)
+            size_kwargs = {"target_size_cols": ("dx", "dy", "dz")}
+        else:
+            pd.DataFrame([
+                {"x": 7.5, "y": 2.5, "z": 2.5, "grade": 10, "dx": 1, "dy": 1, "dz": 1},
+            ]).to_csv(source_path, index=False)
+            _write_regular_subblock_csv(target_path, [
+                {"x": 2.5, "y": 2.5, "z": 2.5},
+                {"x": 12.5, "y": 2.5, "z": 2.5},
+            ])
+            size_kwargs = {"source_size_cols": ("dx", "dy", "dz")}
+        monkeypatch.setattr(viewer_module, "BLOCK_MODEL_TRANSFER_TARGET_CHUNK_SIZE", 1)
+        result = export_blocks_with_source_block_values(
+            source_path, target_path, output_file=output_path,
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="x", target_y_col="y", target_z_col="z",
+            source_value_cols=["grade"], source_block_size=(15, 15, 15),
+            target_block_size=(15, 15, 15), nearest_fallback=False, **size_kwargs,
+        )
+        assert result["overlap_matched_blocks"] == 0
+        assert pd.read_csv(output_path)["grade"].isna().all()
+        assert result[f"{metadata_model}_geometry_mode"] == "regular-subblock-metadata"
+
+
 def test_streaming_metadata_collapses_subblocks_to_base_blocks():
     with tempfile.TemporaryDirectory() as td:
         blocks_path = os.path.join(td, "blocks.csv")
@@ -976,11 +1152,14 @@ def test_export_blocks_with_source_values_exact_prematch_skips_matched_targets(m
         target_geometry_sizes = []
 
         def wrapped_resolve(df, coordinate_columns, base_block_size, size_columns=None,
-                            progress_callback=None, progress_label='Resolving block geometry'):
+                            progress_callback=None, progress_label='Resolving block geometry', metadata=None):
             if 'target_id' in df.columns:
                 target_geometry_sizes.append(len(df))
                 assert len(df) == 1
-            return original_resolve(df, coordinate_columns, base_block_size, size_columns, progress_callback, progress_label)
+            return original_resolve(
+                df, coordinate_columns, base_block_size, size_columns, progress_callback, progress_label,
+                metadata=metadata,
+            )
 
         monkeypatch.setattr(viewer_module, "_resolve_block_row_geometry", wrapped_resolve)
 
@@ -1147,6 +1326,108 @@ def test_export_blocks_with_source_values_respects_max_nearest_distance():
         assert result["overlap_matched_blocks"] == 0
         assert result["nearest_matched_blocks"] == 0
         assert result["unmatched_blocks"] == 1
+
+
+def test_export_blocks_with_source_values_domain_wise_prefers_same_domain_and_cross_domain_is_last_resort():
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        pd.DataFrame([
+            {"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A", "grade": 1.0},
+            {"x": 25.0, "y": 5.0, "z": 5.0, "dom": "B", "grade": 2.0},
+        ]).to_csv(source_path, index=False)
+        pd.DataFrame([
+            {"x": 35.0, "y": 5.0, "z": 5.0, "tdom": "A", "target_id": "nearest_other_domain"},
+            {"x": 25.0, "y": 5.0, "z": 5.0, "tdom": "A", "target_id": "overlaps_other_domain"},
+            {"x": 25.0, "y": 5.0, "z": 5.0, "tdom": "B", "target_id": "overlaps_same_domain"},
+            {"x": 35.0, "y": 5.0, "z": 5.0, "tdom": "C", "target_id": "unknown_domain"},
+            {"x": 35.0, "y": 5.0, "z": 5.0, "tdom": "", "target_id": "blank_domain"},
+        ]).to_csv(target_path, index=False)
+
+        common = dict(
+            source_x_col="x", source_y_col="y", source_z_col="z",
+            target_x_col="x", target_y_col="y", target_z_col="z",
+            source_value_cols=["grade"],
+            source_block_size=(10, 10, 10),
+            target_block_size=(10, 10, 10),
+        )
+
+        plain_output = os.path.join(td, "plain.csv")
+        export_blocks_with_source_block_values(source_path, target_path, output_file=plain_output, **common)
+        plain_df = pd.read_csv(plain_output).set_index("target_id")
+        assert plain_df.loc["nearest_other_domain", "grade"] == pytest.approx(2.0)
+
+        # Default: overlap takes precedence over domain, other-domain blocks allowed as a last resort.
+        domain_output = os.path.join(td, "domain.csv")
+        result = export_blocks_with_source_block_values(
+            source_path, target_path, output_file=domain_output,
+            source_domain_col="dom", target_domain_col="tdom", **common,
+        )
+        domain_df = pd.read_csv(domain_output).set_index("target_id")
+        assert domain_df.loc["nearest_other_domain", "grade"] == pytest.approx(1.0)
+        assert domain_df.loc["overlaps_other_domain", "grade"] == pytest.approx(2.0)
+        assert domain_df.loc["overlaps_same_domain", "grade"] == pytest.approx(2.0)
+        assert domain_df.loc["unknown_domain", "grade"] == pytest.approx(2.0)
+        assert domain_df.loc["blank_domain", "grade"] == pytest.approx(2.0)
+        assert result["domain_wise"] is True
+        assert result["cross_domain_matched_blocks"] == 2
+
+        # Overlap precedence kept, cross-domain nearest disallowed.
+        strict_output = os.path.join(td, "strict.csv")
+        strict_result = export_blocks_with_source_block_values(
+            source_path, target_path, output_file=strict_output,
+            source_domain_col="dom", target_domain_col="tdom",
+            allow_cross_domain_fallback=False, **common,
+        )
+        strict_df = pd.read_csv(strict_output).set_index("target_id")
+        assert pd.isna(strict_df.loc["unknown_domain", "grade"])
+        assert strict_df.loc["blank_domain", "grade"] == pytest.approx(2.0)
+        assert strict_df.loc["nearest_other_domain", "grade"] == pytest.approx(1.0)
+        assert strict_df.loc["overlaps_other_domain", "grade"] == pytest.approx(2.0)
+        assert strict_result["cross_domain_matched_blocks"] == 1
+        assert strict_result["unmatched_blocks"] == 1
+
+        # Domain wins over overlap.
+        domain_first_output = os.path.join(td, "domain_first.csv")
+        domain_first_result = export_blocks_with_source_block_values(
+            source_path, target_path, output_file=domain_first_output,
+            source_domain_col="dom", target_domain_col="tdom",
+            overlap_precedence_over_domain=False, **common,
+        )
+        domain_first_df = pd.read_csv(domain_first_output).set_index("target_id")
+        assert domain_first_df.loc["overlaps_other_domain", "grade"] == pytest.approx(1.0)
+        assert domain_first_df.loc["overlaps_same_domain", "grade"] == pytest.approx(2.0)
+        assert domain_first_df.loc["unknown_domain", "grade"] == pytest.approx(2.0)
+        assert domain_first_result["cross_domain_matched_blocks"] == 1
+
+        # Domain wins over overlap and other domains are never used.
+        strictest_output = os.path.join(td, "strictest.csv")
+        strictest_result = export_blocks_with_source_block_values(
+            source_path, target_path, output_file=strictest_output,
+            source_domain_col="dom", target_domain_col="tdom",
+            overlap_precedence_over_domain=False, allow_cross_domain_fallback=False, **common,
+        )
+        strictest_df = pd.read_csv(strictest_output).set_index("target_id")
+        assert strictest_df.loc["overlaps_other_domain", "grade"] == pytest.approx(1.0)
+        assert pd.isna(strictest_df.loc["unknown_domain", "grade"])
+        assert strictest_result["cross_domain_matched_blocks"] == 0
+
+
+def test_export_blocks_with_source_values_domain_wise_requires_existing_target_domain_column():
+    with tempfile.TemporaryDirectory() as td:
+        source_path = os.path.join(td, "source.csv")
+        target_path = os.path.join(td, "target.csv")
+        pd.DataFrame([{"x": 5.0, "y": 5.0, "z": 5.0, "dom": "A", "grade": 1.0}]).to_csv(source_path, index=False)
+        pd.DataFrame([{"x": 5.0, "y": 5.0, "z": 5.0}]).to_csv(target_path, index=False)
+        with pytest.raises(ValueError, match="Target domain column"):
+            export_blocks_with_source_block_values(
+                source_path, target_path, output_file=os.path.join(td, "out.csv"),
+                source_x_col="x", source_y_col="y", source_z_col="z",
+                target_x_col="x", target_y_col="y", target_z_col="z",
+                source_value_cols=["grade"],
+                source_block_size=(10, 10, 10), target_block_size=(10, 10, 10),
+                source_domain_col="dom", target_domain_col="missing",
+            )
 
 
 def test_export_block_model_with_table_attributes_matches_multiple_keys_and_columns():

@@ -12,6 +12,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timezone
 import json
 import math
@@ -220,9 +221,12 @@ def parse_header_line(path: str | Path, delimiter: str, line_number: int) -> lis
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for current, line in enumerate(handle, start=1):
             if current == line_number:
-                tokens = [token.strip() for token in line.rstrip("\r\n").split(delimiter)]
-                tokens = [token for token in tokens if token]
-                if not tokens:
+                if len(delimiter) == 1:
+                    tokens = next(csv.reader([line], delimiter=delimiter))
+                else:
+                    tokens = line.rstrip("\r\n").split(delimiter)
+                tokens = [token.strip() for token in tokens]
+                if not any(tokens):
                     raise ValueError(f"Parsed header line {line_number} in '{path.name}' produced no tokens.")
                 return tokens
     raise ValueError(f"Header line {line_number} exceeds total lines in file '{path.name}'.")

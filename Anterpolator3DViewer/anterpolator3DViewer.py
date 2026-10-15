@@ -356,7 +356,7 @@ def create_interpolator(config, domain=None, current_algorithm=None):
 def parse_header_line(path, delimiter, line_number):
     """Return list of header tokens from the specified 1-based line number.
     If line_number is 1 we still parse it manually for consistency.
-    Whitespace trimmed; empty tokens filtered out.
+    CSV quoting is respected and whitespace trimmed; empty column positions are retained.
     Raises ValueError if the line does not exist or no tokens found."""
     if not os.path.isfile(path):
         raise ValueError(f"File not found: {path}")
@@ -405,6 +405,27 @@ def parse_leapfrog_block_metadata(path, max_lines=100):
     if not path or is_bmf_file(path):
         return {}
     return _get_bmf_tools_module().parse_leapfrog_block_metadata(path, max_lines=max_lines)
+
+
+def _regular_subblock_size_from_metadata(metadata):
+    metadata = metadata or {}
+    if str(metadata.get('subblock_scheme', '')).strip().lower() != 'regular':
+        return None
+    if 'parent_block_size' not in metadata or 'subblock_factors' not in metadata:
+        return None
+    parent_size = np.asarray(metadata['parent_block_size'], dtype=float)
+    factors = np.asarray(metadata['subblock_factors'], dtype=float)
+    if (
+        parent_size.shape != (3,) or factors.shape != (3,)
+        or not np.isfinite(parent_size).all() or not np.isfinite(factors).all()
+        or np.any(parent_size <= 0) or np.any(factors < 1)
+        or np.any(factors != np.floor(factors))
+    ):
+        raise ValueError(
+            'Invalid regular sub-block metadata: parent sizes must be positive and '
+            'subdivision factors must be three positive integers.'
+        )
+    return parent_size / factors
 
 
 def _format_metadata_vector(metadata, key):
@@ -1089,12 +1110,14 @@ def _encode_block_index_keys(indices):
     return keys, in_range
 
 
-def _resolve_subblock_bounds(coords, parent_indices, grid_origin, parent_dims, sizes=None):
+def _resolve_subblock_bounds(coords, parent_indices, grid_origin, parent_dims, sizes=None, metadata=None):
     """Return per-row sub-block lower/upper bounds within each base block."""
     coords = np.asarray(coords, dtype=float)
     if len(coords) == 0:
         empty = np.empty((0, 3), dtype=float)
         return empty, empty.copy()
+    if sizes is None:
+        sizes = _regular_subblock_size_from_metadata(metadata)
     if sizes is not None:
         half_sizes = np.asarray(sizes, dtype=float) / 2.0
         return coords - half_sizes, coords + half_sizes
@@ -5560,7 +5583,7 @@ def _infer_subblock_axis_widths(local_axis_values, axis_extent, tolerance):
 
 
 def infer_block_row_volumes(block_coords, block_size, group_indices=None,
-                            progress_callback=None, progress_label='Inferring block volumes'):
+                            progress_callback=None, progress_label='Inferring block volumes', metadata=None):
     coords = np.asarray(block_coords, dtype=float)
     if coords.ndim != 2 or coords.shape[1] != 3:
         raise ValueError('Block coordinates must be an Nx3 array.')
@@ -5578,6 +5601,22 @@ def infer_block_row_volumes(block_coords, block_size, group_indices=None,
     if len(coords) == 0:
         empty_indices = np.empty((0, 3), dtype=int)
         return np.empty(0, dtype=float), empty_indices
+
+    metadata_size = _regular_subblock_size_from_metadata(metadata)
+    if metadata_size is not None:
+        grid_origin = np.asarray(
+            metadata.get('minimum_corner', np.floor(coords.min(axis=0) / unified_dims) * unified_dims),
+            dtype=float,
+        )
+        base_indices = (
+            np.floor((coords - grid_origin) / unified_dims + 1e-6).astype(int)
+            if group_indices is None else np.asarray(group_indices, dtype=int)
+        )
+        if base_indices.shape != coords.shape:
+            raise ValueError('Group indices must match the shape of block coordinates.')
+        if progress_callback:
+            progress_callback(1, 1, progress_label)
+        return np.full(len(coords), float(np.prod(metadata_size))), base_indices
 
     all_min_bounds = np.floor(coords.min(axis=0) / unified_dims) * unified_dims
     if group_indices is None:
@@ -6419,7 +6458,9 @@ def export_block_domain_sample_metrics(samples_file, blocks_file, output_file=No
             rotation_matrix, rotation_center, is_rotated = detect_grid_rotation(volume_coords, block_size_hint=block_size)
             if is_rotated:
                 volume_coords = (volume_coords - rotation_center) @ rotation_matrix.T
-            row_volumes, _ = infer_block_row_volumes(volume_coords, block_size)
+            row_volumes, _ = infer_block_row_volumes(
+                volume_coords, block_size, metadata=parse_leapfrog_block_metadata(blocks_file),
+            )
             block_row_volumes[valid_block_mask.to_numpy()] = row_volumes
 
     summary_output_file = None
@@ -6859,6 +6900,7 @@ def export_block_volume_weighted_average(blocks_file, value_col, output_file=Non
                 block_size,
                 progress_callback=_make_scaled_progress_callback(progress_callback, 62, 92, 'Inferring block volumes...'),
                 progress_label='Inferring block volumes...',
+                metadata=parse_leapfrog_block_metadata(blocks_file),
             )
             inferred_volumes[valid_coord_mask.to_numpy()] = row_volumes
 
@@ -7365,6 +7407,14 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
     saw_values = {column_name: False for column_name in selected_columns}
 
     explicit_size_columns = _normalize_optional_size_columns(block_size_cols)
+    leapfrog_metadata = block_metadata.get('leapfrog_metadata', {})
+    metadata_size = (
+        None if explicit_size_columns else _regular_subblock_size_from_metadata(leapfrog_metadata)
+    )
+    geometry_mode = (
+        'explicit-size-columns' if explicit_size_columns else
+        'regular-subblock-metadata' if metadata_size is not None else 'inferred-from-base-grid'
+    )
     extra_block_columns = list(selected_columns) + list(explicit_size_columns or ())
 
     effective_header_line = resolve_effective_csv_header_line(blocks_file, blocks_header_line or 1)
@@ -7384,6 +7434,7 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
     print(
         'Sub-block geometry: '
         + ('explicit size columns ' + ', '.join(explicit_size_columns) if explicit_size_columns
+           else 'regular Leapfrog metadata ' + str(tuple(metadata_size)) if metadata_size is not None
            else 'inferred from the base block grid')
     )
 
@@ -7400,7 +7451,7 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
         parent_indices = np.floor((coords - grid_origin) / parent_dims + 1e-6).astype(np.int64)
         row_sizes = (
             buffer_df[list(explicit_size_columns)].to_numpy(dtype=float, copy=False)
-            if explicit_size_columns else None
+            if explicit_size_columns else metadata_size
         )
         lower_bounds, upper_bounds = _resolve_subblock_bounds(
             coords, parent_indices, grid_origin, parent_dims, row_sizes,
@@ -7591,7 +7642,7 @@ def export_samples_with_block_values_from_blocks(samples_file, blocks_file, outp
         'nearest_block_matched_samples': int(nearest_mask.sum()),
         'transferred_columns': list(selected_columns),
         'column_modes': column_modes,
-        'block_geometry_mode': 'explicit-size-columns' if explicit_size_columns else 'inferred-from-base-grid',
+        'block_geometry_mode': geometry_mode,
     }
 
 
@@ -7650,7 +7701,7 @@ def _infer_block_row_bounds(coords, base_block_size, progress_callback=None, pro
 
 
 def _resolve_block_row_geometry(df, coordinate_columns, base_block_size, size_columns=None,
-                                progress_callback=None, progress_label='Resolving block geometry'):
+                                progress_callback=None, progress_label='Resolving block geometry', metadata=None):
     if len(coordinate_columns) != 3 or any(column not in df.columns for column in coordinate_columns):
         raise ValueError('Three valid block coordinate columns are required.')
     coord_frame = df[list(coordinate_columns)].apply(pd.to_numeric, errors='coerce')
@@ -7671,13 +7722,22 @@ def _resolve_block_row_geometry(df, coordinate_columns, base_block_size, size_co
         if progress_callback:
             progress_callback(1, 1, progress_label)
     else:
-        lower_bounds, upper_bounds, sizes = _infer_block_row_bounds(
-            coords,
-            base_block_size,
-            progress_callback=progress_callback,
-            progress_label=progress_label,
-        )
-        mode = 'inferred-from-base-grid'
+        metadata_size = _regular_subblock_size_from_metadata(metadata)
+        if metadata_size is not None:
+            sizes = np.broadcast_to(metadata_size, coords.shape).copy()
+            lower_bounds, upper_bounds = coords - sizes / 2.0, coords + sizes / 2.0
+            mode = 'regular-subblock-metadata'
+            if progress_callback:
+                progress_callback(1, 1, progress_label)
+        else:
+            lower_bounds, upper_bounds, sizes = _infer_block_row_bounds(
+                coords,
+                base_block_size,
+                progress_callback=progress_callback,
+                progress_label=progress_label,
+                grid_origin=(metadata or {}).get('minimum_corner'),
+            )
+            mode = 'inferred-from-base-grid'
     return {
         'row_indices': np.flatnonzero(valid_mask), 'centers': coords,
         'lower_bounds': lower_bounds, 'upper_bounds': upper_bounds,
@@ -7862,6 +7922,183 @@ def _normalize_table_attribute_key_series(series):
     return pd.Series(normalized_values, index=series.index, dtype=object)
 
 
+def _normalize_matching_value_keys(series):
+    if pd.api.types.infer_dtype(series, skipna=True) in ('mixed', 'mixed-integer'):
+        return series.map(_normalize_categorical_filter_token)
+    codes, unique_values = pd.factorize(series, sort=False)
+    tokens = np.asarray([''] + [_normalize_categorical_filter_token(value) for value in unique_values], dtype=object)
+    return pd.Series(tokens[codes + 1], index=series.index, name=series.name, dtype=object)
+
+
+def export_matching_value_sample_distances(samples_file, blocks_file, field_mappings,
+                                          sample_domain_col, block_domain_col, output_file=None,
+                                          samples_delimiter=None, blocks_delimiter=None,
+                                          samples_header_line=1, blocks_header_line=1,
+                                          sample_x_col=None, sample_y_col=None, sample_z_col=None,
+                                          block_x_col=None, block_y_col=None, block_z_col=None,
+                                          sample_filters=None, block_filters=None,
+                                          progress_callback=None):
+    for path, label in ((samples_file, 'samples'), (blocks_file, 'blocks')):
+        if not path or not os.path.isfile(path):
+            raise ValueError(f'Please select a valid {label} file.')
+    for column, label in ((sample_domain_col, 'sample'), (block_domain_col, 'block')):
+        if not column or column == '(None)':
+            raise ValueError(f'Please select an explicit {label} domain column.')
+    if not field_mappings:
+        raise ValueError('Please add at least one block-to-sample value field mapping.')
+    mappings = []
+    for mapping in field_mappings:
+        block_col = mapping.get('block_col')
+        sample_col = mapping.get('sample_col')
+        if not block_col or block_col == '(None)' or not sample_col or sample_col == '(None)':
+            raise ValueError('Select both a block field and a sample field for every mapping.')
+        if any(entry['block_col'] == block_col for entry in mappings):
+            raise ValueError(f'Block field selected more than once: {block_col}')
+        mappings.append({'block_col': block_col, 'sample_col': sample_col})
+
+    output_file = output_file or os.path.splitext(blocks_file)[0] + '_matching_value_distances.csv'
+    if os.path.normcase(os.path.abspath(output_file)) in {
+        os.path.normcase(os.path.abspath(samples_file)),
+        os.path.normcase(os.path.abspath(blocks_file)),
+    }:
+        raise ValueError('Choose an output file different from the input files.')
+    _emit_progress(progress_callback, 0, 100, 'Reading samples...')
+    samples_delimiter = samples_delimiter or detect_csv_delimiter(samples_file)
+    sample_headers = build_unique_column_names(parse_effective_header_line(samples_file, samples_delimiter, samples_header_line))
+    sample_coords_cols = resolve_sample_coordinate_columns(
+        sample_headers, sample_x_col=sample_x_col, sample_y_col=sample_y_col, sample_z_col=sample_z_col,
+    )
+    selected_sample_columns = list(dict.fromkeys(
+        list(sample_coords_cols) + [sample_domain_col] + [entry['sample_col'] for entry in mappings]
+        + collect_filter_fields(sample_filters)
+    ))
+    samples, _ = read_selected_columns_with_header(
+        samples_file, samples_delimiter, samples_header_line, selected_sample_columns,
+        progress_label='Reading samples',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 0, 15, 'Reading samples...'),
+    )
+    _emit_progress(progress_callback, 15, 100, 'Applying sample filters...')
+    samples, applied_filters = apply_sample_filters(
+        samples, sample_filters=sample_filters,
+        progress_label='Applying sample filters...',
+        progress_callback=_make_scaled_progress_callback(progress_callback, 15, 20, 'Applying sample filters...'),
+    )
+    _emit_progress(progress_callback, 20, 100, 'Reading blocks...')
+    block_read_progress = _make_scaled_progress_callback(progress_callback, 20, 32, 'Reading blocks...')
+    if is_bmf_file(blocks_file):
+        blocks, _ = load_full_blocks_dataframe(
+            blocks_file, progress_label='Reading blocks', progress_callback=block_read_progress,
+        )
+    else:
+        blocks_delimiter = blocks_delimiter or detect_csv_delimiter(blocks_file)
+        block_headers = build_unique_column_names(parse_effective_header_line(blocks_file, blocks_delimiter, blocks_header_line))
+        blocks, _ = read_selected_columns_with_header(
+            blocks_file, blocks_delimiter, blocks_header_line, block_headers,
+            progress_label='Reading blocks', progress_callback=block_read_progress,
+        )
+    _emit_progress(progress_callback, 32, 100, 'Applying block filters...')
+    if block_filters:
+        blocks, _ = apply_dataframe_filters(
+            blocks, filters=block_filters, filter_subject='block', source_label='blocks file',
+            progress_label='Applying block filters...',
+            progress_callback=_make_scaled_progress_callback(progress_callback, 32, 35, 'Applying block filters...'),
+        )
+    _emit_progress(progress_callback, 35, 100, 'Preparing coordinate columns...')
+    samples = samples.reset_index(drop=True)
+    blocks = blocks.reset_index(drop=True)
+    block_coords_cols = resolve_block_coordinate_columns(
+        list(blocks.columns), block_x_col=block_x_col, block_y_col=block_y_col, block_z_col=block_z_col,
+    )
+    for frame, columns, label in (
+        (samples, [sample_domain_col] + [entry['sample_col'] for entry in mappings], 'samples'),
+        (blocks, [block_domain_col] + [entry['block_col'] for entry in mappings], 'blocks'),
+    ):
+        missing = [column for column in columns if column not in frame.columns]
+        if missing:
+            raise ValueError(f'Selected columns not found in {label} file: {", ".join(missing)}')
+    output_columns = [
+        name for entry in mappings
+        for name in (f"{entry['block_col']}_{block_domain_col}_MinDist", f"{entry['block_col']}_AbsMinDist")
+    ]
+    input_columns = set(block_coords_cols) | {block_domain_col} | {entry['block_col'] for entry in mappings}
+    if len(set(output_columns)) != len(output_columns) or input_columns.intersection(output_columns):
+        raise ValueError('Generated distance column names collide with selected input fields or each other.')
+
+    _emit_progress(progress_callback, 36, 100, 'Preparing sample coordinates...')
+    sample_coords = samples[list(sample_coords_cols)].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    _emit_progress(progress_callback, 37, 100, 'Preparing block coordinates...')
+    block_coords = blocks[list(block_coords_cols)].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    valid_samples = np.isfinite(sample_coords).all(axis=1)
+    valid_blocks = np.isfinite(block_coords).all(axis=1)
+    _emit_progress(progress_callback, 38, 100, 'Preparing sample domain keys...')
+    sample_domains = _normalize_matching_value_keys(samples[sample_domain_col])
+    _emit_progress(progress_callback, 39, 100, 'Preparing block domain keys...')
+    block_domains = _normalize_matching_value_keys(blocks[block_domain_col])
+    _emit_progress(progress_callback, 40, 100, 'Preparing matching-value fields...')
+    output_df = blocks.copy()
+    field_results = []
+    for field_index, mapping in enumerate(mappings):
+        block_col, sample_col = mapping['block_col'], mapping['sample_col']
+        _emit_progress(progress_callback, 40 + 55 * field_index / len(mappings), 100, f'Preparing matching keys for {block_col}...')
+        sample_keys = pd.DataFrame({
+            'value': _normalize_matching_value_keys(samples[sample_col]),
+            'domain': sample_domains,
+        })
+        block_keys = pd.DataFrame({
+            'value': _normalize_matching_value_keys(blocks[block_col]),
+            'domain': block_domains,
+        })
+        field_result = dict(mapping)
+        for same_domain in (True, False):
+            columns = ['value', 'domain'] if same_domain else ['value']
+            sample_mask = valid_samples & sample_keys['value'].ne('')
+            block_mask = valid_blocks & block_keys['value'].ne('')
+            if same_domain:
+                sample_mask &= sample_domains.ne('')
+                block_mask &= block_domains.ne('')
+            sample_groups = sample_keys.loc[sample_mask].groupby(columns, sort=False).groups
+            block_groups = block_keys.loc[block_mask].groupby(columns, sort=False).groups
+            distances = np.full(len(blocks), np.nan)
+            pass_index = field_index * 2 + (0 if same_domain else 1)
+            start = 40 + 55 * pass_index / (len(mappings) * 2)
+            end = 40 + 55 * (pass_index + 1) / (len(mappings) * 2)
+            completed = 0
+            total = int(block_mask.sum())
+            label = f"Matching {block_col} ({'same domain' if same_domain else 'all domains'})..."
+            for key, block_rows in block_groups.items():
+                sample_rows = sample_groups.get(key)
+                if sample_rows is not None:
+                    nearest, _ = _compute_point_to_set_kdtree_metrics(
+                        block_coords[block_rows], sample_coords[sample_rows],
+                        progress_callback=lambda value, maximum, message: _emit_progress(
+                            progress_callback, start + (end - start) * (completed + value) / max(total, 1), 100, label,
+                        ),
+                    )
+                    distances[block_rows] = nearest
+                completed += len(block_rows)
+                _emit_progress(progress_callback, start + (end - start) * completed / max(total, 1), 100, label)
+            output_column = f'{block_col}_{block_domain_col}_MinDist' if same_domain else f'{block_col}_AbsMinDist'
+            output_df[output_column] = distances
+            count_key = 'same_domain_unmatched_blocks' if same_domain else 'absolute_unmatched_blocks'
+            field_result[count_key] = int(np.isnan(distances).sum())
+            print(f'{output_column}: {field_result[count_key]:,} blocks without a distance (left blank).')
+            _emit_progress(progress_callback, end, 100, label)
+        field_results.append(field_result)
+    _emit_progress(progress_callback, 95, 100, 'Writing matching-value distances...')
+    output_df.to_csv(output_file, index=False)
+    _emit_progress(progress_callback, 100, 100, 'Matching-value sample distances complete.')
+    return {
+        'output_file': output_file,
+        'output_columns': output_columns,
+        'processed_blocks': len(blocks),
+        'filtered_samples': len(samples),
+        'invalid_coordinate_samples': int((~valid_samples).sum()),
+        'invalid_coordinate_blocks': int((~valid_blocks).sum()),
+        'field_results': field_results,
+        'filters_applied': applied_filters,
+    }
+
+
 def export_block_model_with_table_attributes(block_model_file, table_file, output_file=None,
                                              block_model_delimiter=None, block_model_header_line=1,
                                              table_delimiter=None, table_header_line=1,
@@ -8000,7 +8237,7 @@ BLOCK_MODEL_TRANSFER_TARGET_CHUNK_SIZE = 100_000
 def _prepare_source_block_transfer_dataframe(source_blocks_file, selected_columns,
                                              source_delimiter=None, source_header_line=1,
                                              source_x_col=None, source_y_col=None, source_z_col=None,
-                                             source_size_cols=None, progress_callback=None):
+                                             source_size_cols=None, extra_columns=None, progress_callback=None):
     if is_bmf_file(source_blocks_file):
         source_df, _ = load_full_blocks_dataframe(
             source_blocks_file,
@@ -8032,6 +8269,7 @@ def _prepare_source_block_transfer_dataframe(source_blocks_file, selected_column
         source_z_col,
         *explicit_size_columns,
         *selected_columns,
+        *(extra_columns or ()),
     ]))
     source_df, _ = read_selected_columns_with_header(
         source_blocks_file,
@@ -8107,6 +8345,121 @@ def _match_exact_block_transfer_chunk(target_chunk_df, exact_source_lookup,
     }
 
 
+def _normalize_optional_domain_column(column_name):
+    name = str(column_name or '').strip()
+    return '' if name == '(None)' else name
+
+
+def _domain_tokens_from_series(series):
+    return _normalize_matching_value_keys(series).to_numpy(dtype=object)
+
+
+class _SourceBlockMatcher:
+    """Finds overlapping or nearest source blocks for a target block, optionally domain-wise.
+
+    In domain-wise mode a target block is matched against source blocks of its own domain
+    first. Source blocks of other domains are only considered afterwards, and only when
+    allow_cross_domain is set. With overlap_precedence, any overlapping source block (same domain
+    preferred) is used before any nearest-block match, regardless of allow_cross_domain.
+    Targets with a blank domain are matched against every source block.
+    """
+
+    def __init__(self, source_geometry, source_domain_tokens=None, nearest_fallback=True,
+                 nearest_distance_limit=None, allow_cross_domain=True, overlap_precedence=True):
+        self.geometry = source_geometry
+        self.nearest_fallback = bool(nearest_fallback)
+        self.nearest_distance_limit = nearest_distance_limit
+        self.allow_cross_domain = bool(allow_cross_domain)
+        self.overlap_precedence = bool(overlap_precedence)
+        self.domain_wise = source_domain_tokens is not None
+        self._all_scope = self._build_scope(np.arange(len(source_geometry['centers'])))
+        self._domain_scopes = {}
+        if self.domain_wise:
+            tokens = np.asarray(source_domain_tokens, dtype=object)
+            for token in pd.unique(tokens):
+                if token:
+                    self._domain_scopes[token] = self._build_scope(np.flatnonzero(tokens == token))
+
+    def _build_scope(self, indices):
+        from scipy.spatial import cKDTree
+        return {
+            'indices': indices,
+            'tree': cKDTree(self.geometry['centers'][indices]),
+            'max_half_diagonal': float(np.linalg.norm(self.geometry['sizes'][indices], axis=1).max() / 2.0),
+        }
+
+    def _overlaps(self, scope, center, lower, upper, size):
+        radius = float(np.linalg.norm(size) / 2.0 + scope['max_half_diagonal'])
+        candidates = scope['indices'][np.asarray(scope['tree'].query_ball_point(center, radius), dtype=int)]
+        if not len(candidates):
+            return np.empty(0, dtype=int), np.empty(0, dtype=float)
+        overlap_lengths = np.maximum(
+            0.0,
+            np.minimum(self.geometry['upper_bounds'][candidates], upper)
+            - np.maximum(self.geometry['lower_bounds'][candidates], lower),
+        )
+        candidate_volumes = np.prod(overlap_lengths, axis=1)
+        positive = candidate_volumes > max(float(np.prod(size)) * 1e-12, 1e-12)
+        return candidates[positive], candidate_volumes[positive]
+
+    def match(self, center, lower, upper, size, domain_token=''):
+        """Return (kind, source_positions, volumes, cross_domain); kind is 'overlap', 'nearest' or None."""
+        if self.domain_wise and domain_token:
+            same = self._domain_scopes.get(domain_token)
+            same_steps = lambda kinds: [(same, kind, False) for kind in kinds if same is not None]
+            cross_steps = lambda kinds: [(self._all_scope, kind, True) for kind in kinds]
+            nearest = ('nearest',) if self.nearest_fallback else ()
+            if self.overlap_precedence:
+                # Any overlap (same domain preferred) beats a nearest-block match.
+                steps = same_steps(('overlap',)) + cross_steps(('overlap',)) + same_steps(nearest)
+                if self.allow_cross_domain:
+                    steps += cross_steps(nearest)
+            else:
+                steps = same_steps(('overlap',) + nearest)
+                if self.allow_cross_domain:
+                    steps += cross_steps(('overlap',) + nearest)
+        else:
+            steps = [(self._all_scope, 'overlap', False)]
+            if self.nearest_fallback:
+                steps.append((self._all_scope, 'nearest', False))
+        for scope, kind, cross_domain in steps:
+            if kind == 'overlap':
+                overlaps, volumes = self._overlaps(scope, center, lower, upper, size)
+                if len(overlaps):
+                    return 'overlap', overlaps, volumes, cross_domain
+            else:
+                distance, nearest_index = scope['tree'].query(center, k=1)
+                if self.nearest_distance_limit is None or float(distance) <= self.nearest_distance_limit:
+                    return 'nearest', scope['indices'][[int(nearest_index)]], None, cross_domain
+        return None, np.empty(0, dtype=int), np.empty(0, dtype=float), False
+
+
+def _assign_matched_source_values(assigned, column_modes, values_by_column, target_row, kind, source_positions, volumes):
+    if kind == 'overlap':
+        for column, mode in column_modes.items():
+            values = values_by_column[column][source_positions]
+            if mode == 'numeric':
+                valid = np.isfinite(values)
+                if valid.any():
+                    assigned[column][target_row] = float(np.average(values[valid], weights=volumes[valid]))
+            else:
+                totals = {}
+                for value, volume in zip(values, volumes):
+                    value = str(value).strip()
+                    if value and value.lower() != 'nan':
+                        totals[value] = totals.get(value, 0.0) + float(volume)
+                if totals:
+                    assigned[column][target_row] = sorted(totals.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    elif kind == 'nearest':
+        nearest = int(source_positions[0])
+        for column, mode in column_modes.items():
+            value = values_by_column[column][nearest]
+            if mode == 'numeric' and np.isfinite(value):
+                assigned[column][target_row] = float(value)
+            elif mode != 'numeric' and str(value).strip() and str(value).strip().lower() != 'nan':
+                assigned[column][target_row] = str(value).strip()
+
+
 def _iter_block_model_transfer_target_chunks(target_blocks_file, target_delimiter=None, target_header_line=1,
                                              progress_callback=None, chunksize=BLOCK_MODEL_TRANSFER_TARGET_CHUNK_SIZE):
     delimiter = target_delimiter or detect_csv_delimiter(target_blocks_file)
@@ -8137,7 +8490,22 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
                                                              source_block_size=None, target_block_size=None,
                                                              source_size_cols=None, target_size_cols=None,
                                                              nearest_fallback=True, nearest_distance_limit=None,
-                                                             progress_callback=None):
+                                                             progress_callback=None, source_metadata=None,
+                                                             source_domain_col=None, target_domain_col=None,
+                                                             allow_cross_domain_fallback=True,
+                                                             overlap_precedence_over_domain=True):
+    source_domain_col = _normalize_optional_domain_column(source_domain_col)
+    target_domain_col = _normalize_optional_domain_column(target_domain_col)
+    domain_wise = bool(source_domain_col and target_domain_col)
+    target_metadata = parse_leapfrog_block_metadata(target_blocks_file)
+    source_metadata_size = (
+        None if _normalize_optional_size_columns(source_size_cols)
+        else _regular_subblock_size_from_metadata(source_metadata)
+    )
+    target_metadata_size = (
+        None if _normalize_optional_size_columns(target_size_cols)
+        else _regular_subblock_size_from_metadata(target_metadata)
+    )
     target_delimiter, target_columns, target_chunks = _iter_block_model_transfer_target_chunks(
         target_blocks_file,
         target_delimiter=target_delimiter,
@@ -8150,12 +8518,18 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
         target_y_col,
         target_z_col,
     )
-    exact_source_lookup = _prepare_exact_source_block_transfer_lookup(
+    if domain_wise:
+        if target_domain_col not in target_columns:
+            raise ValueError(f"Target domain column '{target_domain_col}' was not found in the target block model.")
+        if source_domain_col not in source_df.columns:
+            raise ValueError(f"Source domain column '{source_domain_col}' was not found in the source block model.")
+    # Exact grid pre-matching ignores domains, so domain-wise transfers always use the geometric matcher.
+    exact_source_lookup = None if domain_wise else _prepare_exact_source_block_transfer_lookup(
         source_df,
         selected_columns,
         (source_x_col, source_y_col, source_z_col),
-        source_block_size,
-        target_block_size,
+        source_block_size if source_metadata_size is None else source_metadata_size,
+        target_block_size if target_metadata_size is None else target_metadata_size,
         source_size_cols=source_size_cols,
         target_size_cols=target_size_cols,
     )
@@ -8168,27 +8542,29 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
 
     source_geometry = None
     values_by_column = None
-    tree = None
-    max_source_half_diagonal = None
+    matcher = None
     wrote_header = False
     total_target_blocks = 0
     overlap_matches = 0
     nearest_matches = 0
+    cross_domain_matches = 0
     invalid_target_blocks = 0
     target_geometry_mode = None
 
     def ensure_source_matching_context(use_progress=False):
-        nonlocal source_geometry, values_by_column, tree, max_source_half_diagonal, column_modes
+        nonlocal source_geometry, values_by_column, matcher, column_modes
         if source_geometry is not None:
             return
         if use_progress:
             _emit_progress(progress_callback, 46, 100, 'Resolving source block geometry...')
         source_geometry_kwargs = {}
+        if source_metadata:
+            source_geometry_kwargs['metadata'] = source_metadata
         if use_progress:
-            source_geometry_kwargs = {
+            source_geometry_kwargs.update({
                 'progress_callback': _make_scaled_progress_callback(progress_callback, 46, 56, 'Resolving source block geometry...'),
                 'progress_label': 'Resolving source block geometry',
-            }
+            })
         source_geometry = _resolve_block_row_geometry(
             source_df,
             (source_x_col, source_y_col, source_z_col),
@@ -8198,8 +8574,6 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
         )
         if not len(source_geometry['centers']):
             raise ValueError('The source block model has no rows with valid coordinates and dimensions.')
-
-        from scipy.spatial import cKDTree
 
         source_values_df_local = source_df.iloc[source_geometry['row_indices']]
         if column_modes is None:
@@ -8212,8 +8586,16 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
             )
             for column, mode in column_modes.items()
         }
-        tree = cKDTree(source_geometry['centers'])
-        max_source_half_diagonal = float(np.linalg.norm(source_geometry['sizes'], axis=1).max() / 2.0)
+        matcher = _SourceBlockMatcher(
+            source_geometry,
+            source_domain_tokens=(
+                _domain_tokens_from_series(source_values_df_local[source_domain_col]) if domain_wise else None
+            ),
+            nearest_fallback=nearest_fallback,
+            nearest_distance_limit=nearest_distance_limit,
+            allow_cross_domain=allow_cross_domain_fallback,
+            overlap_precedence=overlap_precedence_over_domain,
+        )
 
     if exact_source_lookup is None:
         ensure_source_matching_context(use_progress=True)
@@ -8273,6 +8655,7 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
                 (target_x_col, target_y_col, target_z_col),
                 target_block_size,
                 target_size_cols,
+                metadata=target_metadata,
             )
             if exact_chunk is None:
                 invalid_target_blocks += int(len(target_chunk) - len(target_geometry['row_indices']))
@@ -8285,51 +8668,26 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
                     target_geometry['mode'] if exact_source_lookup is None else f'exact-prematch + {target_geometry["mode"]}'
                 )
 
+            target_domain_tokens = (
+                _domain_tokens_from_series(target_chunk[target_domain_col]) if domain_wise else None
+            )
             for local_index, target_row in enumerate(target_row_positions):
-                target_center = target_geometry['centers'][local_index]
-                radius = float(np.linalg.norm(target_geometry['sizes'][local_index]) / 2.0 + max_source_half_diagonal)
-                candidates = np.asarray(tree.query_ball_point(target_center, radius), dtype=int)
-                overlaps = np.empty(0, dtype=int)
-                volumes = np.empty(0, dtype=float)
-                if len(candidates):
-                    overlap_lengths = np.maximum(
-                        0.0,
-                        np.minimum(source_geometry['upper_bounds'][candidates], target_geometry['upper_bounds'][local_index])
-                        - np.maximum(source_geometry['lower_bounds'][candidates], target_geometry['lower_bounds'][local_index]),
-                    )
-                    candidate_volumes = np.prod(overlap_lengths, axis=1)
-                    positive = candidate_volumes > max(float(np.prod(target_geometry['sizes'][local_index])) * 1e-12, 1e-12)
-                    overlaps, volumes = candidates[positive], candidate_volumes[positive]
-                if len(overlaps):
+                kind, source_positions, volumes, cross_domain = matcher.match(
+                    target_geometry['centers'][local_index],
+                    target_geometry['lower_bounds'][local_index],
+                    target_geometry['upper_bounds'][local_index],
+                    target_geometry['sizes'][local_index],
+                    target_domain_tokens[target_row] if domain_wise else '',
+                )
+                if kind == 'overlap':
                     overlap_matches += 1
-                    for column, mode in column_modes.items():
-                        values = values_by_column[column][overlaps]
-                        if mode == 'numeric':
-                            valid = np.isfinite(values)
-                            if valid.any():
-                                assigned[column][target_row] = float(np.average(values[valid], weights=volumes[valid]))
-                        else:
-                            totals = {}
-                            for value, volume in zip(values, volumes):
-                                value = str(value).strip()
-                                if value and value.lower() != 'nan':
-                                    totals[value] = totals.get(value, 0.0) + float(volume)
-                            if totals:
-                                assigned[column][target_row] = sorted(
-                                    totals.items(),
-                                    key=lambda item: (-item[1], item[0]),
-                                )[0][0]
-                elif nearest_fallback:
-                    nearest_distance, nearest = tree.query(target_center, k=1)
-                    if nearest_distance_limit is None or float(nearest_distance) <= nearest_distance_limit:
-                        nearest = int(nearest)
-                        nearest_matches += 1
-                        for column, mode in column_modes.items():
-                            value = values_by_column[column][nearest]
-                            if mode == 'numeric' and np.isfinite(value):
-                                assigned[column][target_row] = float(value)
-                            elif mode != 'numeric' and str(value).strip() and str(value).strip().lower() != 'nan':
-                                assigned[column][target_row] = str(value).strip()
+                elif kind == 'nearest':
+                    nearest_matches += 1
+                if kind and cross_domain:
+                    cross_domain_matches += 1
+                _assign_matched_source_values(
+                    assigned, column_modes, values_by_column, target_row, kind, source_positions, volumes,
+                )
         elif target_geometry_mode is None:
             target_geometry_mode = 'exact-grid'
 
@@ -8367,6 +8725,7 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
         'total_target_blocks': int(total_target_blocks),
         'overlap_matched_blocks': int(overlap_matches),
         'nearest_matched_blocks': int(nearest_matches),
+        'cross_domain_matched_blocks': int(cross_domain_matches),
         'unmatched_blocks': int(unmatched),
         'invalid_target_blocks': int(invalid_target_blocks),
         'transferred_columns': list(selected_columns),
@@ -8374,6 +8733,7 @@ def _export_blocks_with_source_block_values_streaming_target(source_df, target_b
         'source_geometry_mode': source_geometry_mode,
         'target_geometry_mode': target_geometry_mode,
         'max_nearest_distance': nearest_distance_limit,
+        'domain_wise': domain_wise,
     }
 
 
@@ -8386,8 +8746,21 @@ def export_blocks_with_source_block_values(source_blocks_file, target_blocks_fil
                                             source_block_size=None, target_block_size=None,
                                             source_size_cols=None, target_size_cols=None,
                                             nearest_fallback=True, max_nearest_distance=None,
-                                            progress_callback=None):
-    """Enrich existing target blocks from overlapping source blocks without creating rows."""
+                                            progress_callback=None,
+                                            source_domain_col=None, target_domain_col=None,
+                                            allow_cross_domain_fallback=True,
+                                            overlap_precedence_over_domain=True):
+    """Enrich existing target blocks from overlapping source blocks without creating rows.
+
+    When both source_domain_col and target_domain_col are set, matching is domain-wise: source
+    blocks of the target block's domain are used first. With overlap_precedence_over_domain, any
+    overlapping source block (same domain preferred) wins over a nearest-block match. Otherwise,
+    or when nothing overlaps, other-domain blocks are used only as a last resort and only when
+    allow_cross_domain_fallback is True.
+    """
+    source_domain_col = _normalize_optional_domain_column(source_domain_col)
+    target_domain_col = _normalize_optional_domain_column(target_domain_col)
+    domain_wise = bool(source_domain_col and target_domain_col)
     if not source_blocks_file or not os.path.isfile(source_blocks_file):
         raise ValueError('Please select a valid source blocks file.')
     if not target_blocks_file or not os.path.isfile(target_blocks_file):
@@ -8414,8 +8787,10 @@ def export_blocks_with_source_block_values(source_blocks_file, target_blocks_fil
         source_y_col=source_y_col,
         source_z_col=source_z_col,
         source_size_cols=source_size_cols,
+        extra_columns=[source_domain_col] if domain_wise else None,
         progress_callback=progress_callback,
     )
+    source_metadata = parse_leapfrog_block_metadata(source_blocks_file)
     missing = [column for column in selected_columns if column not in source_df.columns]
     if missing:
         raise ValueError(f"Source block column(s) not found: {', '.join(missing)}")
@@ -8440,6 +8815,11 @@ def export_blocks_with_source_block_values(source_blocks_file, target_blocks_fil
             nearest_fallback=nearest_fallback,
             nearest_distance_limit=nearest_distance_limit,
             progress_callback=progress_callback,
+            source_metadata=source_metadata,
+            source_domain_col=source_domain_col,
+            target_domain_col=target_domain_col,
+            allow_cross_domain_fallback=allow_cross_domain_fallback,
+            overlap_precedence_over_domain=overlap_precedence_over_domain,
         )
     target_df, output_delimiter = load_full_blocks_dataframe(
         target_blocks_file, target_delimiter, target_header_line,
@@ -8449,13 +8829,20 @@ def export_blocks_with_source_block_values(source_blocks_file, target_blocks_fil
     target_x_col, target_y_col, target_z_col = resolve_block_coordinate_columns(
         list(target_df.columns), target_x_col, target_y_col, target_z_col,
     )
-    exact_transfer = _try_exact_block_model_transfer(
+    source_metadata_size = (
+        None if _normalize_optional_size_columns(source_size_cols)
+        else _regular_subblock_size_from_metadata(source_metadata)
+    )
+    if domain_wise and target_domain_col not in target_df.columns:
+        raise ValueError(f"Target domain column '{target_domain_col}' was not found in the target block model.")
+    # Exact grid pre-matching ignores domains, so domain-wise transfers always use the geometric matcher.
+    exact_transfer = None if domain_wise else _try_exact_block_model_transfer(
         source_df,
         target_df,
         selected_columns,
         (source_x_col, source_y_col, source_z_col),
         (target_x_col, target_y_col, target_z_col),
-        source_block_size,
+        source_block_size if source_metadata_size is None else source_metadata_size,
         target_block_size,
         source_size_cols=source_size_cols,
         target_size_cols=target_size_cols,
@@ -8523,6 +8910,7 @@ def export_blocks_with_source_block_values(source_blocks_file, target_blocks_fil
         source_size_cols,
         progress_callback=_make_scaled_progress_callback(progress_callback, 46, 56, 'Resolving source block geometry...'),
         progress_label='Resolving source block geometry',
+        metadata=source_metadata,
     )
     _emit_progress(progress_callback, 57, 100, 'Resolving target block geometry...')
     target_geometry_df = target_df if remaining_target_rows is None else target_df.iloc[remaining_target_rows]
@@ -8537,7 +8925,6 @@ def export_blocks_with_source_block_values(source_blocks_file, target_blocks_fil
     if not len(source_geometry['centers']):
         raise ValueError('The source block model has no rows with valid coordinates and dimensions.')
 
-    from scipy.spatial import cKDTree
     source_values_df = source_df.iloc[source_geometry['row_indices']]
     if column_modes is None:
         column_modes = _detect_dataframe_transfer_column_modes(source_values_df, selected_columns)
@@ -8548,9 +8935,17 @@ def export_blocks_with_source_block_values(source_blocks_file, target_blocks_fil
     }
     if assigned is None:
         assigned = {column: np.full(len(target_df), '', dtype=object) for column in selected_columns}
-    tree = cKDTree(source_geometry['centers'])
-    max_source_half_diagonal = float(np.linalg.norm(source_geometry['sizes'], axis=1).max() / 2.0)
+    matcher = _SourceBlockMatcher(
+        source_geometry,
+        source_domain_tokens=_domain_tokens_from_series(source_values_df[source_domain_col]) if domain_wise else None,
+        nearest_fallback=nearest_fallback,
+        nearest_distance_limit=nearest_distance_limit,
+        allow_cross_domain=allow_cross_domain_fallback,
+        overlap_precedence=overlap_precedence_over_domain,
+    )
+    target_domain_tokens = _domain_tokens_from_series(target_df[target_domain_col]) if domain_wise else None
     nearest_matches = 0
+    cross_domain_matches = 0
     target_count = len(target_geometry['centers'])
     target_row_indices = (
         target_geometry['row_indices']
@@ -8560,47 +8955,22 @@ def export_blocks_with_source_block_values(source_blocks_file, target_blocks_fil
     _emit_progress(progress_callback, 70, 100, 'Matching target blocks to source blocks...')
 
     for local_index, target_row in enumerate(target_row_indices):
-        target_center = target_geometry['centers'][local_index]
-        radius = float(np.linalg.norm(target_geometry['sizes'][local_index]) / 2.0 + max_source_half_diagonal)
-        candidates = np.asarray(tree.query_ball_point(target_center, radius), dtype=int)
-        overlaps = np.empty(0, dtype=int)
-        volumes = np.empty(0, dtype=float)
-        if len(candidates):
-            overlap_lengths = np.maximum(
-                0.0,
-                np.minimum(source_geometry['upper_bounds'][candidates], target_geometry['upper_bounds'][local_index])
-                - np.maximum(source_geometry['lower_bounds'][candidates], target_geometry['lower_bounds'][local_index]),
-            )
-            candidate_volumes = np.prod(overlap_lengths, axis=1)
-            positive = candidate_volumes > max(float(np.prod(target_geometry['sizes'][local_index])) * 1e-12, 1e-12)
-            overlaps, volumes = candidates[positive], candidate_volumes[positive]
-        if len(overlaps):
+        kind, source_positions, volumes, cross_domain = matcher.match(
+            target_geometry['centers'][local_index],
+            target_geometry['lower_bounds'][local_index],
+            target_geometry['upper_bounds'][local_index],
+            target_geometry['sizes'][local_index],
+            target_domain_tokens[target_row] if domain_wise else '',
+        )
+        if kind == 'overlap':
             overlap_matches += 1
-            for column, mode in column_modes.items():
-                values = values_by_column[column][overlaps]
-                if mode == 'numeric':
-                    valid = np.isfinite(values)
-                    if valid.any():
-                        assigned[column][target_row] = float(np.average(values[valid], weights=volumes[valid]))
-                else:
-                    totals = {}
-                    for value, volume in zip(values, volumes):
-                        value = str(value).strip()
-                        if value and value.lower() != 'nan':
-                            totals[value] = totals.get(value, 0.0) + float(volume)
-                    if totals:
-                        assigned[column][target_row] = sorted(totals.items(), key=lambda item: (-item[1], item[0]))[0][0]
-        elif nearest_fallback:
-            nearest_distance, nearest = tree.query(target_center, k=1)
-            if nearest_distance_limit is None or float(nearest_distance) <= nearest_distance_limit:
-                nearest = int(nearest)
-                nearest_matches += 1
-                for column, mode in column_modes.items():
-                    value = values_by_column[column][nearest]
-                    if mode == 'numeric' and np.isfinite(value):
-                        assigned[column][target_row] = float(value)
-                    elif mode != 'numeric' and str(value).strip() and str(value).strip().lower() != 'nan':
-                        assigned[column][target_row] = str(value).strip()
+        elif kind == 'nearest':
+            nearest_matches += 1
+        if kind and cross_domain:
+            cross_domain_matches += 1
+        _assign_matched_source_values(
+            assigned, column_modes, values_by_column, target_row, kind, source_positions, volumes,
+        )
         if progress_callback and (local_index + 1 == target_count or (local_index + 1) % 10_000 == 0):
             _emit_progress(
                 progress_callback, 70 + int(round(((local_index + 1) / max(target_count, 1)) * 28)), 100,
@@ -8628,10 +8998,11 @@ def export_blocks_with_source_block_values(source_blocks_file, target_blocks_fil
     return {
         'output_file': output_file, 'total_target_blocks': int(len(target_df)),
         'overlap_matched_blocks': int(overlap_matches), 'nearest_matched_blocks': int(nearest_matches),
+        'cross_domain_matched_blocks': int(cross_domain_matches),
         'unmatched_blocks': int(unmatched), 'invalid_target_blocks': int(invalid_targets),
         'transferred_columns': list(selected_columns), 'column_modes': column_modes,
         'source_geometry_mode': source_geometry['mode'], 'target_geometry_mode': target_geometry_mode,
-        'max_nearest_distance': nearest_distance_limit,
+        'max_nearest_distance': nearest_distance_limit, 'domain_wise': domain_wise,
     }
 
 
@@ -11725,6 +12096,12 @@ if __name__ == "__main__":
             self.block_model_source_size_cols = [QtWidgets.QComboBox() for _ in range(3)]
             self.block_model_target_size_cols = [QtWidgets.QComboBox() for _ in range(3)]
             self.block_model_target_size_spins = [TrimmedDisplayDoubleSpinBox() for _ in range(3)]
+            self.block_model_target_domain_col = QtWidgets.QComboBox()
+            self.block_model_target_domain_col.addItem('(None)')
+            self.block_model_cross_domain_fallback = QtWidgets.QCheckBox('Allow other-domain source blocks as a last resort')
+            self.block_model_cross_domain_fallback.setChecked(True)
+            self.block_model_overlap_precedence = QtWidgets.QCheckBox('Overlap takes precedence over domain')
+            self.block_model_overlap_precedence.setChecked(True)
             for spin, source_spin in zip(self.block_model_target_size_spins, [self.block_x, self.block_y, self.block_z]):
                 spin.setRange(0.001, 1_000_000_000.0)
                 spin.setDecimals(6)
@@ -12172,14 +12549,16 @@ if __name__ == "__main__":
             self.start_block_value_transfer_btn.setToolTip(
                 'Export the samples file with the selected block columns transferred onto each matched sample row. '
                 'Each sample takes the value of the sub-block that contains it; sub-block extents come from the '
-                'Source DX / DY / DZ columns below when set, otherwise they are inferred from the base block grid.'
+                'Source DX / DY / DZ columns below when set, then regular Leapfrog subdivision metadata, '
+                'otherwise they are inferred from the base block grid.'
             )
             block_value_transfer_form.addRow('', self.start_block_value_transfer_btn)
             operations_form.addRow(block_value_transfer_group)
 
             block_model_transfer_group, block_model_transfer_form = create_collapsible_operation_section(
                 'Assign Block Columns To Block Model',
-                'Enrich the existing rows of a target block model from overlapping source blocks. Numeric fields are overlap-volume weighted; categorical fields use the category with the greatest overlap volume.',
+                'Enrich the existing rows of a target block model from overlapping source blocks. Numeric fields are overlap-volume weighted; categorical fields use the category with the greatest overlap volume. '
+                'Optionally select a Target Domain to match domain-wise against the source Blocks domain column.',
             )
             self.block_model_target_edit.setToolTip('Target block model to enrich. The export preserves these rows and appends or replaces only the selected source columns.')
             self.block_model_target_browse.setToolTip('Choose the target block model CSV or BMF file.')
@@ -12197,9 +12576,9 @@ if __name__ == "__main__":
                 combo.setToolTip(tip)
             for combo, tip in zip(
                 self.block_model_target_size_cols,
-                ['Optional target DX column. Leave on Infer to use the target base size below.',
-                 'Optional target DY column. Leave on Infer to use the target base size below.',
-                 'Optional target DZ column. Leave on Infer to use the target base size below.'],
+                ['Optional target DX column. Leave on Infer to use regular Leapfrog metadata or centroid inference.',
+                 'Optional target DY column. Leave on Infer to use regular Leapfrog metadata or centroid inference.',
+                 'Optional target DZ column. Leave on Infer to use regular Leapfrog metadata or centroid inference.'],
             ):
                 combo.setToolTip(tip)
             for spin, axis in zip(self.block_model_target_size_spins, ['X', 'Y', 'Z']):
@@ -12207,8 +12586,51 @@ if __name__ == "__main__":
             self.block_model_transfer_cols.setToolTip('Source columns to transfer onto the target block rows. Numeric columns use overlap-volume-weighted averages; text columns use the category with the greatest overlap volume.')
             self.block_model_transfer_select_all_btn.setToolTip('Select every transferable source column.')
             self.block_model_transfer_clear_btn.setToolTip('Clear the source-column selection.')
-            self.block_model_transfer_summary.setToolTip('Shows the current source-column selection and no-overlap fallback settings.')
-            self.block_model_nearest_fallback.setToolTip('If checked, targets with no overlapping source block can inherit values from the nearest source-block center, subject to the distance limit.')
+            self.block_model_transfer_summary.setToolTip('Shows the current source-column selection, no-overlap fallback and domain settings.')
+            self.block_model_target_domain_col.setToolTip(
+                'Target Domain: optional column in the target block model that holds each block\'s domain.\n'
+                '\n'
+                'Domain-wise matching is ON only when BOTH this column and the source model\'s Domain column\n'
+                '(Blocks mapping) are set. If either is (None), domains are ignored entirely and the\n'
+                'transfer works as a plain overlap / nearest-block transfer.\n'
+                '\n'
+                'Target blocks with a blank domain are matched against all source blocks.'
+            )
+            self.block_model_overlap_precedence.setToolTip(
+                'Overlap takes precedence over domain (domain-wise mode only).\n'
+                '\n'
+                'Checked (default): if a target block overlaps any source block, it takes its values from the overlap,\n'
+                'even when the overlapping source blocks belong to another domain. Overlapping blocks of the\n'
+                'target\'s own domain are used first; other-domain overlaps are used only if none of them\n'
+                'overlap. Domain only decides which block is picked when there is NO overlap at all.\n'
+                '\n'
+                'Unchecked: the target\'s own domain always wins. Overlapping blocks of other domains are ignored\n'
+                'unless nothing in the target\'s own domain matches and the last-resort option below is checked.\n'
+                '\n'
+                'Order when checked:  same-domain overlap > any-domain overlap > same-domain nearest > other-domain nearest*\n'
+                'Order when unchecked: same-domain overlap > same-domain nearest > other-domain overlap* > other-domain nearest*\n'
+                '(* only if "Allow other-domain source blocks as a last resort" is checked; nearest steps also need\n'
+                '"Use nearest source block when there is no overlap" and respect its distance limit.)'
+            )
+            self.block_model_cross_domain_fallback.setToolTip(
+                'Allow other-domain source blocks as a last resort (domain-wise mode only).\n'
+                '\n'
+                'Checked (default): when no source block of the target\'s own domain can be used, blocks from other\n'
+                'domains are accepted (nearest block, and overlap too if "Overlap takes precedence" is unchecked).\n'
+                'Use this to avoid leaving target blocks empty.\n'
+                '\n'
+                'Unchecked: a target block never takes values from another domain through the nearest-block\n'
+                'fallback. It stays empty if its own domain has nothing to match. (Other-domain overlaps are\n'
+                'still used when "Overlap takes precedence over domain" is checked.)'
+            )
+            self.block_model_nearest_fallback.setToolTip(
+                'Use nearest source block when there is no overlap.\n'
+                '\n'
+                'Checked: a target block that overlaps no usable source block takes the values of the source block whose\n'
+                'center is closest to its own center, within the maximum distance. In domain-wise mode the nearest\n'
+                'block is searched in the target\'s own domain first (see the domain options above).\n'
+                'Unchecked: such target blocks stay empty.'
+            )
             self.block_model_nearest_max_distance.setToolTip('Maximum center-to-center distance allowed for the nearest fallback. Set to Unlimited to allow any distance.')
             self.block_model_transfer_output_edit.setToolTip('CSV file to write. The output keeps the target geometry rows and adds the selected source columns.')
             self.block_model_transfer_output_browse.setToolTip('Choose the CSV file to write for the enriched target model.')
@@ -12224,6 +12646,7 @@ if __name__ == "__main__":
             for combo in [self.block_model_target_x_col, self.block_model_target_y_col, self.block_model_target_z_col]:
                 target_coords_layout.addWidget(combo)
             block_model_transfer_form.addRow('Target X / Y / Z', target_coords_layout)
+            block_model_transfer_form.addRow('Target Domain', self.block_model_target_domain_col)
             source_sizes_layout = QtWidgets.QHBoxLayout()
             target_sizes_layout = QtWidgets.QHBoxLayout()
             for combo in self.block_model_source_size_cols:
@@ -12246,12 +12669,16 @@ if __name__ == "__main__":
             no_overlap_layout.addWidget(self.block_model_nearest_fallback)
             no_overlap_layout.addWidget(self.block_model_nearest_max_distance)
             block_model_transfer_form.addRow('No-overlap Policy', no_overlap_layout)
+            block_model_transfer_form.addRow('Overlap vs Domain', self.block_model_overlap_precedence)
+            block_model_transfer_form.addRow('Cross-domain Policy', self.block_model_cross_domain_fallback)
             block_model_transfer_output_layout = QtWidgets.QHBoxLayout()
             block_model_transfer_output_layout.addWidget(self.block_model_transfer_output_edit)
             block_model_transfer_output_layout.addWidget(self.block_model_transfer_output_browse)
             block_model_transfer_form.addRow('Output File', block_model_transfer_output_layout)
             self.start_block_model_transfer_btn.setToolTip(
-                'Preserve every target row and add the selected source columns using exact 3-D overlap. Explicit DX/DY/DZ columns are preferred for sub-block models; otherwise dimensions are inferred inside each configured base block.'
+                'Preserve every target row and add the selected source columns using exact 3-D overlap. '
+                'Dimensions use explicit DX/DY/DZ columns first, then regular Leapfrog metadata, '
+                'otherwise centroid inference inside each configured base block.'
             )
             block_model_transfer_form.addRow('', self.start_block_model_transfer_btn)
             operations_form.addRow(block_model_transfer_group)
@@ -12375,6 +12802,46 @@ if __name__ == "__main__":
             )
             block_metrics_form.addRow('', self.start_block_domain_metrics_btn)
             operations_form.addRow(block_metrics_group)
+
+            matching_distance_group, matching_distance_form = create_collapsible_operation_section(
+                'Matching Value Sample Distances',
+                'For each mapped field, find the closest sample with the same value/category within the block domain and across all domains. '
+                'Select explicit domain columns in Samples Columns and Blocks Columns. Distances are 3D Euclidean distances in coordinate units; '
+                'unmatched distances stay blank. The same-domain output name uses the block domain column.',
+            )
+            self.matching_distance_fields = QtWidgets.QTableWidget(0, 2)
+            self.matching_distance_fields.setHorizontalHeaderLabels(['Block Value Field', 'Matching Sample Field'])
+            self.matching_distance_fields.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+            self.matching_distance_fields.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+            self.matching_distance_fields.setMinimumHeight(150)
+            matching_distance_form.addRow('Field Mappings', self.matching_distance_fields)
+            matching_field_buttons = QtWidgets.QHBoxLayout()
+            self.matching_distance_add_btn = QtWidgets.QPushButton('Add Field')
+            self.matching_distance_remove_btn = QtWidgets.QPushButton('Remove Selected')
+            matching_field_buttons.addWidget(self.matching_distance_add_btn)
+            matching_field_buttons.addWidget(self.matching_distance_remove_btn)
+            matching_distance_form.addRow('', matching_field_buttons)
+            self.matching_distance_output_edit = QtWidgets.QLineEdit('')
+            self.matching_distance_output_edit.setPlaceholderText('Default: <blocks>_matching_value_distances.csv')
+            self.matching_distance_browse = QtWidgets.QPushButton('Browse')
+            matching_output_layout = QtWidgets.QHBoxLayout()
+            matching_output_layout.addWidget(self.matching_distance_output_edit)
+            matching_output_layout.addWidget(self.matching_distance_browse)
+            matching_distance_form.addRow('Output File', matching_output_layout)
+            self.start_matching_distance_btn = QtWidgets.QPushButton('Export Matching Value Distances')
+            matching_distance_form.addRow('', self.start_matching_distance_btn)
+            operations_form.addRow(matching_distance_group)
+            self.matching_distance_add_btn.clicked.connect(lambda: self._add_matching_distance_field())
+            self.matching_distance_remove_btn.clicked.connect(self._remove_matching_distance_fields)
+            self.matching_distance_browse.clicked.connect(self._browse_matching_distance_output)
+            self.start_matching_distance_btn.clicked.connect(self.run_matching_value_sample_distances_only)
+            for edit in (self.samples_edit, self.blocks_edit):
+                edit.textChanged.connect(lambda _: self._refresh_matching_distance_fields())
+            for combo in (self.samples_delim, self.blocks_delim):
+                combo.currentIndexChanged.connect(lambda _: self._refresh_matching_distance_fields())
+            for spin in (self.samples_header_line, self.blocks_header_line):
+                spin.valueChanged.connect(lambda _: self._refresh_matching_distance_fields())
+            self._add_matching_distance_field()
 
             domain_confidence_group, domain_confidence_form = create_collapsible_operation_section(
                 'Domain Interpolation Confidence',
@@ -12530,6 +12997,10 @@ if __name__ == "__main__":
             self.block_model_transfer_cols.itemSelectionChanged.connect(self._update_block_model_transfer_summary)
             self.block_model_nearest_fallback.toggled.connect(self._update_block_model_transfer_fallback_controls)
             self.block_model_nearest_max_distance.valueChanged.connect(lambda _: self._update_block_model_transfer_summary())
+            self.block_model_target_domain_col.currentTextChanged.connect(lambda _: self._update_block_model_transfer_summary())
+            self.block_model_cross_domain_fallback.toggled.connect(lambda _: self._update_block_model_transfer_summary())
+            self.block_model_overlap_precedence.toggled.connect(lambda _: self._update_block_model_transfer_summary())
+            self.block_domain_col.currentTextChanged.connect(lambda _: self._update_block_model_transfer_summary())
             self.block_model_target_edit.textChanged.connect(lambda _: self._refresh_block_model_target_columns())
             self.block_model_target_edit.textChanged.connect(lambda _: refresh_block_model_transfer_output_path())
             self.block_model_target_delim.currentIndexChanged.connect(self._refresh_block_model_target_columns)
@@ -13260,6 +13731,9 @@ if __name__ == "__main__":
                 'block_model_transfer_cols': self._get_selected_block_model_transfer_columns(),
                 'block_model_transfer_nearest_fallback': self.block_model_nearest_fallback.isChecked(),
                 'block_model_transfer_max_nearest_distance': self.block_model_nearest_max_distance.value(),
+                'block_model_target_domain_col': self.block_model_target_domain_col.currentText(),
+                'block_model_transfer_cross_domain_fallback': self.block_model_cross_domain_fallback.isChecked(),
+                'block_model_transfer_overlap_precedence': self.block_model_overlap_precedence.isChecked(),
                 'block_model_transfer_file': self.block_model_transfer_output_edit.text(),
                 'table_attribute_block_model_file': self.table_attribute_block_model_edit.text(),
                 'table_attribute_block_model_delimiter': self.table_attribute_block_model_delim.currentText(),
@@ -13271,6 +13745,8 @@ if __name__ == "__main__":
                 'table_attribute_value_cols': self._get_selected_table_attribute_value_columns(),
                 'table_attribute_output_file': self.table_attribute_output_edit.text(),
                 'block_domain_metrics_file': self.block_domain_metrics_output_edit.text(),
+                'matching_distance_file': self.matching_distance_output_edit.text(),
+                'matching_distance_field_mappings': self._get_matching_distance_field_mappings(),
                 'block_domain_metrics_selected_metrics': self._get_selected_block_domain_metrics(),
                 'block_domain_metrics_avg_distance_knn_k': self.block_domain_metrics_knn_k.value(),
                 'domain_interpolation_confidence_file': self.domain_interpolation_confidence_output_edit.text(),
@@ -13557,6 +14033,12 @@ if __name__ == "__main__":
                     self.block_model_nearest_fallback.setChecked(bool(config['block_model_transfer_nearest_fallback']))
                 if 'block_model_transfer_max_nearest_distance' in config:
                     self.block_model_nearest_max_distance.setValue(float(config['block_model_transfer_max_nearest_distance']))
+                if config.get('block_model_target_domain_col'):
+                    self.block_model_target_domain_col.setCurrentText(str(config['block_model_target_domain_col']))
+                if 'block_model_transfer_cross_domain_fallback' in config:
+                    self.block_model_cross_domain_fallback.setChecked(bool(config['block_model_transfer_cross_domain_fallback']))
+                if 'block_model_transfer_overlap_precedence' in config:
+                    self.block_model_overlap_precedence.setChecked(bool(config['block_model_transfer_overlap_precedence']))
                 if 'sample_blocks_id_cols' in config:
                     for cb, column_name in zip(self.sample_blocks_id_cols, config['sample_blocks_id_cols']):
                         cb.setCurrentText(column_name)
@@ -13576,6 +14058,10 @@ if __name__ == "__main__":
                     self.block_domain_metrics_value_col.setCurrentText(config['block_domain_metrics_value_col'])
                 elif legacy_block_value_metric_col is not None:
                     self.block_domain_metrics_value_col.setCurrentText(legacy_block_value_metric_col)
+                self.matching_distance_output_edit.setText(config.get('matching_distance_file', ''))
+                self.matching_distance_fields.setRowCount(0)
+                for mapping in config.get('matching_distance_field_mappings', []):
+                    self._add_matching_distance_field(mapping)
                 if 'block_domain_metrics_selected_metrics' in config:
                     self._set_selected_block_domain_metrics(config.get('block_domain_metrics_selected_metrics'))
                 else:
@@ -13939,6 +14425,50 @@ if __name__ == "__main__":
             combined_preview = pd.concat(preview_frames, ignore_index=True)
             return FilterDataSource(combined_preview)
 
+        def _get_matching_distance_field_mappings(self):
+            mappings = []
+            for row in range(self.matching_distance_fields.rowCount()):
+                block_combo = self.matching_distance_fields.cellWidget(row, 0)
+                sample_combo = self.matching_distance_fields.cellWidget(row, 1)
+                if isinstance(block_combo, QtWidgets.QComboBox) and isinstance(sample_combo, QtWidgets.QComboBox):
+                    mappings.append({'block_col': block_combo.currentText(), 'sample_col': sample_combo.currentText()})
+            return mappings
+
+        def _add_matching_distance_field(self, mapping=None):
+            row = self.matching_distance_fields.rowCount()
+            self.matching_distance_fields.insertRow(row)
+            for column, source, key in (
+                (0, self.block_x_col, 'block_col'), (1, self.sample_x_col, 'sample_col'),
+            ):
+                combo = QtWidgets.QComboBox()
+                combo.addItem('(None)')
+                combo.addItems([source.itemText(index) for index in range(source.count())])
+                selected = (mapping or {}).get(key)
+                if selected and combo.findText(selected) < 0:
+                    combo.addItem(selected)
+                if selected:
+                    combo.setCurrentText(selected)
+                self.matching_distance_fields.setCellWidget(row, column, combo)
+
+        def _remove_matching_distance_fields(self):
+            rows = {index.row() for index in self.matching_distance_fields.selectedIndexes()}
+            for row in sorted(rows, reverse=True):
+                self.matching_distance_fields.removeRow(row)
+
+        def _refresh_matching_distance_fields(self):
+            mappings = self._get_matching_distance_field_mappings()
+            self.matching_distance_fields.setRowCount(0)
+            for mapping in mappings:
+                self._add_matching_distance_field(mapping)
+
+        def _browse_matching_distance_output(self):
+            initial = self.matching_distance_output_edit.text().strip()
+            if not initial:
+                initial = os.path.splitext(self.blocks_edit.text().strip())[0] + '_matching_value_distances.csv'
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Matching Value Distances Output File', initial, 'CSV Files (*.csv)')
+            if path:
+                self.matching_distance_output_edit.setText(path)
+
         def _get_selected_block_value_transfer_columns(self):
             if not hasattr(self, 'block_value_transfer_cols'):
                 return []
@@ -14035,8 +14565,18 @@ if __name__ == "__main__":
                     if distance_limit <= 0 else
                     f'enabled up to {distance_limit:g} m'
                 )
+            domain_state = 'Domain-wise matching is off (select a Target Domain column and a Blocks Domain column to enable it).'
+            source_domain = self.block_domain_col.currentText().strip()
+            target_domain = self.block_model_target_domain_col.currentText().strip()
+            if source_domain and source_domain != '(None)' and target_domain and target_domain != '(None)':
+                domain_state = (
+                    f"Domain-wise matching on '{source_domain}' / '{target_domain}'; overlap "
+                    f"{'takes precedence over' if self.block_model_overlap_precedence.isChecked() else 'does not override'} domain; "
+                    f"other-domain nearest/overlap blocks "
+                    f"{'allowed as a last resort' if self.block_model_cross_domain_fallback.isChecked() else 'not allowed as a last resort'}."
+                )
             self.block_model_transfer_summary.setText(
-                f'{selected} of {total} source columns selected. No-overlap fallback is {fallback_state}.'
+                f'{selected} of {total} source columns selected. No-overlap fallback is {fallback_state}. {domain_state}'
             )
 
         def _update_block_model_transfer_fallback_controls(self):
@@ -14131,6 +14671,10 @@ if __name__ == "__main__":
                 [('dx', 'dim_x', 'size_x', 'x_size'), ('dy', 'dim_y', 'size_y', 'y_size'), ('dz', 'dim_z', 'size_z', 'z_size')],
             ):
                 self._populate_block_model_column_combo(combo, columns, '(Infer)', suggestions)
+            self._populate_block_model_column_combo(
+                self.block_model_target_domain_col, columns, '(None)', ('domain', 'dom'),
+            )
+            self._update_block_model_transfer_summary()
 
         def _get_selected_table_attribute_key_columns(self):
             if not hasattr(self, 'table_attribute_key_cols'):
@@ -15192,6 +15736,7 @@ if __name__ == "__main__":
             self.start_block_value_transfer_btn.setEnabled(enabled)
             self.start_table_attribute_assign_btn.setEnabled(enabled)
             self.start_block_domain_metrics_btn.setEnabled(enabled)
+            self.start_matching_distance_btn.setEnabled(enabled)
             self.start_domain_interpolation_confidence_btn.setEnabled(enabled)
             self.start_block_volume_weighted_btn.setEnabled(enabled)
             self.start_bmf_export_btn.setEnabled(enabled)
@@ -15524,6 +16069,9 @@ if __name__ == "__main__":
                         nearest_distance_display = 'Unlimited'
                     else:
                         nearest_distance_display = f"{max_nearest_distance:g} m"
+                    domain_note = ''
+                    if result.get('domain_wise'):
+                        domain_note = f"\nOther-domain matches: {result.get('cross_domain_matched_blocks', 0):,}"
                     QtWidgets.QMessageBox.information(
                         self,
                         'Success',
@@ -15534,7 +16082,7 @@ if __name__ == "__main__":
                             f"Overlap matches: {result['overlap_matched_blocks']:,}\n"
                             f"Nearest fallback matches: {result['nearest_matched_blocks']:,}\n"
                             f"Unmatched blocks: {result['unmatched_blocks']:,}\n"
-                            f"Nearest max distance: {nearest_distance_display}"
+                            f"Nearest max distance: {nearest_distance_display}{domain_note}"
                         ),
                     )
 
@@ -15563,6 +16111,10 @@ if __name__ == "__main__":
                         'target_size_cols': cfg.get('block_model_target_size_cols'),
                         'nearest_fallback': cfg.get('block_model_transfer_nearest_fallback', True),
                         'max_nearest_distance': cfg.get('block_model_transfer_max_nearest_distance'),
+                        'source_domain_col': cfg.get('block_domain_col'),
+                        'target_domain_col': cfg.get('block_model_target_domain_col'),
+                        'allow_cross_domain_fallback': cfg.get('block_model_transfer_cross_domain_fallback', True),
+                        'overlap_precedence_over_domain': cfg.get('block_model_transfer_overlap_precedence', True),
                     },
                     handle_success,
                     'An error occurred during block-model transfer',
@@ -15618,6 +16170,47 @@ if __name__ == "__main__":
                 print(f"Error during table attribute assignment: {e}")
                 traceback.print_exc()
                 QtWidgets.QMessageBox.critical(self, 'Error', f'An error occurred during table attribute assignment:\n{str(e)}')
+
+        def run_matching_value_sample_distances_only(self):
+            try:
+                cfg = self.to_dict()
+                output_file = cfg.get('matching_distance_file') or os.path.splitext(cfg['blocks_file'])[0] + '_matching_value_distances.csv'
+                self.matching_distance_output_edit.setText(output_file)
+
+                def handle_success(result):
+                    field_summary = '\n'.join(
+                        f"{entry['block_col']}: same-domain unmatched={entry['same_domain_unmatched_blocks']:,}, "
+                        f"absolute unmatched={entry['absolute_unmatched_blocks']:,}"
+                        for entry in result['field_results']
+                    )
+                    QtWidgets.QMessageBox.information(
+                        self, 'Success',
+                        f"Matching-value distances saved to:\n{result['output_file']}\n\n"
+                        f"Processed blocks: {result['processed_blocks']:,}\n"
+                        f"Filtered samples: {result['filtered_samples']:,}\n"
+                        f"Invalid block coordinates: {result['invalid_coordinate_blocks']:,}\n"
+                        f"Invalid sample coordinates: {result['invalid_coordinate_samples']:,}\n\n"
+                        f"Unmatched distances were left blank:\n{field_summary}",
+                    )
+
+                self._run_operation_with_progress(
+                    'Matching Value Sample Distances', 'Preparing matching-value distances...',
+                    export_matching_value_sample_distances,
+                    {
+                        'samples_file': cfg['samples_file'], 'blocks_file': cfg['blocks_file'],
+                        'output_file': output_file, 'field_mappings': cfg['matching_distance_field_mappings'],
+                        'sample_domain_col': cfg.get('sample_domain_col'), 'block_domain_col': cfg.get('block_domain_col'),
+                        'samples_delimiter': cfg.get('samples_delimiter'), 'blocks_delimiter': cfg.get('blocks_delimiter'),
+                        'samples_header_line': cfg.get('samples_header_line', 1), 'blocks_header_line': cfg.get('blocks_header_line', 1),
+                        'sample_x_col': cfg.get('sample_x_col'), 'sample_y_col': cfg.get('sample_y_col'), 'sample_z_col': cfg.get('sample_z_col'),
+                        'block_x_col': cfg.get('block_x_col'), 'block_y_col': cfg.get('block_y_col'), 'block_z_col': cfg.get('block_z_col'),
+                        'sample_filters': cfg.get('block_domain_sample_filters'), 'block_filters': cfg.get('block_volume_weighted_filters'),
+                    },
+                    handle_success, 'Matching Value Sample Distances failed',
+                )
+            except Exception as exc:
+                print(f'Matching Value Sample Distances failed: {exc}')
+                QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to export matching-value distances: {exc}')
 
         def run_block_domain_sample_metrics_only(self):
             """Export block rows with distance statistics to filtered samples inside the same domain."""
