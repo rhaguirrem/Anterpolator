@@ -11,6 +11,8 @@ def normalize_provenance_algorithm_name(algo_name: Any) -> Tuple[str, str]:
     name = str(algo_name or '').strip().lower()
     if name in ('sample',):
         return 'Sample', 'sample'
+    if name == 'same-domain idw fill':
+        return 'Same-domain IDW Fill', 'same_domain_idw_fill'
     if 'fill with average' in name or 'fill_with_average' in name or 'fill average' in name:
         return 'Fill with Average', 'fill_with_average'
     if 'ant colony ii' in name:

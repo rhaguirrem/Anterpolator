@@ -97,6 +97,25 @@ CSV headers may contain quoted separators or quotes. Unnamed block columns are
 retained as `Unnamed` (with numbered suffixes for additional unnamed columns).
 
 ### 8. Viewer and Export Utilities
+For regular/base-grid interpolation, CSV output retains every source block-model
+row in source order, including unestimated blocks and sub-blocks. App-wide block
+filters still apply. In value interpolation, `Domain` is copied from each source
+row's selected domain column, even when no value could be estimated. Domain
+interpolation keeps the estimated domains instead. Adaptive Leaf Cover retains
+its explicitly selected mixed-size leaf output.
+
+Under **Advanced**, enable **Fill Isolated Blank Blocks (IDW)** to fill remaining
+blank base blocks after the domain-wise **Fill with Average** stage and all
+interpolation passes. **Isolated Fill Nearest Blocks (n)** defaults to **8**.
+The estimate is `sum(value / distance^2) / sum(1 / distance^2)` using up to `n`
+finite-valued blocks in the same source domain. Distances are 3D Euclidean
+distances in model units (respecting unequal XYZ block sizes). Donors are frozen
+before this stage, so newly filled blocks do not become donors. Existing values
+and samples are unchanged; domains with no valued donors remain blank and are
+reported in the log. This optional stage is for value interpolation on base-grid
+outputs, not categorical domain interpolation or Adaptive Leaf Cover. Its
+results are recorded as **Same-domain IDW Fill** in export provenance.
+
 - Interactive 3D viewer for blocks, samples, and interpolation output.
 - CSV export of interpolation results.
 - Optional sub-block-aware export expansion.

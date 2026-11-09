@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
+from block_postprocess import fill_isolated_blank_blocks
 
 from provenance_utils import (
     copy_interpolator_provenance,
@@ -2178,6 +2179,8 @@ class TaichiInterpolationViewer:
                     finalize_phase_provenance(interp, 'Post-process', 'Fill with Average', post_process_snapshot)
                     changed = True
             next_phase_label = self._advance_interpolation_phase(interp)
+            if self._interpolation_complete:
+                changed = bool(fill_isolated_blank_blocks(self.blocks_data, self.config)) or changed
             self._phase_provenance_snapshot = None
             self._phase_provenance_interp = None
 
@@ -2623,7 +2626,13 @@ def create_viewer_from_files(
     block_domains = {}
     if interpolation_file and os.path.isfile(interpolation_file):
         df_blocks = read_autodetect_csv(interpolation_file, forced_delimiter=blocks_delimiter)
-        block_points, block_values, df_blocks = prepare_points(df_blocks, value_col='Value')
+        selected_value_col = str(sample_value_col or '').strip()
+        interpolation_value_col = (
+            selected_value_col
+            if selected_value_col and selected_value_col != '(None)' and selected_value_col in df_blocks.columns
+            else 'Value'
+        )
+        block_points, block_values, df_blocks = prepare_points(df_blocks, value_col=interpolation_value_col)
         for point, value in zip(block_points, block_values):
             block_positions[tuple(point)] = value
         if 'Domain' in df_blocks.columns:

@@ -76,6 +76,73 @@ def _write_regular_subblock_csv(path, rows, factors=(3, 3, 3)):
         pd.DataFrame(rows).to_csv(handle, index=False)
 
 
+def test_load_samples_dataframe_preserves_selected_value_column_with_internal_value_alias():
+    with tempfile.TemporaryDirectory() as td:
+        samples_path = os.path.join(td, "samples.csv")
+        pd.DataFrame(
+            [
+                {"mid_x": 1.0, "mid_y": 2.0, "mid_z": 3.0, "RQD_pctg": 80.0},
+                {"mid_x": 4.0, "mid_y": 5.0, "mid_z": 6.0, "RQD_pctg": 120.0},
+            ]
+        ).to_csv(samples_path, index=False)
+
+        samples, _, column_mapping = load_samples_dataframe(
+            samples_path,
+            samples_delimiter=",",
+            sample_x_col="mid_x",
+            sample_y_col="mid_y",
+            sample_z_col="mid_z",
+            sample_value_col="RQD_pctg",
+            sample_filters=[
+                {"field": "RQD_pctg", "type": "numeric", "min": 0.0, "max": 100.0},
+            ],
+        )
+
+        assert column_mapping["RQD_pctg"] == "Value"
+        assert samples["RQD_pctg"].tolist() == [80.0]
+        assert samples["Value"].tolist() == [80.0]
+        normalized = viewer_module.normalize_selected_sample_value_column(samples, "RQD_pctg")
+        assert normalized["Value"].tolist() == [80.0]
+
+        reloaded_samples = pd.read_csv(samples_path)
+        reloaded_samples = reloaded_samples.rename(
+            columns={"mid_x": "x", "mid_y": "y", "mid_z": "z"}
+        )
+        normalized_reloaded = viewer_module.normalize_selected_sample_value_column(
+            reloaded_samples,
+            "RQD_pctg",
+        )
+        assert normalized_reloaded["RQD_pctg"].tolist() == [80.0, 120.0]
+        assert normalized_reloaded["Value"].tolist() == [80.0, 120.0]
+
+
+def test_export_blocks_to_csv_value_column_name_is_per_call(monkeypatch):
+    with tempfile.TemporaryDirectory() as td:
+        named_output_path = os.path.join(td, "named.csv")
+        default_output_path = os.path.join(td, "default.csv")
+
+        class FakeBlocks:
+            _block_info = {}
+
+        monkeypatch.setattr(
+            viewer_module,
+            "_collect_export_block_data",
+            lambda blocks: [
+                {"x": 1.0, "y": 2.0, "z": 3.0, "Value": 4.0},
+            ],
+        )
+
+        export_blocks_to_csv(FakeBlocks(), named_output_path, value_column_name="RQD_pctg")
+        export_blocks_to_csv(FakeBlocks(), default_output_path)
+
+        named_df = pd.read_csv(named_output_path)
+        default_df = pd.read_csv(default_output_path)
+        assert named_df["RQD_pctg"].tolist() == [4.0]
+        assert "Value" not in named_df.columns
+        assert default_df["Value"].tolist() == [4.0]
+        assert "RQD_pctg" not in default_df.columns
+
+
 @pytest.mark.parametrize("explicit_sizes", [False, True])
 def test_regular_metadata_geometry_precedes_centroid_inference(explicit_sizes):
     df = pd.DataFrame([{"x": 2.5, "y": 2.5, "z": 2.5, "dx": 2, "dy": 3, "dz": 4}])
@@ -2361,7 +2428,7 @@ def test_build_export_blocks_dataframe_can_expand_base_blocks_back_to_source_sub
         assert output_df["Domain"].tolist() == ["A", "A", "B", "B"]
 
 
-def test_build_export_blocks_dataframe_keeps_empty_interpolation_export_empty():
+def test_build_export_blocks_dataframe_retains_source_rows_without_interpolation():
     with tempfile.TemporaryDirectory() as td:
         blocks_path = os.path.join(td, "blocks.csv")
         pd.DataFrame(
@@ -2392,8 +2459,9 @@ def test_build_export_blocks_dataframe_keeps_empty_interpolation_export_empty():
 
         output_df = _build_export_blocks_dataframe(fake_blocks, [])
 
-        assert output_df.empty
-        assert list(output_df.columns) == []
+        assert len(output_df) == 2
+        assert output_df['x'].tolist() == [2.5, 7.5]
+        assert output_df['Value'].isna().all()
 
 
 def test_collect_export_block_data_uses_cumulative_provenance_labels():
@@ -3126,7 +3194,11 @@ def test_silent_interpolation_executes_fill_only_domain_post_process(monkeypatch
         )
 
         monkeypatch.setattr(viewer_module, "_run_interpolator_statistics_with_retry", lambda *args, **kwargs: None)
-        monkeypatch.setattr(viewer_module, "export_blocks_to_file", lambda blocks_obj, path: path)
+        monkeypatch.setattr(
+            viewer_module,
+            "export_blocks_to_file",
+            lambda blocks_obj, path, **kwargs: path,
+        )
 
         class _FakePlotter:
             pass
@@ -3218,7 +3290,7 @@ def test_export_blocks_to_csv_streams_large_subblock_expansion(monkeypatch):
         )
 
         try:
-            export_blocks_to_csv(fake_blocks, output_path)
+            export_blocks_to_csv(fake_blocks, output_path, value_column_name="RQD_pctg")
         finally:
             monkeypatch.setattr(viewer_module, "_collect_export_block_data", original_collect)
 
@@ -3227,7 +3299,8 @@ def test_export_blocks_to_csv_streams_large_subblock_expansion(monkeypatch):
         assert progress_labels == ["Reading source blocks for export expansion"]
         assert len(output_df) == 4
         assert output_df["x"].tolist() == [2.5, 7.5, 12.5, 17.5]
-        assert output_df["Value"].tolist() == [10.0, 10.0, 20.0, 20.0]
+        assert "Value" not in output_df.columns
+        assert output_df["RQD_pctg"].tolist() == [10.0, 10.0, 20.0, 20.0]
         assert output_df["Domain"].tolist() == ["A", "A", "B", "B"]
 
 

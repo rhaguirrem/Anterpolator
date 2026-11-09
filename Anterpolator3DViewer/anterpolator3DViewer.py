@@ -35,6 +35,7 @@ from provenance_utils import (
     seed_original_sample_provenance,
     snapshot_interpolator_state,
 )
+from block_postprocess import fill_isolated_blank_blocks
 
 pv = None
 taichi_runtime_module = None
@@ -883,10 +884,14 @@ def load_samples_dataframe(samples_file, samples_delimiter=None, samples_header_
             sample_y_col: 'y',
             sample_z_col: 'z',
         }
-        if use_selected_value_col:
-            rename_map[selected_value_col] = 'Value'
         df = df.rename(columns=rename_map)
+        if use_selected_value_col:
+            if selected_value_col != 'Value':
+                df['Value'] = df[selected_value_col]
+            rename_map[selected_value_col] = 'Value'
         ordered_columns = ['x', 'y', 'z']
+        if use_selected_value_col and selected_value_col != 'Value' and selected_value_col in df.columns:
+            ordered_columns.append(selected_value_col)
         if use_selected_value_col and 'Value' in df.columns:
             ordered_columns.append('Value')
         if selected_domain_col and selected_domain_col != '(None)' and selected_domain_col in df.columns:
@@ -2997,6 +3002,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
             'source_block_x_col': block_x_col,
             'source_block_y_col': block_y_col,
             'source_block_z_col': block_z_col,
+            'source_block_domain_col': block_domain_col,
             'source_block_filters': [dict(entry) for entry in (block_filters or [])],
             'expand_interpolation_exports_to_subblocks': bool((config or {}).get('expand_interpolation_exports_to_subblocks', True)),
         }
@@ -3198,7 +3204,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 algo_type = config.get('algorithm', 'ant_colony')
                 
                 if has_extra_blocks:
-                    if algo_type == 'ant_colony':
+                    if algo_type in ('ant_colony', 'ant_colony_ii'):
                         interp1.allowed_grid_override = allowed_grid
                         interp1.domain_mapping = domain_mapping
                     elif algo_type == 'molecular_clock':
@@ -3234,7 +3240,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 interp2 = create_interpolator(config2)
                 
                 if has_extra_blocks:
-                    if algo2 == 'ant_colony':
+                    if algo2 in ('ant_colony', 'ant_colony_ii'):
                         interp2.allowed_grid_override = allowed_grid
                         interp2.domain_mapping = domain_mapping
                     elif algo2 == 'molecular_clock':
@@ -3283,7 +3289,7 @@ def create_blocks(points, values, block_size=10, verbose=False, range_size=10, m
                 print(f"  Undomained (1-pass) sparse check: allowed={len(allowed_grid)}, samples={len(multiblock._sample_blocks)}, has_extra={has_extra_blocks}")
                 
                 if has_extra_blocks:
-                    if algo_type == 'ant_colony':
+                    if algo_type in ('ant_colony', 'ant_colony_ii'):
                         interpolator.allowed_grid_override = allowed_grid
                         interpolator.domain_mapping = domain_mapping
                     elif algo_type == 'molecular_clock':
@@ -4630,12 +4636,14 @@ def load_full_samples_dataframe(samples_file, samples_delimiter=None, samples_he
 
 
 def load_full_blocks_dataframe(blocks_file, blocks_delimiter=None, blocks_header_line=1,
-                               block_filters=None, progress_label=None, progress_callback=None):
+                               block_filters=None, progress_label=None, progress_callback=None,
+                               preserve_empty_columns=False):
     if is_bmf_file(blocks_file):
         df = read_autodetect_csv(
             blocks_file,
             progress_label=progress_label,
             progress_callback=progress_callback,
+            preserve_empty_columns=preserve_empty_columns,
         )
         if block_filters:
             print(
@@ -4654,6 +4662,7 @@ def load_full_blocks_dataframe(blocks_file, blocks_delimiter=None, blocks_header
             expected_min_cols=3,
             progress_label=progress_label,
             progress_callback=progress_callback,
+            preserve_empty_columns=preserve_empty_columns,
         )
         if block_filters:
             print(
@@ -4668,6 +4677,7 @@ def load_full_blocks_dataframe(blocks_file, blocks_delimiter=None, blocks_header
         forced_delimiter=delimiter,
         progress_label=progress_label,
         progress_callback=progress_callback,
+        preserve_empty_columns=preserve_empty_columns,
     )
     if block_filters:
         print(
@@ -9064,7 +9074,43 @@ def _collect_export_block_data(blocks):
 
 
 def _build_base_block_export_dataframe(block_rows):
+    if not block_rows:
+        return pd.DataFrame(columns=['x', 'y', 'z', 'Value', 'Domain', 'Source', 'Algorithm'])
     return pd.DataFrame([{k: v for k, v in row.items() if k != '_Grid_Index'} for row in block_rows])
+
+
+def _export_preserves_source_domains(blocks):
+    if hasattr(blocks, '_interpolators'):
+        final_passes = {domain: passes[-1] for domain, passes in blocks._interpolators.items() if passes}
+        value_domains = {
+            domain for domain, interp in final_passes.items()
+            if getattr(interp, 'interpolation_target', 'value') != 'domain'
+        }
+        return True if len(value_domains) == len(final_passes) else value_domains
+    return getattr(getattr(blocks, '_ant_colony', None), 'interpolation_target', 'value') != 'domain'
+
+
+def _restore_source_export_domains(export_df, source_df, domain_col, preserve_source_domains):
+    if preserve_source_domains and domain_col and domain_col != '(None)':
+        if domain_col not in source_df.columns:
+            raise ValueError(f"Source block domain column not found during export: {domain_col}")
+        source_domains = source_df[domain_col].to_numpy(copy=False)
+        if preserve_source_domains is True:
+            export_df['Domain'] = source_domains
+        else:
+            mask = source_df[domain_col].astype(str).str.strip().isin(preserve_source_domains).to_numpy()
+            export_df.loc[mask, 'Domain'] = source_domains[mask]
+    return export_df
+
+
+def _source_export_domain_column(columns, block_info):
+    domain_col = block_info.get('source_block_domain_col')
+    if domain_col and domain_col != '(None)':
+        return domain_col
+    coordinate_columns = [block_info.get(f'source_block_{axis}_col') for axis in ('x', 'y', 'z')]
+    if not all(coordinate_columns) and len(columns) >= 4:
+        return columns[3]
+    return None
 
 
 def _build_export_block_row_lookup(block_rows):
@@ -9072,13 +9118,16 @@ def _build_export_block_row_lookup(block_rows):
     export_lookup = {}
     for row in block_rows:
         grid_index = tuple(row['_Grid_Index'])
+        if grid_index in export_lookup:
+            raise ValueError(f"Multiple interpolation results for source base block {grid_index}.")
         export_lookup[grid_index] = {k: v for k, v in row.items() if k != '_Grid_Index'}
     return export_lookup, export_columns
 
 
 def _expand_export_block_rows_to_source_rows(block_rows, source_blocks_df, block_x_col, block_y_col, block_z_col,
                                              min_bounds, block_size, rotation_matrix=None, rotation_center=None,
-                                             grid_index_origin=None):
+                                             grid_index_origin=None, block_domain_col=None,
+                                             preserve_source_domains=True):
     export_df = _build_base_block_export_dataframe(block_rows)
     export_df['_Grid_Index'] = [tuple(row['_Grid_Index']) for row in block_rows]
 
@@ -9095,21 +9144,25 @@ def _expand_export_block_rows_to_source_rows(block_rows, source_blocks_df, block
         block_indices = np.floor((valid_coords - index_origin) / np.asarray(block_size, dtype=float) + 1e-6).astype(int)
         expanded_index_df.loc[valid_mask, '_Grid_Index'] = [tuple(int(v) for v in idx) for idx in block_indices]
 
-    expanded_df = expanded_index_df.merge(export_df, on='_Grid_Index', how='left')
+    expanded_df = expanded_index_df.merge(export_df, on='_Grid_Index', how='left', validate='many_to_one')
 
     # Preserve the original source row coordinates so expanded output matches the input block rows.
     expanded_df['x'] = source_blocks_df[block_x_col].to_numpy(copy=False)
     expanded_df['y'] = source_blocks_df[block_y_col].to_numpy(copy=False)
     expanded_df['z'] = source_blocks_df[block_z_col].to_numpy(copy=False)
 
-    return expanded_df.drop(columns=['_Grid_Index'])
+    expanded_df = expanded_df.drop(columns=['_Grid_Index'])
+    return _restore_source_export_domains(
+        expanded_df, source_blocks_df, block_domain_col, preserve_source_domains,
+    )
 
 
 def _expand_export_chunk_rows_to_source_rows(source_blocks_df, export_lookup, export_columns,
                                              block_x_col, block_y_col, block_z_col,
                                              min_bounds, block_size,
                                              rotation_matrix=None, rotation_center=None,
-                                             grid_index_origin=None):
+                                             grid_index_origin=None, block_domain_col=None,
+                                             preserve_source_domains=True):
     expanded_records = [{} for _ in range(len(source_blocks_df))]
 
     coord_frame = source_blocks_df[[block_x_col, block_y_col, block_z_col]].apply(pd.to_numeric, errors='coerce')
@@ -9129,7 +9182,9 @@ def _expand_export_chunk_rows_to_source_rows(source_blocks_df, export_lookup, ex
     expanded_df['x'] = source_blocks_df[block_x_col].to_numpy(copy=False)
     expanded_df['y'] = source_blocks_df[block_y_col].to_numpy(copy=False)
     expanded_df['z'] = source_blocks_df[block_z_col].to_numpy(copy=False)
-    return expanded_df
+    return _restore_source_export_domains(
+        expanded_df, source_blocks_df, block_domain_col, preserve_source_domains,
+    )
 
 
 def _iter_expanded_export_block_chunks(block_rows, source_blocks_file, blocks_delimiter=None,
@@ -9139,11 +9194,14 @@ def _iter_expanded_export_block_chunks(block_rows, source_blocks_file, blocks_de
                                        rotation_matrix=None, rotation_center=None,
                                        grid_index_origin=None,
                                        progress_label='Reading source blocks for export expansion',
-                                       chunksize=250_000):
+                                       chunksize=250_000, block_domain_col=None,
+                                       preserve_source_domains=True):
     delimiter = blocks_delimiter or detect_csv_delimiter(source_blocks_file)
     header_line = resolve_effective_csv_header_line(source_blocks_file, blocks_header_line)
     headers = parse_header_line(source_blocks_file, delimiter, header_line)
     final_names = build_unique_column_names(headers)
+    if block_domain_col is None and not all([block_x_col, block_y_col, block_z_col]) and len(final_names) >= 4:
+        block_domain_col = final_names[3]
     block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
         final_names,
         block_x_col=block_x_col,
@@ -9156,6 +9214,11 @@ def _iter_expanded_export_block_chunks(block_rows, source_blocks_file, blocks_de
         block_z_col,
         *collect_filter_fields(block_filters or []),
     ]))
+    if preserve_source_domains and block_domain_col and block_domain_col != '(None)':
+        if block_domain_col not in final_names:
+            raise ValueError(f"Source block domain column not found during export: {block_domain_col}")
+        if block_domain_col not in selected_columns:
+            selected_columns.append(block_domain_col)
     read_kwargs = dict(
         delimiter=delimiter,
         header=None,
@@ -9199,6 +9262,8 @@ def _iter_expanded_export_block_chunks(block_rows, source_blocks_file, blocks_de
             rotation_matrix=rotation_matrix,
             rotation_center=rotation_center,
             grid_index_origin=grid_index_origin,
+            block_domain_col=block_domain_col,
+            preserve_source_domains=preserve_source_domains,
         )
 
 
@@ -9224,9 +9289,15 @@ def _write_expanded_export_blocks_to_csv(block_rows, block_info, filepath):
             rotation_matrix=block_info.get('rotation_matrix'),
             rotation_center=block_info.get('rotation_center'),
             grid_index_origin=block_info.get('grid_index_origin'),
+            block_domain_col=block_info.get('source_block_domain_col'),
+            preserve_source_domains=block_info.get('preserve_source_domains', True),
         ),
         start=1,
     ):
+        expanded_chunk = _rename_interpolation_value_column(
+            expanded_chunk,
+            block_info.get('interpolation_value_column_name', 'Value'),
+        )
         expanded_chunk.to_csv(filepath, index=False, mode='w' if not wrote_header else 'a', header=not wrote_header)
         wrote_header = True
         total_rows_written += len(expanded_chunk)
@@ -9238,7 +9309,12 @@ def _write_expanded_export_blocks_to_csv(block_rows, block_info, filepath):
 
     if not wrote_header:
         empty_columns = list(_build_base_block_export_dataframe(block_rows).columns)
-        pd.DataFrame(columns=empty_columns).to_csv(filepath, index=False)
+        empty_df = pd.DataFrame(columns=empty_columns)
+        empty_df = _rename_interpolation_value_column(
+            empty_df,
+            block_info.get('interpolation_value_column_name', 'Value'),
+        )
+        empty_df.to_csv(filepath, index=False)
 
     print(
         f"Expanded {len(block_rows):,} base-block export rows to {total_rows_written:,} source block rows "
@@ -9251,15 +9327,14 @@ def _build_export_blocks_dataframe(blocks, block_rows):
     base_df = _build_base_block_export_dataframe(block_rows)
     block_info = getattr(blocks, '_block_info', {}) or {}
 
-    if not block_rows or base_df.empty:
-        return base_df
-
-    if not block_info.get('expand_interpolation_exports_to_subblocks', False) or _blocks_use_adaptive_leaf_cover(blocks):
+    if _blocks_use_adaptive_leaf_cover(blocks):
         return base_df
 
     source_blocks_file = str(block_info.get('source_blocks_file') or '').strip()
-    if not source_blocks_file or not os.path.isfile(source_blocks_file):
+    if not source_blocks_file:
         return base_df
+    if not os.path.isfile(source_blocks_file):
+        raise ValueError(f"Source blocks file not found during export: {source_blocks_file}")
 
     try:
         source_blocks_df, _ = load_full_blocks_dataframe(
@@ -9268,6 +9343,7 @@ def _build_export_blocks_dataframe(blocks, block_rows):
             blocks_header_line=block_info.get('source_blocks_header_line', 1),
             block_filters=block_info.get('source_block_filters'),
             progress_label='Reading source blocks for export expansion',
+            preserve_empty_columns=True,
         )
         block_x_col, block_y_col, block_z_col = resolve_block_coordinate_columns(
             list(source_blocks_df.columns),
@@ -9286,6 +9362,8 @@ def _build_export_blocks_dataframe(blocks, block_rows):
             rotation_matrix=block_info.get('rotation_matrix'),
             rotation_center=block_info.get('rotation_center'),
             grid_index_origin=block_info.get('grid_index_origin'),
+            block_domain_col=_source_export_domain_column(list(source_blocks_df.columns), block_info),
+            preserve_source_domains=_export_preserves_source_domains(blocks),
         )
         print(
             f"Expanded {len(block_rows):,} base-block export rows to {len(expanded_df):,} source block rows "
@@ -9293,11 +9371,22 @@ def _build_export_blocks_dataframe(blocks, block_rows):
         )
         return expanded_df
     except Exception as exc:
-        print(f"Failed to expand export back to source block rows, falling back to base-block export: {exc}")
-        return base_df
+        raise RuntimeError(f"Failed to export the original source block rows: {exc}") from exc
 
 
-def export_blocks_to_csv(blocks, filepath):
+def _rename_interpolation_value_column(df, value_column_name='Value'):
+    selected_name = str(value_column_name or '').strip()
+    if not selected_name or selected_name == '(None)' or selected_name == 'Value' or 'Value' not in df.columns:
+        return df
+    if selected_name in df.columns:
+        raise ValueError(
+            f"Cannot name the interpolation value column '{selected_name}': "
+            "that column already exists in the block export."
+        )
+    return df.rename(columns={'Value': selected_name})
+
+
+def export_blocks_to_csv(blocks, filepath, value_column_name='Value'):
     output_dir = os.path.dirname(filepath) or '.'
     os.makedirs(output_dir, exist_ok=True)
 
@@ -9306,20 +9395,22 @@ def export_blocks_to_csv(blocks, filepath):
     block_info = getattr(blocks, '_block_info', {}) or {}
     source_blocks_file = str(block_info.get('source_blocks_file') or '').strip()
     should_stream_expanded_export = (
-        bool(data)
-        and block_info.get('expand_interpolation_exports_to_subblocks', False)
-        and not _blocks_use_adaptive_leaf_cover(blocks)
+        not _blocks_use_adaptive_leaf_cover(blocks)
         and source_blocks_file
         and os.path.isfile(source_blocks_file)
         and os.path.getsize(source_blocks_file) >= LARGE_BLOCK_FILE_THRESHOLD
     )
 
     if should_stream_expanded_export:
+        block_info = dict(block_info)
+        block_info['interpolation_value_column_name'] = value_column_name
+        block_info['preserve_source_domains'] = _export_preserves_source_domains(blocks)
         rows_written = _write_expanded_export_blocks_to_csv(data, block_info, filepath)
         print(f"Exported {rows_written:,} rows to {filepath}")
         return
 
     df = _build_export_blocks_dataframe(blocks, data)
+    df = _rename_interpolation_value_column(df, value_column_name)
     df.to_csv(filepath, index=False)
     print(f"Exported {len(df):,} rows to {filepath}")
 
@@ -9358,11 +9449,11 @@ def export_dataframe_to_bmf(df, filepath, backend='tbms-config-text'):
             pass
 
 
-def export_blocks_to_file(blocks, filepath, bmf_backend='tbms-config-text'):
+def export_blocks_to_file(blocks, filepath, bmf_backend='tbms-config-text', value_column_name='Value'):
     output_path = resolve_interpolation_csv_export_path(filepath)
     if output_path != str(filepath or '').strip():
         print(f"Interpolation BMF output is disabled; writing CSV instead: {output_path}")
-    export_blocks_to_csv(blocks, output_path)
+    export_blocks_to_csv(blocks, output_path, value_column_name=value_column_name)
     return output_path
 
 
@@ -9915,7 +10006,11 @@ def silent_interpolation(plotter, iterations, interpolation_file):
     blocks = plotter._blocks_data
     dims = tuple(blocks._block_info['dims'])
     block_evaluated_samples_file = getattr(plotter, '_block_evaluated_samples_file', None)
-    post_process_config = {'domain_algorithm_overrides': getattr(plotter, '_domain_post_process_overrides', {})}
+    post_process_config = {
+        'domain_algorithm_overrides': getattr(plotter, '_domain_post_process_overrides', {}),
+        'fill_isolated_blanks': getattr(plotter, '_fill_isolated_blanks', False),
+        'isolated_fill_neighbors': getattr(plotter, '_isolated_fill_neighbors', 8),
+    }
     started_at = time.perf_counter()
     
     # Check if we have multiple interpolators (sequential domain processing)
@@ -10126,8 +10221,13 @@ def silent_interpolation(plotter, iterations, interpolation_file):
         output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
         _run_interpolator_statistics_with_retry(interpolator, output_dir, "Global")
     
+    fill_isolated_blank_blocks(blocks, post_process_config)
     # Export results (handles both single and multiple interpolators)
-    interpolation_file = export_blocks_to_file(blocks, interpolation_file)
+    interpolation_file = export_blocks_to_file(
+        blocks,
+        interpolation_file,
+        value_column_name=getattr(plotter, '_interpolation_value_column_name', 'Value'),
+    )
     if block_evaluated_samples_file:
         export_block_evaluated_samples_to_csv(blocks, block_evaluated_samples_file)
     elapsed_text = _format_elapsed_runtime(time.perf_counter() - started_at)
@@ -10315,9 +10415,6 @@ def build_taichi_viewer_state_from_config(config):
             config.get('sample_y_col'): 'y',
             config.get('sample_z_col'): 'z',
         }
-        selected_value_col = str(config.get('sample_value_col') or '').strip()
-        if selected_value_col and selected_value_col != '(None)':
-            rename_map[selected_value_col] = 'Value'
         df = df.rename(columns=rename_map)
 
     df = normalize_selected_sample_value_column(
@@ -10495,13 +10592,19 @@ def build_taichi_viewer_state_from_interpolation_file(config):
         interpolation_file,
         progress_label='Reading interpolation file',
     )
-    required_columns = {'x', 'y', 'z', 'Value'}
+    interpolation_value_column = str(config.get('sample_value_col') or 'Value').strip()
+    if interpolation_value_column == '(None)' or interpolation_value_column not in df_blocks.columns:
+        interpolation_value_column = 'Value'
+    required_columns = {'x', 'y', 'z', interpolation_value_column}
     missing_columns = [column for column in required_columns if column not in df_blocks.columns]
     if missing_columns:
         raise ValueError(
             f"Interpolation file is missing required columns: {', '.join(missing_columns)}"
         )
 
+    if interpolation_value_column != 'Value':
+        df_blocks = df_blocks.copy()
+        df_blocks['Value'] = df_blocks[interpolation_value_column]
     block_coord_frame = df_blocks[['x', 'y', 'z']].apply(pd.to_numeric, errors='coerce')
     block_values_series = pd.to_numeric(df_blocks['Value'], errors='coerce')
     block_valid_mask = block_coord_frame.notna().all(axis=1) & block_values_series.notna()
@@ -10709,8 +10812,6 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, val
                 if chosen not in df.columns:
                     raise ValueError(f"Selected samples column '{chosen}' not present in file.")
             rename_map = {sample_x_col: 'x', sample_y_col: 'y', sample_z_col: 'z'}
-            if selected_value_col and selected_value_col != '(None)':
-                rename_map[selected_value_col] = 'Value'
             df = df.rename(columns=rename_map)
             print(f"Applied user sample column mapping: {rename_map}")
         else:
@@ -10893,12 +10994,17 @@ def load_and_visualize_samples(samples_file, block_size=10, value_filter=60, val
 
         # Store settings in plotter
         plotter._blocks_data = blocks
+        plotter._interpolation_value_column_name = str(
+            (config or {}).get('sample_value_col') or 'Value'
+        ).strip()
         plotter._verbose = verbose
         plotter._display_block_filters = normalize_display_block_filters(display_block_filters)
         plotter._value_filter = value_filter  # Legacy lower-bound alias
         plotter._value_filter_min = value_filter
         plotter._value_filter_max = value_filter_max
         plotter._domain_post_process_overrides = dict((config or {}).get('domain_algorithm_overrides', {}))
+        plotter._fill_isolated_blanks = bool((config or {}).get('fill_isolated_blanks', False))
+        plotter._isolated_fill_neighbors = (config or {}).get('isolated_fill_neighbors', 8)
         plotter._avoid_visited_threshold_enabled = avoid_visited_threshold_enabled
         plotter._avoid_visited_threshold = avoid_visited_threshold
         plotter._block_lookup = None
@@ -13490,7 +13596,15 @@ if __name__ == "__main__":
             self.verbose = QtWidgets.QCheckBox(); self.verbose.setChecked(False)
             self.process_domains_sequentially = QtWidgets.QCheckBox(); self.process_domains_sequentially.setChecked(True)
             self.expand_interpolation_exports_to_subblocks = QtWidgets.QCheckBox(); self.expand_interpolation_exports_to_subblocks.setChecked(True)
-            self.expand_interpolation_exports_to_subblocks.setToolTip('If checked, interpolation CSV exports reuse the original blocks file rows and assign each sub-block the interpolated value of its parent base block. Interpolation still runs on the base-block grid.')
+            self.expand_interpolation_exports_to_subblocks.setEnabled(False)
+            self.expand_interpolation_exports_to_subblocks.setToolTip('CSV exports always retain the source block rows (regular or sub-blocked). Adaptive Leaf Cover keeps its explicit leaf output.')
+            self.fill_isolated_blanks = QtWidgets.QCheckBox()
+            self.fill_isolated_blanks.setToolTip('After average fill, fill remaining blank base blocks using inverse-distance-squared weights (1/distance^2) from valued blocks in the same source domain. Domains without valued blocks remain blank. Value interpolation only.')
+            self.isolated_fill_neighbors = QtWidgets.QSpinBox()
+            self.isolated_fill_neighbors.setRange(1, 1000000)
+            self.isolated_fill_neighbors.setValue(8)
+            self.isolated_fill_neighbors.setEnabled(False)
+            self.fill_isolated_blanks.toggled.connect(self.isolated_fill_neighbors.setEnabled)
             self.force_rebuild_sample_blocks = QtWidgets.QCheckBox(); self.force_rebuild_sample_blocks.setChecked(False)
             self.force_rebuild_sample_blocks.setToolTip('If checked, ignore any valid sample-block cache and regenerate sample blocks from the source samples for this run.')
             self.blank_sample_domain_behavior = QtWidgets.QComboBox(); self.blank_sample_domain_behavior.addItems(['Skip', 'Infer From Blocks'])
@@ -13537,7 +13651,9 @@ if __name__ == "__main__":
             advanced_form.addRow('Domain-Specific Algorithms', self.domain_mapping_btn)
 
             advanced_form.addRow('Process Domains Sequentially', self.process_domains_sequentially)
-            advanced_form.addRow('Expand CSV Export to Sub-Blocks', self.expand_interpolation_exports_to_subblocks)
+            advanced_form.addRow('Retain Source Block Rows', self.expand_interpolation_exports_to_subblocks)
+            advanced_form.addRow('Fill Isolated Blank Blocks (IDW)', self.fill_isolated_blanks)
+            advanced_form.addRow('Isolated Fill Nearest Blocks (n)', self.isolated_fill_neighbors)
             advanced_form.addRow('Force Rebuild Sample Blocks', self.force_rebuild_sample_blocks)
             advanced_form.addRow('Blank Sample Domains', self.blank_sample_domain_behavior)
             advanced_form.addRow('Verbose', self.verbose)
@@ -13877,6 +13993,8 @@ if __name__ == "__main__":
                 'average_with_blocks': self.average_with_blocks.isChecked(),
                 'process_domains_sequentially': self.process_domains_sequentially.isChecked(),
                 'expand_interpolation_exports_to_subblocks': self.expand_interpolation_exports_to_subblocks.isChecked(),
+                'fill_isolated_blanks': self.fill_isolated_blanks.isChecked(),
+                'isolated_fill_neighbors': self.isolated_fill_neighbors.value(),
                 'force_rebuild_sample_blocks': self.force_rebuild_sample_blocks.isChecked(),
                 'blank_sample_domain_behavior': 'infer_from_blocks' if self.blank_sample_domain_behavior.currentText() == 'Infer From Blocks' else 'skip',
                 'verbose': self.verbose.isChecked(),
@@ -14209,7 +14327,9 @@ if __name__ == "__main__":
                 # We'll just ignore them for now.
                 if 'average_with_blocks' in config: self.average_with_blocks.setChecked(config['average_with_blocks'])
                 if 'process_domains_sequentially' in config: self.process_domains_sequentially.setChecked(config['process_domains_sequentially'])
-                self.expand_interpolation_exports_to_subblocks.setChecked(bool(config.get('expand_interpolation_exports_to_subblocks', True)))
+                self.expand_interpolation_exports_to_subblocks.setChecked(True)
+                self.fill_isolated_blanks.setChecked(bool(config.get('fill_isolated_blanks', False)))
+                self.isolated_fill_neighbors.setValue(int(config.get('isolated_fill_neighbors', 8)))
                 self.force_rebuild_sample_blocks.setChecked(bool(config.get('force_rebuild_sample_blocks', False)))
                 if 'blank_sample_domain_behavior' in config:
                     behavior = str(config['blank_sample_domain_behavior']).strip().lower()
@@ -14379,7 +14499,11 @@ if __name__ == "__main__":
                 preview_frames.append(
                     build_display_block_filter_preview_frame(
                         preview_df,
-                        value_col='Value',
+                        value_col=(
+                            config.get('sample_value_col')
+                            if config.get('sample_value_col') in preview_df.columns
+                            else 'Value'
+                        ),
                         domain_col='Domain',
                         is_sample_value=None,
                     )
@@ -16803,9 +16927,6 @@ if __name__ == "__main__":
                     pass
                 elif sample_x_col and sample_y_col and sample_z_col:
                     rename_map = {sample_x_col: 'x', sample_y_col: 'y', sample_z_col: 'z'}
-                    selected_value_col = str(sample_value_col or '').strip()
-                    if selected_value_col and selected_value_col != '(None)':
-                        rename_map[selected_value_col] = 'Value'
                     df = df.rename(columns=rename_map)
 
                 df = normalize_selected_sample_value_column(
@@ -17032,8 +17153,13 @@ if __name__ == "__main__":
                     output_dir = os.path.dirname(interpolation_file) if interpolation_file else "."
                     _run_interpolator_statistics_with_retry(interpolator, output_dir, "Global", parent=self)
                 
+                fill_isolated_blank_blocks(blocks, cfg)
                 # Export results (handles both single and multiple interpolators)
-                interpolation_file = export_blocks_to_file(blocks, interpolation_file)
+                interpolation_file = export_blocks_to_file(
+                    blocks,
+                    interpolation_file,
+                    value_column_name=cfg.get('sample_value_col') or 'Value',
+                )
                 cfg['interpolation_file'] = interpolation_file
                 self.interp_edit.setText(interpolation_file)
                 if block_evaluated_samples_file:
